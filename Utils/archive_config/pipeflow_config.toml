@@ -1,0 +1,23 @@
+# =============================================================================
+# PipeFlow BC Configuration — Butterfly (O-H) 5-block pipe mesh
+# Used with convert_plot3d.jl or gen_butterfly_fvm.jl
+# =============================================================================
+
+NG = 4
+
+# ─── Boundary Conditions ─────────────────────────────────────────────
+# Face order: [ξ-, ξ+, η-, η+, ζ-, ζ+]
+[face_bc]
+0 = ["periodic", "periodic", "interblock", "interblock", "interblock", "interblock"]
+1 = ["periodic", "periodic", "isothermal_wall", "interblock", "interblock", "interblock"]
+2 = ["periodic", "periodic", "interblock", "isothermal_wall", "interblock", "interblock"]
+3 = ["periodic", "periodic", "interblock", "interblock", "isothermal_wall", "interblock"]
+4 = ["periodic", "periodic", "interblock", "interblock", "interblock", "isothermal_wall"]
+
+# ─── BC Parameters ───────────────────────────────────────────────────
+# Format: "block.face.param_name" = value
+[bc_params]
+"1.3.Tw" = 307.0
+"2.4.Tw" = 307.0
+"3.5.Tw" = 307.0
+"4.6.Tw" = 307.0

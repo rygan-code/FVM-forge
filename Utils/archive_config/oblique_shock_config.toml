@@ -1,0 +1,22 @@
+# =============================================================================
+# ObliqueShock BC Configuration — Single-block supersonic wedge
+# Used with convert_plot3d.jl
+# =============================================================================
+
+NG = 4
+
+# ─── Block Connectivity (none for single block) ─────────────────────
+
+# ─── Boundary Conditions ─────────────────────────────────────────────
+# Face order: [ξ-, ξ+, η-, η+, ζ-, ζ+]
+[face_bc]
+0 = ["supersonic_inflow", "supersonic_outflow", "slip_wall", "zero_gradient", "periodic", "periodic"]
+
+# ─── BC Parameters ───────────────────────────────────────────────────
+# Freestream state for supersonic inflow (Ma=2.0, γ=1.4)
+[bc_params]
+"0.1.rho_inf" = 1.0
+"0.1.u_inf" = 2.36643
+"0.1.v_inf" = 0.0
+"0.1.w_inf" = 0.0
+"0.1.p_inf" = 1.0
