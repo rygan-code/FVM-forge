@@ -1,134 +1,486 @@
-function viscousFlux(Fv_x, Fv_y, Fv_z, Q, dξdx, dξdy, dξdz, dηdx, dηdy, dηdz, dζdx, dζdy, dζdz, J)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+# Viscous flux — Jacobian metric transformation + optional GG non-orthogonal correction
+# Strategy: high-order FD in computational space (ξ,η,ζ), mapped to physical space via J^{-T}
+# gg_blend=0 → pure Jacobian (default), gg_blend>0 → blend in GG cross-derivative correction
+# GG uses a SINGLE merged function to minimize GPU register pressure
 
-    if i > Nxp+2*NG-2 || j > Nyp+2*NG-2 || k > Nzp+2*NG-2 || i < 3 || j < 3 || k < 3
+@inline function get_viscosity(T::FT)
+    return C_s * T * sqrt(T) / (T + T_s)
+end
+
+@inline function gradFace(fLLL, fLL, fL, fR, fRR, fRRR, ds)
+    if viscous_order == 2
+        return (fR - fL) / ds
+    elseif viscous_order == 4
+        return (FT(1.125e0) * (fR - fL) - FT(0.0416666667e0) * (fRR - fLL)) / ds
+    else
+        return (FT(1.171875e0) * (fR - fL) - FT(0.0651041667e0) * (fRR - fLL) + FT(0.0046875e0) * (fRRR - fLLL)) / ds
+    end
+end
+
+@inline function gradCell(fLLL, fLL, fL, fR, fRR, fRRR, ds)
+    if viscous_order == 2
+        return (fR - fL) / (FT(2.0) * ds)
+    elseif viscous_order == 4
+        return (FT(0.6666666667e0) * (fR - fL) - FT(0.0833333333e0) * (fRR - fLL)) / ds
+    else
+        return (FT(0.75) * (fR - fL) - FT(0.15e0) * (fRR - fLL) + FT(0.0166666667e0) * (fRRR - fLLL)) / ds
+    end
+end
+
+
+# ─── Merged GG: compute ALL 12 gradient components at ONE cell center ──
+# Returns (dudx,dudy,dudz, dvdx,dvdy,dvdz, dwdx,dwdy,dwdz, dTdx,dTdy,dTdz)
+# This avoids 4 separate gg_scalar calls → much less register pressure
+@inline function gg_cell_all(i, j, k, Q,
+        Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk, Vol)
+    @inbounds begin
+        v = Vol[i,j,k]
+        # Cache cell-center values
+        uc = Q[i,j,k,2]; vc = Q[i,j,k,3]; wc = Q[i,j,k,4]; Tc = Q[i,j,k,6]
+
+        # ── I-faces ──
+        aR = Areai[i+1,j,k]; aL = Areai[i,j,k]
+        nxR = nxi[i+1,j,k]*aR; nyR = nyi[i+1,j,k]*aR; nzR = nzi[i+1,j,k]*aR
+        nxL = nxi[i,j,k]*aL;   nyL = nyi[i,j,k]*aL;   nzL = nzi[i,j,k]*aL
+        # Face-averaged scalars
+        uR = FT(0.5)*(uc+Q[i+1,j,k,2]); uL = FT(0.5)*(Q[i-1,j,k,2]+uc)
+        vR = FT(0.5)*(vc+Q[i+1,j,k,3]); vL = FT(0.5)*(Q[i-1,j,k,3]+vc)
+        wR = FT(0.5)*(wc+Q[i+1,j,k,4]); wL = FT(0.5)*(Q[i-1,j,k,4]+wc)
+        TR = FT(0.5)*(Tc+Q[i+1,j,k,6]); TL = FT(0.5)*(Q[i-1,j,k,6]+Tc)
+        # Accumulate (φ_R*n*A - φ_L*n*A) for each gradient component
+        dudx=uR*nxR-uL*nxL; dudy=uR*nyR-uL*nyL; dudz=uR*nzR-uL*nzL
+        dvdx=vR*nxR-vL*nxL; dvdy=vR*nyR-vL*nyL; dvdz=vR*nzR-vL*nzL
+        dwdx=wR*nxR-wL*nxL; dwdy=wR*nyR-wL*nyL; dwdz=wR*nzR-wL*nzL
+        dTdx=TR*nxR-TL*nxL; dTdy=TR*nyR-TL*nyL; dTdz=TR*nzR-TL*nzL
+
+        # ── J-faces ──
+        aR = Areaj[i,j+1,k]; aL = Areaj[i,j,k]
+        nxR = nxj[i,j+1,k]*aR; nyR = nyj[i,j+1,k]*aR; nzR = nzj[i,j+1,k]*aR
+        nxL = nxj[i,j,k]*aL;   nyL = nyj[i,j,k]*aL;   nzL = nzj[i,j,k]*aL
+        uR = FT(0.5)*(uc+Q[i,j+1,k,2]); uL = FT(0.5)*(Q[i,j-1,k,2]+uc)
+        vR = FT(0.5)*(vc+Q[i,j+1,k,3]); vL = FT(0.5)*(Q[i,j-1,k,3]+vc)
+        wR = FT(0.5)*(wc+Q[i,j+1,k,4]); wL = FT(0.5)*(Q[i,j-1,k,4]+wc)
+        TR = FT(0.5)*(Tc+Q[i,j+1,k,6]); TL = FT(0.5)*(Q[i,j-1,k,6]+Tc)
+        dudx+=uR*nxR-uL*nxL; dudy+=uR*nyR-uL*nyL; dudz+=uR*nzR-uL*nzL
+        dvdx+=vR*nxR-vL*nxL; dvdy+=vR*nyR-vL*nyL; dvdz+=vR*nzR-vL*nzL
+        dwdx+=wR*nxR-wL*nxL; dwdy+=wR*nyR-wL*nyL; dwdz+=wR*nzR-wL*nzL
+        dTdx+=TR*nxR-TL*nxL; dTdy+=TR*nyR-TL*nyL; dTdz+=TR*nzR-TL*nzL
+
+        # ── K-faces ──
+        aR = Areak[i,j,k+1]; aL = Areak[i,j,k]
+        nxR = nxk[i,j,k+1]*aR; nyR = nyk[i,j,k+1]*aR; nzR = nzk[i,j,k+1]*aR
+        nxL = nxk[i,j,k]*aL;   nyL = nyk[i,j,k]*aL;   nzL = nzk[i,j,k]*aL
+        uR = FT(0.5)*(uc+Q[i,j,k+1,2]); uL = FT(0.5)*(Q[i,j,k-1,2]+uc)
+        vR = FT(0.5)*(vc+Q[i,j,k+1,3]); vL = FT(0.5)*(Q[i,j,k-1,3]+vc)
+        wR = FT(0.5)*(wc+Q[i,j,k+1,4]); wL = FT(0.5)*(Q[i,j,k-1,4]+wc)
+        TR = FT(0.5)*(Tc+Q[i,j,k+1,6]); TL = FT(0.5)*(Q[i,j,k-1,6]+Tc)
+        dudx+=uR*nxR-uL*nxL; dudy+=uR*nyR-uL*nyL; dudz+=uR*nzR-uL*nzL
+        dvdx+=vR*nxR-vL*nxL; dvdy+=vR*nyR-vL*nyL; dvdz+=vR*nzR-vL*nzL
+        dwdx+=wR*nxR-wL*nxL; dwdy+=wR*nyR-wL*nyL; dwdz+=wR*nzR-wL*nzL
+        dTdx+=TR*nxR-TL*nxL; dTdy+=TR*nyR-TL*nyL; dTdz+=TR*nzR-TL*nzL
+    end
+    # Multiply by 1/Volume
+    return dudx*v,dudy*v,dudz*v, dvdx*v,dvdy*v,dvdz*v, dwdx*v,dwdy*v,dwdz*v, dTdx*v,dTdy*v,dTdz*v
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Viscous flux kernels — ds-based + optional GG correction via gg_blend
+# ═══════════════════════════════════════════════════════════════════════
+@inline function gradCell2(fL, fR, ds)
+    return (fR - fL) / (FT(2e0) * ds)
+end
+
+function viscous_flux_i(Q, Fv_x,
+        Areai, Areaj, Areak,
+        nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
+        Vol, nxp, nyp, nzp, is_inter)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG || j < NG+1 || k < NG+1
         return
     end
-
-    @inbounds ∂ξ∂x = dξdx[i, j, k]
-    @inbounds ∂ξ∂y = dξdy[i, j, k]
-    @inbounds ∂ξ∂z = dξdz[i, j, k]
-    @inbounds ∂η∂x = dηdx[i, j, k]
-    @inbounds ∂η∂y = dηdy[i, j, k]
-    @inbounds ∂η∂z = dηdz[i, j, k]
-    @inbounds ∂ζ∂x = dζdx[i, j, k]
-    @inbounds ∂ζ∂y = dζdy[i, j, k]
-    @inbounds ∂ζ∂z = dζdz[i, j, k]
-
-    @inbounds Jac = J[i, j, k]
-    @inbounds T = Q[i, j, k, 6]
-    μi::Float32 =  C_s*T*sqrt(T)/(T+T_s)
-    λi::Float32 =  Cp*μi/Pr
-
-    c1::Float32 = 1/12f0
-    c2::Float32 = -2/3f0
-    c23::Float32 = 2/3f0
-
-    @inbounds ∂u∂ξ = c1*(Q[i-2, j, k, 2] - Q[i+2, j, k, 2]) + c2*(Q[i-1, j, k, 2] - Q[i+1, j, k, 2])
-    @inbounds ∂v∂ξ = c1*(Q[i-2, j, k, 3] - Q[i+2, j, k, 3]) + c2*(Q[i-1, j, k, 3] - Q[i+1, j, k, 3])
-    @inbounds ∂w∂ξ = c1*(Q[i-2, j, k, 4] - Q[i+2, j, k, 4]) + c2*(Q[i-1, j, k, 4] - Q[i+1, j, k, 4])
-    @inbounds ∂T∂ξ = c1*(Q[i-2, j, k, 6] - Q[i+2, j, k, 6]) + c2*(Q[i-1, j, k, 6] - Q[i+1, j, k, 6])
-
-    @inbounds ∂u∂η = c1*(Q[i, j-2, k, 2] - Q[i, j+2, k, 2]) + c2*(Q[i, j-1, k, 2] - Q[i, j+1, k, 2])
-    @inbounds ∂v∂η = c1*(Q[i, j-2, k, 3] - Q[i, j+2, k, 3]) + c2*(Q[i, j-1, k, 3] - Q[i, j+1, k, 3])
-    @inbounds ∂w∂η = c1*(Q[i, j-2, k, 4] - Q[i, j+2, k, 4]) + c2*(Q[i, j-1, k, 4] - Q[i, j+1, k, 4])
-    @inbounds ∂T∂η = c1*(Q[i, j-2, k, 6] - Q[i, j+2, k, 6]) + c2*(Q[i, j-1, k, 6] - Q[i, j+1, k, 6])
-
-    @inbounds ∂u∂ζ = c1*(Q[i, j, k-2, 2] - Q[i, j, k+2, 2]) + c2*(Q[i, j, k-1, 2] - Q[i, j, k+1, 2])
-    @inbounds ∂v∂ζ = c1*(Q[i, j, k-2, 3] - Q[i, j, k+2, 3]) + c2*(Q[i, j, k-1, 3] - Q[i, j, k+1, 3])
-    @inbounds ∂w∂ζ = c1*(Q[i, j, k-2, 4] - Q[i, j, k+2, 4]) + c2*(Q[i, j, k-1, 4] - Q[i, j, k+1, 4])
-    @inbounds ∂T∂ζ = c1*(Q[i, j, k-2, 6] - Q[i, j, k+2, 6]) + c2*(Q[i, j, k-1, 6] - Q[i, j, k+1, 6])
-
-    @inbounds u = Q[i, j, k, 2]
-    @inbounds v = Q[i, j, k, 3]
-    @inbounds w = Q[i, j, k, 4]
-
-    dudx = (∂u∂ξ * ∂ξ∂x + ∂u∂η * ∂η∂x + ∂u∂ζ * ∂ζ∂x) * Jac
-    dudy = (∂u∂ξ * ∂ξ∂y + ∂u∂η * ∂η∂y + ∂u∂ζ * ∂ζ∂y) * Jac
-    dudz = (∂u∂ξ * ∂ξ∂z + ∂u∂η * ∂η∂z + ∂u∂ζ * ∂ζ∂z) * Jac
-
-    dvdx = (∂v∂ξ * ∂ξ∂x + ∂v∂η * ∂η∂x + ∂v∂ζ * ∂ζ∂x) * Jac
-    dvdy = (∂v∂ξ * ∂ξ∂y + ∂v∂η * ∂η∂y + ∂v∂ζ * ∂ζ∂y) * Jac
-    dvdz = (∂v∂ξ * ∂ξ∂z + ∂v∂η * ∂η∂z + ∂v∂ζ * ∂ζ∂z) * Jac
-
-    dwdx = (∂w∂ξ * ∂ξ∂x + ∂w∂η * ∂η∂x + ∂w∂ζ * ∂ζ∂x) * Jac
-    dwdy = (∂w∂ξ * ∂ξ∂y + ∂w∂η * ∂η∂y + ∂w∂ζ * ∂ζ∂y) * Jac
-    dwdz = (∂w∂ξ * ∂ξ∂z + ∂w∂η * ∂η∂z + ∂w∂ζ * ∂ζ∂z) * Jac
-
-    dTdx = (∂T∂ξ * ∂ξ∂x + ∂T∂η * ∂η∂x + ∂T∂ζ * ∂ζ∂x) * Jac
-    dTdy = (∂T∂ξ * ∂ξ∂y + ∂T∂η * ∂η∂y + ∂T∂ζ * ∂ζ∂y) * Jac
-    dTdz = (∂T∂ξ * ∂ξ∂z + ∂T∂η * ∂η∂z + ∂T∂ζ * ∂ζ∂z) * Jac
-
-    div = dudx + dvdy + dwdz
-
-    if LES_smag
-        Cs = 0.1f0
-        Prt = 0.9f0
-        @inbounds ρ = Q[i, j, k, 1]
-
-        @fastmath Sijmag = sqrt(2*(dudx^2 + dvdy^2 + dwdz^2 + 
-                               2*((0.5f0*(dudy+dvdx))^2 + (0.5f0*(dudz+dwdx))^2 +(0.5f0*(dvdz+dwdy))^2))) # √2|sij|
-      
-        @fastmath μt = min(ρ * (Cs/Jac^(1/3f0))^2 * Sijmag, 2*μi) #ρ(csΔ)^2 * Sijmag
-
-        λt = Cp * μt / Prt # cp = Rg*γ/(γ-1)
-
-        μi += μt
-        λi += λt
-    elseif LES_wale
-        Cw = 0.325f0
-        Prt = 0.9f0
-        @inbounds ρ = Q[i, j, k, 1]
-
-        @fastmath S = sqrt(dudx^2 + dvdy^2 + dwdz^2 + 
-        2*((0.5f0*(dudy+dvdx))^2 + (0.5f0*(dudz+dwdx))^2 +(0.5f0*(dvdz+dwdy))^2))
-
-        Sd11 = dudx*dudx + dudy*dvdx + dudz*dwdx
-        Sd22 = dvdx*dudy + dvdy*dvdy + dvdz*dwdy
-        Sd33 = dwdx*dudz + dwdy*dvdz + dwdz*dwdz
-        trSd = 1/3f0*(Sd11 + Sd22 + Sd33)
-        Sd11 -= trSd
-        Sd22 -= trSd
-        Sd33 -= trSd
-        Sd12 = 0.5f0*(dudx*dvdx + dvdx*dvdy + dwdx*dvdz + dudy*dudx + dvdy*dudy + dwdy*dudz)
-        Sd13 = 0.5f0*(dudx*dwdx + dvdx*dwdy + dwdx*dwdz + dudz*dudx + dvdz*dudy + dwdz*dudz)
-        Sd23 = 0.5f0*(dudy*dwdx + dvdy*dwdy + dwdy*dwdz + dudz*dvdx + dvdz*dvdy + dwdz*dvdz)
-        @fastmath Sd = sqrt(Sd11^2 + Sd22^2 + Sd33^2 + 2 * (Sd12^2 + Sd13^2 + Sd23^2))
-        @fastmath D = Sd^3/(S^5 + Sd^2.5f0)
-        @fastmath μt = min(ρ * (Cw/Jac^(1/3f0))^2 * D, 2*μi)
-      
-        λt = Cp * μt / Prt # cp = Rg*γ/(γ-1)
-
-        μi += μt
-        λi += λt
+    near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
+    near_inter_k = (is_inter[5] && k <= NG + 2) || (is_inter[6] && k >= nzp + NG - 1)
+    # ── AC mode: constant ν, no energy equation ──
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        iL = i; iR = i + 1
+        @inbounds begin
+            u_f = FT(0.5)*(Q[iL,j,k,2]+Q[iR,j,k,2]); v_f = FT(0.5)*(Q[iL,j,k,3]+Q[iR,j,k,3])
+            w_f = FT(0.5)*(Q[iL,j,k,4]+Q[iR,j,k,4])
+            area = Areai[i+1,j,k]; fnx = nxi[i+1,j,k]; fny = nyi[i+1,j,k]; fnz = nzi[i+1,j,k]
+            Vf_inv = FT(2.0) / (FT(1.0)/Vol[iL,j,k] + FT(1.0)/Vol[iR,j,k])
+            xix = nxi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+            xiy = nyi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+            xiz = nzi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+            etax = FT(0.25) * (nxj[iL,j,k]*Areaj[iL,j,k] + nxj[iL,j+1,k]*Areaj[iL,j+1,k] + nxj[iR,j,k]*Areaj[iR,j,k] + nxj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+            etay = FT(0.25) * (nyj[iL,j,k]*Areaj[iL,j,k] + nyj[iL,j+1,k]*Areaj[iL,j+1,k] + nyj[iR,j,k]*Areaj[iR,j,k] + nyj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+            etaz = FT(0.25) * (nzj[iL,j,k]*Areaj[iL,j,k] + nzj[iL,j+1,k]*Areaj[iL,j+1,k] + nzj[iR,j,k]*Areaj[iR,j,k] + nzj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+            zetax = FT(0.25) * (nxk[iL,j,k]*Areak[iL,j,k] + nxk[iL,j,k+1]*Areak[iL,j,k+1] + nxk[iR,j,k]*Areak[iR,j,k] + nxk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+            zetay = FT(0.25) * (nyk[iL,j,k]*Areak[iL,j,k] + nyk[iL,j,k+1]*Areak[iL,j,k+1] + nyk[iR,j,k]*Areak[iR,j,k] + nyk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+            zetaz = FT(0.25) * (nzk[iL,j,k]*Areak[iL,j,k] + nzk[iL,j,k+1]*Areak[iL,j,k+1] + nzk[iR,j,k]*Areak[iR,j,k] + nzk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+        end
+        mu = ρ_ref * ν_AC
+        @inbounds begin
+            dudxi = gradFace(Q[i-2,j,k,2],Q[i-1,j,k,2],Q[i,j,k,2],Q[i+1,j,k,2],Q[i+2,j,k,2],Q[i+3,j,k,2], FT(1.0))
+            dvdxi = gradFace(Q[i-2,j,k,3],Q[i-1,j,k,3],Q[i,j,k,3],Q[i+1,j,k,3],Q[i+2,j,k,3],Q[i+3,j,k,3], FT(1.0))
+            dwdxi = gradFace(Q[i-2,j,k,4],Q[i-1,j,k,4],Q[i,j,k,4],Q[i+1,j,k,4],Q[i+2,j,k,4],Q[i+3,j,k,4], FT(1.0))
+            dudetaL=gradCell(Q[iL,j-3,k,2],Q[iL,j-2,k,2],Q[iL,j-1,k,2],Q[iL,j+1,k,2],Q[iL,j+2,k,2],Q[iL,j+3,k,2],FT(1.0));dudetaR=gradCell(Q[iR,j-3,k,2],Q[iR,j-2,k,2],Q[iR,j-1,k,2],Q[iR,j+1,k,2],Q[iR,j+2,k,2],Q[iR,j+3,k,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell(Q[iL,j-3,k,3],Q[iL,j-2,k,3],Q[iL,j-1,k,3],Q[iL,j+1,k,3],Q[iL,j+2,k,3],Q[iL,j+3,k,3],FT(1.0));dvdetaR=gradCell(Q[iR,j-3,k,3],Q[iR,j-2,k,3],Q[iR,j-1,k,3],Q[iR,j+1,k,3],Q[iR,j+2,k,3],Q[iR,j+3,k,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell(Q[iL,j-3,k,4],Q[iL,j-2,k,4],Q[iL,j-1,k,4],Q[iL,j+1,k,4],Q[iL,j+2,k,4],Q[iL,j+3,k,4],FT(1.0));dwdetaR=gradCell(Q[iR,j-3,k,4],Q[iR,j-2,k,4],Q[iR,j-1,k,4],Q[iR,j+1,k,4],Q[iR,j+2,k,4],Q[iR,j+3,k,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+            dudzetaL=gradCell(Q[iL,j,k-3,2],Q[iL,j,k-2,2],Q[iL,j,k-1,2],Q[iL,j,k+1,2],Q[iL,j,k+2,2],Q[iL,j,k+3,2],FT(1.0));dudzetaR=gradCell(Q[iR,j,k-3,2],Q[iR,j,k-2,2],Q[iR,j,k-1,2],Q[iR,j,k+1,2],Q[iR,j,k+2,2],Q[iR,j,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell(Q[iL,j,k-3,3],Q[iL,j,k-2,3],Q[iL,j,k-1,3],Q[iL,j,k+1,3],Q[iL,j,k+2,3],Q[iL,j,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[iR,j,k-3,3],Q[iR,j,k-2,3],Q[iR,j,k-1,3],Q[iR,j,k+1,3],Q[iR,j,k+2,3],Q[iR,j,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell(Q[iL,j,k-3,4],Q[iL,j,k-2,4],Q[iL,j,k-1,4],Q[iL,j,k+1,4],Q[iL,j,k+2,4],Q[iL,j,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[iR,j,k-3,4],Q[iR,j,k-2,4],Q[iR,j,k-1,4],Q[iR,j,k+1,4],Q[iR,j,k+2,4],Q[iR,j,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+        end
+        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+        divu = dudx+dvdy+dwdz
+        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+        @inbounds for n = 1:Ncons
+            Fv_x[i-NG+1,j-NG,k-NG,n] = FT(0e0)
+        end
+        @inbounds Fv_x[i-NG+1,j-NG,k-NG,2]=fv_rhou*area
+        @inbounds Fv_x[i-NG+1,j-NG,k-NG,3]=fv_rhov*area
+        @inbounds Fv_x[i-NG+1,j-NG,k-NG,4]=fv_rhow*area
+        return
     end
+    iL = i; iR = i + 1
+    @inbounds begin
+        u_f = FT(0.5)*(Q[iL,j,k,2]+Q[iR,j,k,2]); v_f = FT(0.5)*(Q[iL,j,k,3]+Q[iR,j,k,3])
+        w_f = FT(0.5)*(Q[iL,j,k,4]+Q[iR,j,k,4]); T_f = FT(0.5)*(Q[iL,j,k,6]+Q[iR,j,k,6])
+        area = Areai[i+1,j,k]; fnx = nxi[i+1,j,k]; fny = nyi[i+1,j,k]; fnz = nzi[i+1,j,k]
+        Vf_inv = FT(2.0) / (FT(1.0)/Vol[iL,j,k] + FT(1.0)/Vol[iR,j,k])
+        xix = nxi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+        xiy = nyi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+        xiz = nzi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
+        etax = FT(0.25) * (nxj[iL,j,k]*Areaj[iL,j,k] + nxj[iL,j+1,k]*Areaj[iL,j+1,k] + nxj[iR,j,k]*Areaj[iR,j,k] + nxj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+        etay = FT(0.25) * (nyj[iL,j,k]*Areaj[iL,j,k] + nyj[iL,j+1,k]*Areaj[iL,j+1,k] + nyj[iR,j,k]*Areaj[iR,j,k] + nyj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+        etaz = FT(0.25) * (nzj[iL,j,k]*Areaj[iL,j,k] + nzj[iL,j+1,k]*Areaj[iL,j+1,k] + nzj[iR,j,k]*Areaj[iR,j,k] + nzj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
+        zetax = FT(0.25) * (nxk[iL,j,k]*Areak[iL,j,k] + nxk[iL,j,k+1]*Areak[iL,j,k+1] + nxk[iR,j,k]*Areak[iR,j,k] + nxk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+        zetay = FT(0.25) * (nyk[iL,j,k]*Areak[iL,j,k] + nyk[iL,j,k+1]*Areak[iL,j,k+1] + nyk[iR,j,k]*Areak[iR,j,k] + nyk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+        zetaz = FT(0.25) * (nzk[iL,j,k]*Areak[iL,j,k] + nzk[iL,j,k+1]*Areak[iL,j,k+1] + nzk[iR,j,k]*Areak[iR,j,k] + nzk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
+    end
+    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    @inbounds begin
+        dudxi = gradFace(Q[i-2,j,k,2],Q[i-1,j,k,2],Q[i,j,k,2],Q[i+1,j,k,2],Q[i+2,j,k,2],Q[i+3,j,k,2], FT(1.0))
+        dvdxi = gradFace(Q[i-2,j,k,3],Q[i-1,j,k,3],Q[i,j,k,3],Q[i+1,j,k,3],Q[i+2,j,k,3],Q[i+3,j,k,3], FT(1.0))
+        dwdxi = gradFace(Q[i-2,j,k,4],Q[i-1,j,k,4],Q[i,j,k,4],Q[i+1,j,k,4],Q[i+2,j,k,4],Q[i+3,j,k,4], FT(1.0))
+        dTdxi = gradFace(Q[i-2,j,k,6],Q[i-1,j,k,6],Q[i,j,k,6],Q[i+1,j,k,6],Q[i+2,j,k,6],Q[i+3,j,k,6], FT(1.0))
+        
+        if near_inter_j
+            dudetaL=gradCell2(Q[iL,j-1,k,2],Q[iL,j+1,k,2],FT(1.0));dudetaR=gradCell2(Q[iR,j-1,k,2],Q[iR,j+1,k,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell2(Q[iL,j-1,k,3],Q[iL,j+1,k,3],FT(1.0));dvdetaR=gradCell2(Q[iR,j-1,k,3],Q[iR,j+1,k,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell2(Q[iL,j-1,k,4],Q[iL,j+1,k,4],FT(1.0));dwdetaR=gradCell2(Q[iR,j-1,k,4],Q[iR,j+1,k,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+            dTdetaL=gradCell2(Q[iL,j-1,k,6],Q[iL,j+1,k,6],FT(1.0));dTdetaR=gradCell2(Q[iR,j-1,k,6],Q[iR,j+1,k,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
+        else
+            dudetaL=gradCell(Q[iL,j-3,k,2],Q[iL,j-2,k,2],Q[iL,j-1,k,2],Q[iL,j+1,k,2],Q[iL,j+2,k,2],Q[iL,j+3,k,2],FT(1.0));dudetaR=gradCell(Q[iR,j-3,k,2],Q[iR,j-2,k,2],Q[iR,j-1,k,2],Q[iR,j+1,k,2],Q[iR,j+2,k,2],Q[iR,j+3,k,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell(Q[iL,j-3,k,3],Q[iL,j-2,k,3],Q[iL,j-1,k,3],Q[iL,j+1,k,3],Q[iL,j+2,k,3],Q[iL,j+3,k,3],FT(1.0));dvdetaR=gradCell(Q[iR,j-3,k,3],Q[iR,j-2,k,3],Q[iR,j-1,k,3],Q[iR,j+1,k,3],Q[iR,j+2,k,3],Q[iR,j+3,k,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell(Q[iL,j-3,k,4],Q[iL,j-2,k,4],Q[iL,j-1,k,4],Q[iL,j+1,k,4],Q[iL,j+2,k,4],Q[iL,j+3,k,4],FT(1.0));dwdetaR=gradCell(Q[iR,j-3,k,4],Q[iR,j-2,k,4],Q[iR,j-1,k,4],Q[iR,j+1,k,4],Q[iR,j+2,k,4],Q[iR,j+3,k,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+            dTdetaL=gradCell(Q[iL,j-3,k,6],Q[iL,j-2,k,6],Q[iL,j-1,k,6],Q[iL,j+1,k,6],Q[iL,j+2,k,6],Q[iL,j+3,k,6],FT(1.0));dTdetaR=gradCell(Q[iR,j-3,k,6],Q[iR,j-2,k,6],Q[iR,j-1,k,6],Q[iR,j+1,k,6],Q[iR,j+2,k,6],Q[iR,j+3,k,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
+        end
+        if near_inter_k
+            dudzetaL=gradCell2(Q[iL,j,k-1,2],Q[iL,j,k+1,2],FT(1.0));dudzetaR=gradCell2(Q[iR,j,k-1,2],Q[iR,j,k+1,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell2(Q[iL,j,k-1,3],Q[iL,j,k+1,3],FT(1.0));dvdzetaR=gradCell2(Q[iR,j,k-1,3],Q[iR,j,k+1,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell2(Q[iL,j,k-1,4],Q[iL,j,k+1,4],FT(1.0));dwdzetaR=gradCell2(Q[iR,j,k-1,4],Q[iR,j,k+1,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+            dTdzetaL=gradCell2(Q[iL,j,k-1,6],Q[iL,j,k+1,6],FT(1.0));dTdzetaR=gradCell2(Q[iR,j,k-1,6],Q[iR,j,k+1,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
+        else
+            dudzetaL=gradCell(Q[iL,j,k-3,2],Q[iL,j,k-2,2],Q[iL,j,k-1,2],Q[iL,j,k+1,2],Q[iL,j,k+2,2],Q[iL,j,k+3,2],FT(1.0));dudzetaR=gradCell(Q[iR,j,k-3,2],Q[iR,j,k-2,2],Q[iR,j,k-1,2],Q[iR,j,k+1,2],Q[iR,j,k+2,2],Q[iR,j,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell(Q[iL,j,k-3,3],Q[iL,j,k-2,3],Q[iL,j,k-1,3],Q[iL,j,k+1,3],Q[iL,j,k+2,3],Q[iL,j,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[iR,j,k-3,3],Q[iR,j,k-2,3],Q[iR,j,k-1,3],Q[iR,j,k+1,3],Q[iR,j,k+2,3],Q[iR,j,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell(Q[iL,j,k-3,4],Q[iL,j,k-2,4],Q[iL,j,k-1,4],Q[iL,j,k+1,4],Q[iL,j,k+2,4],Q[iL,j,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[iR,j,k-3,4],Q[iR,j,k-2,4],Q[iR,j,k-1,4],Q[iR,j,k+1,4],Q[iR,j,k+2,4],Q[iR,j,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+            dTdzetaL=gradCell(Q[iL,j,k-3,6],Q[iL,j,k-2,6],Q[iL,j,k-1,6],Q[iL,j,k+1,6],Q[iL,j,k+2,6],Q[iL,j,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[iR,j,k-3,6],Q[iR,j,k-2,6],Q[iR,j,k-1,6],Q[iR,j,k+1,6],Q[iR,j,k+2,6],Q[iR,j,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
+        end
+    end
+    dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+    dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+    dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+    dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
+    # GG correction: blend in physical-space gradients for cross-derivatives
+    local_gg_blend = (near_inter_j || near_inter_k) ? zero(FT) : gg_blend
+    if local_gg_blend > zero(FT) && iR <= nxp+NG
+        # GG at real cell iR (skip if iR is a ghost cell)
+        gg = gg_cell_all(iR,j,k, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
+        α = local_gg_blend; β = one(FT) - α
+        # Only correct cross-derivatives (dudy,dudz,dvdx,dvdz,dwdx,dwdy,dTdy,dTdz)
+        # Keep normal derivatives (dudx,dvdx_not,dwdx_not,dTdx) from ds-based (high-order)
+        dudy = β*dudy + α*gg[2];  dudz = β*dudz + α*gg[3]
+        dvdx = β*dvdx + α*gg[4];  dvdy = β*dvdy + α*gg[5];  dvdz = β*dvdz + α*gg[6]
+        dwdx = β*dwdx + α*gg[7];  dwdy = β*dwdy + α*gg[8];  dwdz = β*dwdz + α*gg[9]
+        dTdy = β*dTdy + α*gg[11]; dTdz = β*dTdz + α*gg[12]
+    end
+    divu = dudx+dvdy+dwdz
+    tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+    tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+    fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+    qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @inbounds begin
+        Fv_x[i-NG+1,j-NG,k-NG,1]=FT(0e0); Fv_x[i-NG+1,j-NG,k-NG,2]=fv_rhou*area
+        Fv_x[i-NG+1,j-NG,k-NG,3]=fv_rhov*area; Fv_x[i-NG+1,j-NG,k-NG,4]=fv_rhow*area; Fv_x[i-NG+1,j-NG,k-NG,5]=fv_E*area
+    end
+    return
+end
 
-    τ11 = μi*(2*dudx - c23*div)
-    τ12 = μi*(dudy + dvdx)
-    τ13 = μi*(dudz + dwdx)
-    τ22 = μi*(2*dvdy - c23*div)
-    τ23 = μi*(dwdy + dvdz)
-    τ33 = μi*(2*dwdz - c23*div)
+function viscous_flux_j(Q, Fv_y,
+        Areai, Areaj, Areak,
+        nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
+        Vol, nxp, nyp, nzp, is_inter)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG || k < NG+1
+        return
+    end
+    near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
+    near_inter_k = (is_inter[5] && k <= NG + 2) || (is_inter[6] && k >= nzp + NG - 1)
+    # ── AC mode: constant ν, no energy equation ──
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        jL = j; jR = j + 1
+        @inbounds begin
+            u_f = FT(0.5)*(Q[i,jL,k,2]+Q[i,jR,k,2]); v_f = FT(0.5)*(Q[i,jL,k,3]+Q[i,jR,k,3])
+            w_f = FT(0.5)*(Q[i,jL,k,4]+Q[i,jR,k,4])
+            area = Areaj[i,j+1,k]; fnx = nxj[i,j+1,k]; fny = nyj[i,j+1,k]; fnz = nzj[i,j+1,k]
+            Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,jL,k] + FT(1.0)/Vol[i,jR,k])
+            xix = FT(0.25) * (nxi[i,jL,k]*Areai[i,jL,k] + nxi[i+1,jL,k]*Areai[i+1,jL,k] + nxi[i,jR,k]*Areai[i,jR,k] + nxi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+            xiy = FT(0.25) * (nyi[i,jL,k]*Areai[i,jL,k] + nyi[i+1,jL,k]*Areai[i+1,jL,k] + nyi[i,jR,k]*Areai[i,jR,k] + nyi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+            xiz = FT(0.25) * (nzi[i,jL,k]*Areai[i,jL,k] + nzi[i+1,jL,k]*Areai[i+1,jL,k] + nzi[i,jR,k]*Areai[i,jR,k] + nzi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+            etax = nxj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+            etay = nyj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+            etaz = nzj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+            zetax = FT(0.25) * (nxk[i,jL,k]*Areak[i,jL,k] + nxk[i,jL,k+1]*Areak[i,jL,k+1] + nxk[i,jR,k]*Areak[i,jR,k] + nxk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+            zetay = FT(0.25) * (nyk[i,jL,k]*Areak[i,jL,k] + nyk[i,jL,k+1]*Areak[i,jL,k+1] + nyk[i,jR,k]*Areak[i,jR,k] + nyk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+            zetaz = FT(0.25) * (nzk[i,jL,k]*Areak[i,jL,k] + nzk[i,jL,k+1]*Areak[i,jL,k+1] + nzk[i,jR,k]*Areak[i,jR,k] + nzk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+        end
+        mu = ρ_ref * ν_AC
+        @inbounds begin
+            dudeta = gradFace(Q[i,j-2,k,2],Q[i,j-1,k,2],Q[i,j,k,2],Q[i,j+1,k,2],Q[i,j+2,k,2],Q[i,j+3,k,2], FT(1.0))
+            dvdeta = gradFace(Q[i,j-2,k,3],Q[i,j-1,k,3],Q[i,j,k,3],Q[i,j+1,k,3],Q[i,j+2,k,3],Q[i,j+3,k,3], FT(1.0))
+            dwdeta = gradFace(Q[i,j-2,k,4],Q[i,j-1,k,4],Q[i,j,k,4],Q[i,j+1,k,4],Q[i,j+2,k,4],Q[i,j+3,k,4], FT(1.0))
+            dudxiL=gradCell(Q[i-3,jL,k,2],Q[i-2,jL,k,2],Q[i-1,jL,k,2],Q[i+1,jL,k,2],Q[i+2,jL,k,2],Q[i+3,jL,k,2],FT(1.0));dudxiR=gradCell(Q[i-3,jR,k,2],Q[i-2,jR,k,2],Q[i-1,jR,k,2],Q[i+1,jR,k,2],Q[i+2,jR,k,2],Q[i+3,jR,k,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell(Q[i-3,jL,k,3],Q[i-2,jL,k,3],Q[i-1,jL,k,3],Q[i+1,jL,k,3],Q[i+2,jL,k,3],Q[i+3,jL,k,3],FT(1.0));dvdxiR=gradCell(Q[i-3,jR,k,3],Q[i-2,jR,k,3],Q[i-1,jR,k,3],Q[i+1,jR,k,3],Q[i+2,jR,k,3],Q[i+3,jR,k,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell(Q[i-3,jL,k,4],Q[i-2,jL,k,4],Q[i-1,jL,k,4],Q[i+1,jL,k,4],Q[i+2,jL,k,4],Q[i+3,jL,k,4],FT(1.0));dwdxiR=gradCell(Q[i-3,jR,k,4],Q[i-2,jR,k,4],Q[i-1,jR,k,4],Q[i+1,jR,k,4],Q[i+2,jR,k,4],Q[i+3,jR,k,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dudzetaL=gradCell(Q[i,jL,k-3,2],Q[i,jL,k-2,2],Q[i,jL,k-1,2],Q[i,jL,k+1,2],Q[i,jL,k+2,2],Q[i,jL,k+3,2],FT(1.0));dudzetaR=gradCell(Q[i,jR,k-3,2],Q[i,jR,k-2,2],Q[i,jR,k-1,2],Q[i,jR,k+1,2],Q[i,jR,k+2,2],Q[i,jR,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell(Q[i,jL,k-3,3],Q[i,jL,k-2,3],Q[i,jL,k-1,3],Q[i,jL,k+1,3],Q[i,jL,k+2,3],Q[i,jL,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[i,jR,k-3,3],Q[i,jR,k-2,3],Q[i,jR,k-1,3],Q[i,jR,k+1,3],Q[i,jR,k+2,3],Q[i,jR,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell(Q[i,jL,k-3,4],Q[i,jL,k-2,4],Q[i,jL,k-1,4],Q[i,jL,k+1,4],Q[i,jL,k+2,4],Q[i,jL,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[i,jR,k-3,4],Q[i,jR,k-2,4],Q[i,jR,k-1,4],Q[i,jR,k+1,4],Q[i,jR,k+2,4],Q[i,jR,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+        end
+        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+        divu = dudx+dvdy+dwdz
+        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+        @inbounds for n = 1:Ncons
+            Fv_y[i-NG,j-NG+1,k-NG,n] = FT(0e0)
+        end
+        @inbounds Fv_y[i-NG,j-NG+1,k-NG,2]=fv_rhou*area
+        @inbounds Fv_y[i-NG,j-NG+1,k-NG,3]=fv_rhov*area
+        @inbounds Fv_y[i-NG,j-NG+1,k-NG,4]=fv_rhow*area
+        return
+    end
+    jL = j; jR = j + 1
+    @inbounds begin
+        u_f = FT(0.5)*(Q[i,jL,k,2]+Q[i,jR,k,2]); v_f = FT(0.5)*(Q[i,jL,k,3]+Q[i,jR,k,3])
+        w_f = FT(0.5)*(Q[i,jL,k,4]+Q[i,jR,k,4]); T_f = FT(0.5)*(Q[i,jL,k,6]+Q[i,jR,k,6])
+        area = Areaj[i,j+1,k]; fnx = nxj[i,j+1,k]; fny = nyj[i,j+1,k]; fnz = nzj[i,j+1,k]
+        Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,jL,k] + FT(1.0)/Vol[i,jR,k])
+        xix = FT(0.25) * (nxi[i,jL,k]*Areai[i,jL,k] + nxi[i+1,jL,k]*Areai[i+1,jL,k] + nxi[i,jR,k]*Areai[i,jR,k] + nxi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+        xiy = FT(0.25) * (nyi[i,jL,k]*Areai[i,jL,k] + nyi[i+1,jL,k]*Areai[i+1,jL,k] + nyi[i,jR,k]*Areai[i,jR,k] + nyi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+        xiz = FT(0.25) * (nzi[i,jL,k]*Areai[i,jL,k] + nzi[i+1,jL,k]*Areai[i+1,jL,k] + nzi[i,jR,k]*Areai[i,jR,k] + nzi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
+        etax = nxj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+        etay = nyj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+        etaz = nzj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
+        zetax = FT(0.25) * (nxk[i,jL,k]*Areak[i,jL,k] + nxk[i,jL,k+1]*Areak[i,jL,k+1] + nxk[i,jR,k]*Areak[i,jR,k] + nxk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+        zetay = FT(0.25) * (nyk[i,jL,k]*Areak[i,jL,k] + nyk[i,jL,k+1]*Areak[i,jL,k+1] + nyk[i,jR,k]*Areak[i,jR,k] + nyk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+        zetaz = FT(0.25) * (nzk[i,jL,k]*Areak[i,jL,k] + nzk[i,jL,k+1]*Areak[i,jL,k+1] + nzk[i,jR,k]*Areak[i,jR,k] + nzk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
+    end
+    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    @inbounds begin
+        dudeta = gradFace(Q[i,j-2,k,2],Q[i,j-1,k,2],Q[i,j,k,2],Q[i,j+1,k,2],Q[i,j+2,k,2],Q[i,j+3,k,2], FT(1.0))
+        dvdeta = gradFace(Q[i,j-2,k,3],Q[i,j-1,k,3],Q[i,j,k,3],Q[i,j+1,k,3],Q[i,j+2,k,3],Q[i,j+3,k,3], FT(1.0))
+        dwdeta = gradFace(Q[i,j-2,k,4],Q[i,j-1,k,4],Q[i,j,k,4],Q[i,j+1,k,4],Q[i,j+2,k,4],Q[i,j+3,k,4], FT(1.0))
+        dTdeta = gradFace(Q[i,j-2,k,6],Q[i,j-1,k,6],Q[i,j,k,6],Q[i,j+1,k,6],Q[i,j+2,k,6],Q[i,j+3,k,6], FT(1.0))
+        
+        if near_inter_i
+            dudxiL=gradCell2(Q[i-1,jL,k,2],Q[i+1,jL,k,2],FT(1.0));dudxiR=gradCell2(Q[i-1,jR,k,2],Q[i+1,jR,k,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell2(Q[i-1,jL,k,3],Q[i+1,jL,k,3],FT(1.0));dvdxiR=gradCell2(Q[i-1,jR,k,3],Q[i+1,jR,k,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell2(Q[i-1,jL,k,4],Q[i+1,jL,k,4],FT(1.0));dwdxiR=gradCell2(Q[i-1,jR,k,4],Q[i+1,jR,k,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dTdxiL=gradCell2(Q[i-1,jL,k,6],Q[i+1,jL,k,6],FT(1.0));dTdxiR=gradCell2(Q[i-1,jR,k,6],Q[i+1,jR,k,6],FT(1.0));dTdxi=FT(0.5)*(dTdxiL+dTdxiR)
+        else
+            dudxiL=gradCell(Q[i-3,jL,k,2],Q[i-2,jL,k,2],Q[i-1,jL,k,2],Q[i+1,jL,k,2],Q[i+2,jL,k,2],Q[i+3,jL,k,2],FT(1.0));dudxiR=gradCell(Q[i-3,jR,k,2],Q[i-2,jR,k,2],Q[i-1,jR,k,2],Q[i+1,jR,k,2],Q[i+2,jR,k,2],Q[i+3,jR,k,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell(Q[i-3,jL,k,3],Q[i-2,jL,k,3],Q[i-1,jL,k,3],Q[i+1,jL,k,3],Q[i+2,jL,k,3],Q[i+3,jL,k,3],FT(1.0));dvdxiR=gradCell(Q[i-3,jR,k,3],Q[i-2,jR,k,3],Q[i-1,jR,k,3],Q[i+1,jR,k,3],Q[i+2,jR,k,3],Q[i+3,jR,k,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell(Q[i-3,jL,k,4],Q[i-2,jL,k,4],Q[i-1,jL,k,4],Q[i+1,jL,k,4],Q[i+2,jL,k,4],Q[i+3,jL,k,4],FT(1.0));dwdxiR=gradCell(Q[i-3,jR,k,4],Q[i-2,jR,k,4],Q[i-1,jR,k,4],Q[i+1,jR,k,4],Q[i+2,jR,k,4],Q[i+3,jR,k,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dTdxiL=gradCell(Q[i-3,jL,k,6],Q[i-2,jL,k,6],Q[i-1,jL,k,6],Q[i+1,jL,k,6],Q[i+2,jL,k,6],Q[i+3,jL,k,6],FT(1.0));dTdxiR=gradCell(Q[i-3,jR,k,6],Q[i-2,jR,k,6],Q[i-1,jR,k,6],Q[i+1,jR,k,6],Q[i+2,jR,k,6],Q[i+3,jR,k,6],FT(1.0));dTdxi=FT(0.5)*(dTdxiL+dTdxiR)
+        end
+        if near_inter_k
+            dudzetaL=gradCell2(Q[i,jL,k-1,2],Q[i,jL,k+1,2],FT(1.0));dudzetaR=gradCell2(Q[i,jR,k-1,2],Q[i,jR,k+1,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell2(Q[i,jL,k-1,3],Q[i,jL,k+1,3],FT(1.0));dvdzetaR=gradCell2(Q[i,jR,k-1,3],Q[i,jR,k+1,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell2(Q[i,jL,k-1,4],Q[i,jL,k+1,4],FT(1.0));dwdzetaR=gradCell2(Q[i,jR,k-1,4],Q[i,jR,k+1,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+            dTdzetaL=gradCell2(Q[i,jL,k-1,6],Q[i,jL,k+1,6],FT(1.0));dTdzetaR=gradCell2(Q[i,jR,k-1,6],Q[i,jR,k+1,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
+        else
+            dudzetaL=gradCell(Q[i,jL,k-3,2],Q[i,jL,k-2,2],Q[i,jL,k-1,2],Q[i,jL,k+1,2],Q[i,jL,k+2,2],Q[i,jL,k+3,2],FT(1.0));dudzetaR=gradCell(Q[i,jR,k-3,2],Q[i,jR,k-2,2],Q[i,jR,k-1,2],Q[i,jR,k+1,2],Q[i,jR,k+2,2],Q[i,jR,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
+            dvdzetaL=gradCell(Q[i,jL,k-3,3],Q[i,jL,k-2,3],Q[i,jL,k-1,3],Q[i,jL,k+1,3],Q[i,jL,k+2,3],Q[i,jL,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[i,jR,k-3,3],Q[i,jR,k-2,3],Q[i,jR,k-1,3],Q[i,jR,k+1,3],Q[i,jR,k+2,3],Q[i,jR,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
+            dwdzetaL=gradCell(Q[i,jL,k-3,4],Q[i,jL,k-2,4],Q[i,jL,k-1,4],Q[i,jL,k+1,4],Q[i,jL,k+2,4],Q[i,jL,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[i,jR,k-3,4],Q[i,jR,k-2,4],Q[i,jR,k-1,4],Q[i,jR,k+1,4],Q[i,jR,k+2,4],Q[i,jR,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
+            dTdzetaL=gradCell(Q[i,jL,k-3,6],Q[i,jL,k-2,6],Q[i,jL,k-1,6],Q[i,jL,k+1,6],Q[i,jL,k+2,6],Q[i,jL,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[i,jR,k-3,6],Q[i,jR,k-2,6],Q[i,jR,k-1,6],Q[i,jR,k+1,6],Q[i,jR,k+2,6],Q[i,jR,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
+        end
+    end
+    dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+    dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+    dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+    dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
+    # GG correction for cross-derivatives (including wall faces)
+    local_gg_blend = (near_inter_i || near_inter_k) ? zero(FT) : gg_blend
+    if local_gg_blend > zero(FT) && jR <= nyp+NG
+        # GG at real cell jR (skip if jR is a ghost cell)
+        gg = gg_cell_all(i,jR,k, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
+        α = local_gg_blend; β = one(FT) - α
+        dudx = β*dudx + α*gg[1];  dudz = β*dudz + α*gg[3]
+        dvdx = β*dvdx + α*gg[4];  dvdz = β*dvdz + α*gg[6]
+        dwdx = β*dwdx + α*gg[7];  dwdz = β*dwdz + α*gg[9]
+        dTdx = β*dTdx + α*gg[10]; dTdz = β*dTdz + α*gg[12]
+    end
+    divu = dudx+dvdy+dwdz
+    tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+    tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+    fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+    qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @inbounds begin
+        Fv_y[i-NG,j-NG+1,k-NG,1]=FT(0e0); Fv_y[i-NG,j-NG+1,k-NG,2]=fv_rhou*area
+        Fv_y[i-NG,j-NG+1,k-NG,3]=fv_rhov*area; Fv_y[i-NG,j-NG+1,k-NG,4]=fv_rhow*area; Fv_y[i-NG,j-NG+1,k-NG,5]=fv_E*area
+    end
+    return
+end
 
-    @inbounds E1 = u * τ11 + v * τ12 + w * τ13 + λi * dTdx
-    @inbounds E2 = u * τ12 + v * τ22 + w * τ23 + λi * dTdy
-    @inbounds E3 = u * τ13 + v * τ23 + w * τ33 + λi * dTdz
-
-    @inbounds Fv_x[i-2, j-2, k-2, 1] = ∂ξ∂x * τ11 + ∂ξ∂y * τ12 + ∂ξ∂z * τ13
-    @inbounds Fv_x[i-2, j-2, k-2, 2] = ∂ξ∂x * τ12 + ∂ξ∂y * τ22 + ∂ξ∂z * τ23
-    @inbounds Fv_x[i-2, j-2, k-2, 3] = ∂ξ∂x * τ13 + ∂ξ∂y * τ23 + ∂ξ∂z * τ33
-    @inbounds Fv_x[i-2, j-2, k-2, 4] = ∂ξ∂x * E1 + ∂ξ∂y * E2 + ∂ξ∂z * E3
-
-    @inbounds Fv_y[i-2, j-2, k-2, 1] = ∂η∂x * τ11 + ∂η∂y * τ12 + ∂η∂z * τ13
-    @inbounds Fv_y[i-2, j-2, k-2, 2] = ∂η∂x * τ12 + ∂η∂y * τ22 + ∂η∂z * τ23
-    @inbounds Fv_y[i-2, j-2, k-2, 3] = ∂η∂x * τ13 + ∂η∂y * τ23 + ∂η∂z * τ33
-    @inbounds Fv_y[i-2, j-2, k-2, 4] = ∂η∂x * E1 + ∂η∂y * E2 + ∂η∂z * E3
-
-    @inbounds Fv_z[i-2, j-2, k-2, 1] = ∂ζ∂x * τ11 + ∂ζ∂y * τ12 + ∂ζ∂z * τ13
-    @inbounds Fv_z[i-2, j-2, k-2, 2] = ∂ζ∂x * τ12 + ∂ζ∂y * τ22 + ∂ζ∂z * τ23
-    @inbounds Fv_z[i-2, j-2, k-2, 3] = ∂ζ∂x * τ13 + ∂ζ∂y * τ23 + ∂ζ∂z * τ33
-    @inbounds Fv_z[i-2, j-2, k-2, 4] = ∂ζ∂x * E1 + ∂ζ∂y * E2 + ∂ζ∂z * E3
+function viscous_flux_k(Q, Fv_z,
+        Areai, Areaj, Areak,
+        nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
+        Vol, nxp, nyp, nzp, is_inter)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG
+        return
+    end
+    near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
+    near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
+    # ── AC mode: constant ν, no energy equation ──
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        kL = k; kR = k + 1
+        @inbounds begin
+            u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])
+            w_f = FT(0.5)*(Q[i,j,kL,4]+Q[i,j,kR,4])
+            area = Areak[i,j,k+1]; fnx = nxk[i,j,k+1]; fny = nyk[i,j,k+1]; fnz = nzk[i,j,k+1]
+            Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,j,kL] + FT(1.0)/Vol[i,j,kR])
+            xix = FT(0.25) * (nxi[i,j,kL]*Areai[i,j,kL] + nxi[i+1,j,kL]*Areai[i+1,j,kL] + nxi[i,j,kR]*Areai[i,j,kR] + nxi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+            xiy = FT(0.25) * (nyi[i,j,kL]*Areai[i,j,kL] + nyi[i+1,j,kL]*Areai[i+1,j,kL] + nyi[i,j,kR]*Areai[i,j,kR] + nyi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+            xiz = FT(0.25) * (nzi[i,j,kL]*Areai[i,j,kL] + nzi[i+1,j,kL]*Areai[i+1,j,kL] + nzi[i,j,kR]*Areai[i,j,kR] + nzi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+            etax = FT(0.25) * (nxj[i,j,kL]*Areaj[i,j,kL] + nxj[i,j+1,kL]*Areaj[i,j+1,kL] + nxj[i,j,kR]*Areaj[i,j,kR] + nxj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+            etay = FT(0.25) * (nyj[i,j,kL]*Areaj[i,j,kL] + nyj[i,j+1,kL]*Areaj[i,j+1,kL] + nyj[i,j,kR]*Areaj[i,j,kR] + nyj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+            etaz = FT(0.25) * (nzj[i,j,kL]*Areaj[i,j,kL] + nzj[i,j+1,kL]*Areaj[i,j+1,kL] + nzj[i,j,kR]*Areaj[i,j,kR] + nzj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+            zetax = nxk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+            zetay = nyk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+            zetaz = nzk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+        end
+        mu = ρ_ref * ν_AC
+        @inbounds begin
+            dudzeta = gradFace(Q[i,j,k-2,2],Q[i,j,k-1,2],Q[i,j,k,2],Q[i,j,k+1,2],Q[i,j,k+2,2],Q[i,j,k+3,2], FT(1.0))
+            dvdzeta = gradFace(Q[i,j,k-2,3],Q[i,j,k-1,3],Q[i,j,k,3],Q[i,j,k+1,3],Q[i,j,k+2,3],Q[i,j,k+3,3], FT(1.0))
+            dwdzeta = gradFace(Q[i,j,k-2,4],Q[i,j,k-1,4],Q[i,j,k,4],Q[i,j,k+1,4],Q[i,j,k+2,4],Q[i,j,k+3,4], FT(1.0))
+            dudxiL=gradCell(Q[i-3,j,kL,2],Q[i-2,j,kL,2],Q[i-1,j,kL,2],Q[i+1,j,kL,2],Q[i+2,j,kL,2],Q[i+3,j,kL,2],FT(1.0));dudxiR=gradCell(Q[i-3,j,kR,2],Q[i-2,j,kR,2],Q[i-1,j,kR,2],Q[i+1,j,kR,2],Q[i+2,j,kR,2],Q[i+3,j,kR,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell(Q[i-3,j,kL,3],Q[i-2,j,kL,3],Q[i-1,j,kL,3],Q[i+1,j,kL,3],Q[i+2,j,kL,3],Q[i+3,j,kL,3],FT(1.0));dvdxiR=gradCell(Q[i-3,j,kR,3],Q[i-2,j,kR,3],Q[i-1,j,kR,3],Q[i+1,j,kR,3],Q[i+2,j,kR,3],Q[i+3,j,kR,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell(Q[i-3,j,kL,4],Q[i-2,j,kL,4],Q[i-1,j,kL,4],Q[i+1,j,kL,4],Q[i+2,j,kL,4],Q[i+3,j,kL,4],FT(1.0));dwdxiR=gradCell(Q[i-3,j,kR,4],Q[i-2,j,kR,4],Q[i-1,j,kR,4],Q[i+1,j,kR,4],Q[i+2,j,kR,4],Q[i+3,j,kR,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dudetaL=gradCell(Q[i,j-3,kL,2],Q[i,j-2,kL,2],Q[i,j-1,kL,2],Q[i,j+1,kL,2],Q[i,j+2,kL,2],Q[i,j+3,kL,2],FT(1.0));dudetaR=gradCell(Q[i,j-3,kR,2],Q[i,j-2,kR,2],Q[i,j-1,kR,2],Q[i,j+1,kR,2],Q[i,j+2,kR,2],Q[i,j+3,kR,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell(Q[i,j-3,kL,3],Q[i,j-2,kL,3],Q[i,j-1,kL,3],Q[i,j+1,kL,3],Q[i,j+2,kL,3],Q[i,j+3,kL,3],FT(1.0));dvdetaR=gradCell(Q[i,j-3,kR,3],Q[i,j-2,kR,3],Q[i,j-1,kR,3],Q[i,j+1,kR,3],Q[i,j+2,kR,3],Q[i,j+3,kR,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell(Q[i,j-3,kL,4],Q[i,j-2,kL,4],Q[i,j-1,kL,4],Q[i,j+1,kL,4],Q[i,j+2,kL,4],Q[i,j+3,kL,4],FT(1.0));dwdetaR=gradCell(Q[i,j-3,kR,4],Q[i,j-2,kR,4],Q[i,j-1,kR,4],Q[i,j+1,kR,4],Q[i,j+2,kR,4],Q[i,j+3,kR,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+        end
+        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+        divu = dudx+dvdy+dwdz
+        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+        @inbounds for n = 1:Ncons
+            Fv_z[i-NG,j-NG,k-NG+1,n] = FT(0e0)
+        end
+        @inbounds Fv_z[i-NG,j-NG,k-NG+1,2]=fv_rhou*area
+        @inbounds Fv_z[i-NG,j-NG,k-NG+1,3]=fv_rhov*area
+        @inbounds Fv_z[i-NG,j-NG,k-NG+1,4]=fv_rhow*area
+        return
+    end
+    kL = k; kR = k + 1
+    @inbounds begin
+        u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])
+        w_f = FT(0.5)*(Q[i,j,kL,4]+Q[i,j,kR,4]); T_f = FT(0.5)*(Q[i,j,kL,6]+Q[i,j,kR,6])
+        area = Areak[i,j,k+1]; fnx = nxk[i,j,k+1]; fny = nyk[i,j,k+1]; fnz = nzk[i,j,k+1]
+        Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,j,kL] + FT(1.0)/Vol[i,j,kR])
+        xix = FT(0.25) * (nxi[i,j,kL]*Areai[i,j,kL] + nxi[i+1,j,kL]*Areai[i+1,j,kL] + nxi[i,j,kR]*Areai[i,j,kR] + nxi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+        xiy = FT(0.25) * (nyi[i,j,kL]*Areai[i,j,kL] + nyi[i+1,j,kL]*Areai[i+1,j,kL] + nyi[i,j,kR]*Areai[i,j,kR] + nyi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+        xiz = FT(0.25) * (nzi[i,j,kL]*Areai[i,j,kL] + nzi[i+1,j,kL]*Areai[i+1,j,kL] + nzi[i,j,kR]*Areai[i,j,kR] + nzi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
+        etax = FT(0.25) * (nxj[i,j,kL]*Areaj[i,j,kL] + nxj[i,j+1,kL]*Areaj[i,j+1,kL] + nxj[i,j,kR]*Areaj[i,j,kR] + nxj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+        etay = FT(0.25) * (nyj[i,j,kL]*Areaj[i,j,kL] + nyj[i,j+1,kL]*Areaj[i,j+1,kL] + nyj[i,j,kR]*Areaj[i,j,kR] + nyj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+        etaz = FT(0.25) * (nzj[i,j,kL]*Areaj[i,j,kL] + nzj[i,j+1,kL]*Areaj[i,j+1,kL] + nzj[i,j,kR]*Areaj[i,j,kR] + nzj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
+        zetax = nxk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+        zetay = nyk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+        zetaz = nzk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
+    end
+    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    @inbounds begin
+        dudzeta = gradFace(Q[i,j,k-2,2],Q[i,j,k-1,2],Q[i,j,k,2],Q[i,j,k+1,2],Q[i,j,k+2,2],Q[i,j,k+3,2], FT(1.0))
+        dvdzeta = gradFace(Q[i,j,k-2,3],Q[i,j,k-1,3],Q[i,j,k,3],Q[i,j,k+1,3],Q[i,j,k+2,3],Q[i,j,k+3,3], FT(1.0))
+        dwdzeta = gradFace(Q[i,j,k-2,4],Q[i,j,k-1,4],Q[i,j,k,4],Q[i,j,k+1,4],Q[i,j,k+2,4],Q[i,j,k+3,4], FT(1.0))
+        dTdzeta = gradFace(Q[i,j,k-2,6],Q[i,j,k-1,6],Q[i,j,k,6],Q[i,j,k+1,6],Q[i,j,k+2,6],Q[i,j,k+3,6], FT(1.0))
+        
+        if near_inter_i
+            dudxiL=gradCell2(Q[i-1,j,kL,2],Q[i+1,j,kL,2],FT(1.0));dudxiR=gradCell2(Q[i-1,j,kR,2],Q[i+1,j,kR,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell2(Q[i-1,j,kL,3],Q[i+1,j,kL,3],FT(1.0));dvdxiR=gradCell2(Q[i-1,j,kR,3],Q[i+1,j,kR,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell2(Q[i-1,j,kL,4],Q[i+1,j,kL,4],FT(1.0));dwdxiR=gradCell2(Q[i-1,j,kR,4],Q[i+1,j,kR,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dTdxiL=gradCell2(Q[i-1,j,kL,6],Q[i+1,j,kL,6],FT(1.0));dTdxiR=gradCell2(Q[i-1,j,kR,6],Q[i+1,j,kR,6],FT(1.0));dTdxi=FT(0.5)*(dTdxiL+dTdxiR)
+        else
+            dudxiL=gradCell(Q[i-3,j,kL,2],Q[i-2,j,kL,2],Q[i-1,j,kL,2],Q[i+1,j,kL,2],Q[i+2,j,kL,2],Q[i+3,j,kL,2],FT(1.0));dudxiR=gradCell(Q[i-3,j,kR,2],Q[i-2,j,kR,2],Q[i-1,j,kR,2],Q[i+1,j,kR,2],Q[i+2,j,kR,2],Q[i+3,j,kR,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
+            dvdxiL=gradCell(Q[i-3,j,kL,3],Q[i-2,j,kL,3],Q[i-1,j,kL,3],Q[i+1,j,kL,3],Q[i+2,j,kL,3],Q[i+3,j,kL,3],FT(1.0));dvdxiR=gradCell(Q[i-3,j,kR,3],Q[i-2,j,kR,3],Q[i-1,j,kR,3],Q[i+1,j,kR,3],Q[i+2,j,kR,3],Q[i+3,j,kR,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
+            dwdxiL=gradCell(Q[i-3,j,kL,4],Q[i-2,j,kL,4],Q[i-1,j,kL,4],Q[i+1,j,kL,4],Q[i+2,j,kL,4],Q[i+3,j,kL,4],FT(1.0));dwdxiR=gradCell(Q[i-3,j,kR,4],Q[i-2,j,kR,4],Q[i-1,j,kR,4],Q[i+1,j,kR,4],Q[i+2,j,kR,4],Q[i+3,j,kR,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
+            dTdxiL=gradCell(Q[i-3,j,kL,6],Q[i-2,j,kL,6],Q[i-1,j,kL,6],Q[i+1,j,kL,6],Q[i+2,j,kL,6],Q[i+3,j,kL,6],FT(1.0));dTdxiR=gradCell(Q[i-3,j,kR,6],Q[i-2,j,kR,6],Q[i-1,j,kR,6],Q[i+1,j,kR,6],Q[i+2,j,kR,6],Q[i+3,j,kR,6],FT(1.0));dTdxi=FT(0.5)*(dTdxiL+dTdxiR)
+        end
+        if near_inter_j
+            dudetaL=gradCell2(Q[i,j-1,kL,2],Q[i,j+1,kL,2],FT(1.0));dudetaR=gradCell2(Q[i,j-1,kR,2],Q[i,j+1,kR,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell2(Q[i,j-1,kL,3],Q[i,j+1,kL,3],FT(1.0));dvdetaR=gradCell2(Q[i,j-1,kR,3],Q[i,j+1,kR,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell2(Q[i,j-1,kL,4],Q[i,j+1,kL,4],FT(1.0));dwdetaR=gradCell2(Q[i,j-1,kR,4],Q[i,j+1,kR,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+            dTdetaL=gradCell2(Q[i,j-1,kL,6],Q[i,j+1,kL,6],FT(1.0));dTdetaR=gradCell2(Q[i,j-1,kR,6],Q[i,j+1,kR,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
+        else
+            dudetaL=gradCell(Q[i,j-3,kL,2],Q[i,j-2,kL,2],Q[i,j-1,kL,2],Q[i,j+1,kL,2],Q[i,j+2,kL,2],Q[i,j+3,kL,2],FT(1.0));dudetaR=gradCell(Q[i,j-3,kR,2],Q[i,j-2,kR,2],Q[i,j-1,kR,2],Q[i,j+1,kR,2],Q[i,j+2,kR,2],Q[i,j+3,kR,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
+            dvdetaL=gradCell(Q[i,j-3,kL,3],Q[i,j-2,kL,3],Q[i,j-1,kL,3],Q[i,j+1,kL,3],Q[i,j+2,kL,3],Q[i,j+3,kL,3],FT(1.0));dvdetaR=gradCell(Q[i,j-3,kR,3],Q[i,j-2,kR,3],Q[i,j-1,kR,3],Q[i,j+1,kR,3],Q[i,j+2,kR,3],Q[i,j+3,kR,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
+            dwdetaL=gradCell(Q[i,j-3,kL,4],Q[i,j-2,kL,4],Q[i,j-1,kL,4],Q[i,j+1,kL,4],Q[i,j+2,kL,4],Q[i,j+3,kL,4],FT(1.0));dwdetaR=gradCell(Q[i,j-3,kR,4],Q[i,j-2,kR,4],Q[i,j-1,kR,4],Q[i,j+1,kR,4],Q[i,j+2,kR,4],Q[i,j+3,kR,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
+            dTdetaL=gradCell(Q[i,j-3,kL,6],Q[i,j-2,kL,6],Q[i,j-1,kL,6],Q[i,j+1,kL,6],Q[i,j+2,kL,6],Q[i,j+3,kL,6],FT(1.0));dTdetaR=gradCell(Q[i,j-3,kR,6],Q[i,j-2,kR,6],Q[i,j-1,kR,6],Q[i,j+1,kR,6],Q[i,j+2,kR,6],Q[i,j+3,kR,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
+        end
+    end
+    dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
+    dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
+    dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
+    dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
+    # GG correction for cross-derivatives (including wall faces)
+    local_gg_blend = (near_inter_i || near_inter_j) ? zero(FT) : gg_blend
+    if local_gg_blend > zero(FT) && kR <= nzp+NG
+        # GG at real cell kR (skip if kR is a ghost cell)
+        gg = gg_cell_all(i,j,kR, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
+        α = local_gg_blend; β = one(FT) - α
+        dudx = β*dudx + α*gg[1];  dudy = β*dudy + α*gg[2]
+        dvdx = β*dvdx + α*gg[4];  dvdy = β*dvdy + α*gg[5]
+        dwdx = β*dwdx + α*gg[7];  dwdy = β*dwdy + α*gg[8]
+        dTdx = β*dTdx + α*gg[10]; dTdy = β*dTdy + α*gg[11]
+    end
+    divu = dudx+dvdy+dwdz
+    tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
+    tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
+    fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
+    qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @inbounds begin
+        Fv_z[i-NG,j-NG,k-NG+1,1]=FT(0e0); Fv_z[i-NG,j-NG,k-NG+1,2]=fv_rhou*area
+        Fv_z[i-NG,j-NG,k-NG+1,3]=fv_rhov*area; Fv_z[i-NG,j-NG,k-NG+1,4]=fv_rhow*area; Fv_z[i-NG,j-NG,k-NG+1,5]=fv_E*area
+    end
     return
 end

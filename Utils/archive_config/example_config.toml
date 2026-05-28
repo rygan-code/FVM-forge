@@ -1,0 +1,38 @@
+# =============================================================================
+# Sample config for convert_plot3d.jl
+# This example shows a 2-block channel flow configuration
+# =============================================================================
+
+# Ghost cell layers (must match solver's NG)
+NG = 4
+
+# Plot3D file format: true = ASCII formatted, false = binary
+formatted = false
+
+# Coordinate precision in the Plot3D binary file: "float64" or "float32"
+precision = "float64"
+
+# ─── Block Connectivity ───────────────────────────────────────────────
+# Each entry defines a face-to-face connection between two blocks.
+# Faces: 1=ξ-, 2=ξ+, 3=η-, 4=η+, 5=ζ-, 6=ζ+
+# Format: blocks = [block_A, face_A, block_B, face_B]
+#
+# NOTE: For EACH physical interface, add BOTH directions!
+# (block A → B) AND (block B → A)
+
+[[connectivity]]
+blocks = [0, 4, 1, 3]    # Block 0 η+ connects to Block 1 η-
+
+[[connectivity]]
+blocks = [1, 3, 0, 4]    # Block 1 η- connects to Block 0 η+ (reverse)
+
+# ─── Boundary Conditions ──────────────────────────────────────────────
+# Each block has 6 faces indexed 1..6 (ξ-, ξ+, η-, η+, ζ-, ζ+)
+# Types: "interblock", "wall", "periodic", "inflow", "outflow", "symmetry"
+
+[face_bc]
+# Block 0: ξ± periodic, η- wall, η+ interblock, ζ± periodic
+0 = ["periodic", "periodic", "wall", "interblock", "periodic", "periodic"]
+
+# Block 1: ξ± periodic, η- interblock, η+ wall, ζ± periodic
+1 = ["periodic", "periodic", "interblock", "wall", "periodic", "periodic"]

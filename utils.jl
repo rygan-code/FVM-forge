@@ -1,24 +1,60 @@
 # Range: 1+NG -> N+NG
-function c2Prim(U, Q)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function c2Prim(U, Q, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+        return
+    end
+
+    # AC mode: Q == U (identity conversion)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        for n = 1:Ncons
+            @inbounds Q[i, j, k, n] = U[i, j, k, n]
+        end
+        return
+    end
+
+    # MHD mode: U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ) → Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ)
+    if equation_type == :MHD
+        @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+        ρinv = one(FT) / ρ
+        @inbounds u = U[i, j, k, 2] * ρinv
+        @inbounds v = U[i, j, k, 3] * ρinv
+        @inbounds w = U[i, j, k, 4] * ρinv
+        @inbounds Bx = U[i, j, k, 6]; @inbounds By = U[i, j, k, 7]; @inbounds Bz = U[i, j, k, 8]
+        B2 = Bx*Bx + By*By + Bz*Bz
+        @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
+        p = (γ - one(FT)) * ei
+        T = p / (ρ * Rg)
+        @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+        @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+        @inbounds Q[i,j,k,7] = Bx; Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
+        @inbounds Q[i,j,k,10] = U[i, j, k, 9]  # ψ
         return
     end
 
     # correction
-    @inbounds ρ = max(U[i, j, k, 1], CUDA.eps(Float32))
-    @inbounds ρinv = 1/ρ 
+    @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+    @inbounds ρinv = one(FT)/ρ 
 
     @inbounds u = U[i, j, k, 2]*ρinv # U
     @inbounds v = U[i, j, k, 3]*ρinv # V
     @inbounds w = U[i, j, k, 4]*ρinv # W
-    @inbounds ei = max((U[i, j, k, 5] - 0.5f0*ρ*(u^2 + v^2 + w^2)), CUDA.eps(Float32))
+    @inbounds ei = max((U[i, j, k, 5] - FT(0.5)*ρ*(u^2 + v^2 + w^2)), eps(FT))
 
-    p::Float32 = (γ-1) * ei
-    T::Float32 = p/(ρ*Rg)
+    p::FT = (γ-one(FT)) * ei
+    
+    # Positivity clipping
+    ρ_min = FT(1.0e-5)
+    p_min = FT(1.0e-5)
+    ρ = max(ρ, ρ_min)
+    p = max(p, p_min)
+    
+    T::FT = p/(ρ*Rg)
+    T = max(T, eps(FT))
+    p = ρ * Rg * T  # recompute p from clamped T for consistency
 
     @inbounds Q[i, j, k, 1] = ρ
     @inbounds Q[i, j, k, 2] = u
@@ -29,13 +65,106 @@ function c2Prim(U, Q)
     return
 end
 
-# Range: 1 -> N+2*NG
-function prim2c(U, Q)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+# Covers full padded domain
+function c2Prim_global(U, Q, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+2*NG || j > Nyp+2*NG || k > Nzp+2*NG
+    if i > nxp+2*NG || j > nyp+2*NG || k > nzp+2*NG || i < 1 || j < 1 || k < 1
+        return
+    end
+
+    # AC mode: Q == U (identity)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        for n = 1:Ncons
+            @inbounds Q[i, j, k, n] = U[i, j, k, n]
+        end
+        return
+    end
+
+    # MHD mode
+    if equation_type == :MHD
+        @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+        ρinv = one(FT) / ρ
+        @inbounds u = U[i, j, k, 2] * ρinv
+        @inbounds v = U[i, j, k, 3] * ρinv
+        @inbounds w = U[i, j, k, 4] * ρinv
+        @inbounds Bx = U[i, j, k, 6]; @inbounds By = U[i, j, k, 7]; @inbounds Bz = U[i, j, k, 8]
+        B2 = Bx*Bx + By*By + Bz*Bz
+        @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
+        p = (γ - one(FT)) * ei
+        T = p / (ρ * Rg)
+        @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+        @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+        @inbounds Q[i,j,k,7] = Bx; Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
+        @inbounds Q[i,j,k,10] = U[i, j, k, 9]
+        return
+    end
+
+    @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+    @inbounds ρinv = one(FT)/ρ 
+
+    @inbounds u = U[i, j, k, 2]*ρinv 
+    @inbounds v = U[i, j, k, 3]*ρinv 
+    @inbounds w = U[i, j, k, 4]*ρinv 
+    @inbounds ei = max((U[i, j, k, 5] - FT(0.5)*ρ*(u^2 + v^2 + w^2)), eps(FT))
+
+    p::FT = (γ-one(FT)) * ei
+    
+    # Positivity clipping
+    ρ_min = FT(1.0e-5)
+    p_min = FT(1.0e-5)
+    ρ = max(ρ, ρ_min)
+    p = max(p, p_min)
+    
+    T::FT = p/(ρ*Rg)
+    T = max(T, eps(FT))
+    p = ρ * Rg * T  # recompute p from clamped T for consistency
+
+    @inbounds Q[i, j, k, 1] = ρ
+    @inbounds Q[i, j, k, 2] = u
+    @inbounds Q[i, j, k, 3] = v
+    @inbounds Q[i, j, k, 4] = w
+    @inbounds Q[i, j, k, 5] = p
+    @inbounds Q[i, j, k, 6] = T
+    return
+end
+
+# Range: 1+NG -> N+NG
+function prim2c(U, Q, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+        return
+    end
+
+    # AC mode: U == Q (identity)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        for n = 1:Ncons
+            @inbounds U[i, j, k, n] = Q[i, j, k, n]
+        end
+        return
+    end
+
+    # MHD mode: Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ) → U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ)
+    if equation_type == :MHD
+        @inbounds ρ = Q[i, j, k, 1]
+        @inbounds u = Q[i, j, k, 2]; @inbounds v = Q[i, j, k, 3]; @inbounds w = Q[i, j, k, 4]
+        @inbounds p = Q[i, j, k, 5]
+        @inbounds Bx = Q[i, j, k, 7]; @inbounds By = Q[i, j, k, 8]; @inbounds Bz = Q[i, j, k, 9]
+        B2 = Bx*Bx + By*By + Bz*Bz
+        @inbounds U[i,j,k,1] = ρ
+        @inbounds U[i,j,k,2] = ρ * u
+        @inbounds U[i,j,k,3] = ρ * v
+        @inbounds U[i,j,k,4] = ρ * w
+        @inbounds U[i,j,k,5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u*u + v*v + w*w) + FT(0.5) * B2
+        @inbounds U[i,j,k,6] = Bx
+        @inbounds U[i,j,k,7] = By
+        @inbounds U[i,j,k,8] = Bz
+        @inbounds U[i,j,k,9] = Q[i, j, k, 10]  # ψ
         return
     end
 
@@ -49,17 +178,17 @@ function prim2c(U, Q)
     @inbounds U[i, j, k, 2] = u * ρ
     @inbounds U[i, j, k, 3] = v * ρ
     @inbounds U[i, j, k, 4] = w * ρ
-    @inbounds U[i, j, k, 5] = ei + 0.5f0 * ρ * (u^2 + v^2 + w^2)
+    @inbounds U[i, j, k, 5] = ei + FT(0.5) * ρ * (u^2 + v^2 + w^2)
     return
 end
 
 # Range: 1+NG -> N+NG
-function linComb(U, Un, NV, a::Float32, b::Float32)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function linComb(U, Un, NV, a::FT, b::FT, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
@@ -70,118 +199,183 @@ function linComb(U, Un, NV, a::Float32, b::Float32)
 end
 
 # Range: 1+NG -> N+NG
-function compute_dt(dt, Q, J, S1, S2, S3)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+# Uses contravariant velocities (spectral radius) for correct CFL on curvilinear grids.
+# λ_ξ = (|U_contra| + c) * Area / Vol  for each direction
+function compute_dt(dt, Q, J, S1, S2, S3,
+                    nxi, nyi, nzi,   # ξ-face normals
+                    nxj, nyj, nzj,   # η-face normals
+                    nxk, nyk, nzk,   # ζ-face normals
+                    nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
     @inbounds u = Q[i, j, k, 2]
     @inbounds v = Q[i, j, k, 3]
     @inbounds w = Q[i, j, k, 4]
-    @inbounds T = Q[i, j, k, 6]
 
-    @inbounds V = 1/J[i, j, k]
-    c = sqrt(γ*Rg*T)
-    @inbounds dx = V/S1[i, j, k]
-    @inbounds dy = V/S2[i, j, k]
-    @inbounds dz = V/S3[i, j, k]
+    @inbounds Vol = one(FT) / J[i, j, k]
 
-    dtx = dx/(u+c)
-    dty = dy/(v+c)
-    dtz = dz/(w+c)
+    # Wave speed: compressible uses sound speed, AC uses β, MHD uses fast magnetosonic
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        c = β_AC
+    elseif equation_type == :MHD
+        @inbounds ρ_val = Q[i, j, k, 1]
+        @inbounds T_val = Q[i, j, k, 6]
+        c2 = γ * Rg * T_val  # sound speed squared
+        @inbounds Bx_v = Q[i, j, k, 7]; @inbounds By_v = Q[i, j, k, 8]; @inbounds Bz_v = Q[i, j, k, 9]
+        va2 = (Bx_v*Bx_v + By_v*By_v + Bz_v*Bz_v) / (ρ_val + FT(1.0e-30))  # Alfvén speed²
+        # Fast magnetosonic speed (isotropic estimate for CFL)
+        c = sqrt(c2 + va2)
+    else
+        @inbounds T = Q[i, j, k, 6]
+        c = sqrt(γ*Rg*T)
+    end
 
-    @inbounds dt[i, j, k] = min(dtx, dty, dtz) * LTS_CFL
+    # ξ-direction: average face normals from i and i+1 faces
+    @inbounds nx_i = FT(0.5) * (nxi[i, j, k] + nxi[i+1, j, k])
+    @inbounds ny_i = FT(0.5) * (nyi[i, j, k] + nyi[i+1, j, k])
+    @inbounds nz_i = FT(0.5) * (nzi[i, j, k] + nzi[i+1, j, k])
+    Ucon_i = abs(u*nx_i + v*ny_i + w*nz_i)
+    @inbounds Ai = FT(0.5) * (S1[i, j, k] + S1[i+1, j, k])  # average face area (fallback: use S1[i,j,k])
+
+    # η-direction
+    @inbounds nx_j = FT(0.5) * (nxj[i, j, k] + nxj[i, j+1, k])
+    @inbounds ny_j = FT(0.5) * (nyj[i, j, k] + nyj[i, j+1, k])
+    @inbounds nz_j = FT(0.5) * (nzj[i, j, k] + nzj[i, j+1, k])
+    Ucon_j = abs(u*nx_j + v*ny_j + w*nz_j)
+    @inbounds Aj = FT(0.5) * (S2[i, j, k] + S2[i, j+1, k])
+
+    # ζ-direction
+    @inbounds nx_k = FT(0.5) * (nxk[i, j, k] + nxk[i, j, k+1])
+    @inbounds ny_k = FT(0.5) * (nyk[i, j, k] + nyk[i, j, k+1])
+    @inbounds nz_k = FT(0.5) * (nzk[i, j, k] + nzk[i, j, k+1])
+    Ucon_k = abs(u*nx_k + v*ny_k + w*nz_k)
+    @inbounds Ak = FT(0.5) * (S3[i, j, k] + S3[i, j, k+1])
+
+    # Spectral radii: λ = (|U_contra| + c) * Area
+    λ_ξ = (Ucon_i + c) * Ai
+    λ_η = (Ucon_j + c) * Aj
+    λ_ζ = (Ucon_k + c) * Ak
+
+    # dt = CFL * Vol / (λ_ξ + λ_η + λ_ζ)   — sum formulation (more conservative, standard)
+    dt_conv = Vol / (λ_ξ + λ_η + λ_ζ + FT(1.0e-30))
+
+    # Viscous stability limit
+    if viscous
+        dx = Vol / (Ai + FT(1.0e-30))
+        dy = Vol / (Aj + FT(1.0e-30))
+        dz = Vol / (Ak + FT(1.0e-30))
+        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+            nu_eff = ν_AC
+        elseif equation_type == :MHD
+            @inbounds rho = Q[i, j, k, 1]
+            mu = get_viscosity(T_val)
+            nu_eff = mu / (rho * Pr + FT(1.0e-30))
+        else
+            @inbounds rho = Q[i, j, k, 1]
+            mu = get_viscosity(T)
+            nu_eff = mu / (rho * Pr + FT(1.0e-30))
+        end
+        dt_diff = FT(0.5) / (nu_eff * (one(FT)/(dx*dx) + one(FT)/(dy*dy) + one(FT)/(dz*dz)) + FT(1.0e-30))
+        @inbounds dt[i, j, k] = min(dt_conv, dt_diff) * CFL
+    else
+        @inbounds dt[i, j, k] = dt_conv * CFL
+    end
 
     return
 end
 
-function pre_x(Q, sc, rth)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function pre_x(Q, sc, rth, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    @inbounds p1 = Q[i-2, j, k, 5]
-    @inbounds p2 = Q[i-1, j, k, 5]
-    @inbounds p3 = Q[i,   j, k, 5]
-    @inbounds p4 = Q[i+1, j, k, 5]
-    @inbounds p5 = Q[i+2, j, k, 5]
+    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    @inbounds p1 = Q[i-2, j, k, p_idx]
+    @inbounds p2 = Q[i-1, j, k, p_idx]
+    @inbounds p3 = Q[i,   j, k, p_idx]
+    @inbounds p4 = Q[i+1, j, k, p_idx]
+    @inbounds p5 = Q[i+2, j, k, p_idx]
 
-    Δp0 = 0.25f0 * (-p4+2p3-p2)
-    Δp1 = 0.25f0 * (-p5+2p4-p3)
-    Δp2 = 0.25f0 * (-p3+2p2-p1)
-    ri = 0.5f0 * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+1f-16
-    @inbounds sc[i, j, k] = 0.5f0*(1.f0-rth/ri+abs(1.f0-rth/ri))
+    Δp0 = FT(0.25) * (-p4+2p3-p2)
+    Δp1 = FT(0.25) * (-p5+2p4-p3)
+    Δp2 = FT(0.25) * (-p3+2p2-p1)
+    ri = FT(0.5) * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+FT(1e-16)
+    @inbounds sc[i, j, k] = FT(0.5)*(FT(1.e0)-rth/ri+abs(FT(1.e0)-rth/ri))
     return
 end
 
-function pre_y(Q, sc, rth)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function pre_y(Q, sc, rth, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    @inbounds p1 = Q[i, j-2, k, 5]
-    @inbounds p2 = Q[i, j-1, k, 5]
-    @inbounds p3 = Q[i, j,   k, 5]
-    @inbounds p4 = Q[i, j+1, k, 5]
-    @inbounds p5 = Q[i, j+2, k, 5]
+    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    @inbounds p1 = Q[i, j-2, k, p_idx]
+    @inbounds p2 = Q[i, j-1, k, p_idx]
+    @inbounds p3 = Q[i, j,   k, p_idx]
+    @inbounds p4 = Q[i, j+1, k, p_idx]
+    @inbounds p5 = Q[i, j+2, k, p_idx]
 
-    Δp0 = 0.25f0 * (-p4+2p3-p2)
-    Δp1 = 0.25f0 * (-p5+2p4-p3)
-    Δp2 = 0.25f0 * (-p3+2p2-p1)
-    ri = 0.5f0 * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+1f-16
-    @inbounds sc[i, j, k] = 0.5f0*(1.f0-rth/ri+abs(1.f0-rth/ri))
+    Δp0 = FT(0.25) * (-p4+2p3-p2)
+    Δp1 = FT(0.25) * (-p5+2p4-p3)
+    Δp2 = FT(0.25) * (-p3+2p2-p1)
+    ri = FT(0.5) * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+FT(1e-16)
+    @inbounds sc[i, j, k] = FT(0.5)*(FT(1.e0)-rth/ri+abs(FT(1.e0)-rth/ri))
     return
 end
 
-function pre_z(Q, sc, rth)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function pre_z(Q, sc, rth, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    @inbounds p1 = Q[i, j, k-2, 5]
-    @inbounds p2 = Q[i, j, k-1, 5]
-    @inbounds p3 = Q[i, j, k,   5]
-    @inbounds p4 = Q[i, j, k+1, 5]
-    @inbounds p5 = Q[i, j, k+2, 5]
+    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    @inbounds p1 = Q[i, j, k-2, p_idx]
+    @inbounds p2 = Q[i, j, k-1, p_idx]
+    @inbounds p3 = Q[i, j, k,   p_idx]
+    @inbounds p4 = Q[i, j, k+1, p_idx]
+    @inbounds p5 = Q[i, j, k+2, p_idx]
 
-    Δp0 = 0.25f0 * (-p4+2p3-p2)
-    Δp1 = 0.25f0 * (-p5+2p4-p3)
-    Δp2 = 0.25f0 * (-p3+2p2-p1)
-    ri = 0.5f0 * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+1f-16
-    @inbounds sc[i, j, k] = 0.5f0*(1.f0-rth/ri+abs(1.f0-rth/ri))
+    Δp0 = FT(0.25) * (-p4+2p3-p2)
+    Δp1 = FT(0.25) * (-p5+2p4-p3)
+    Δp2 = FT(0.25) * (-p3+2p2-p1)
+    ri = FT(0.5) * ((Δp0-Δp1)^2+(Δp0-Δp2)^2)/p3^2+FT(1e-16)
+    @inbounds sc[i, j, k] = FT(0.5)*(FT(1.e0)-rth/ri+abs(FT(1.e0)-rth/ri))
     return
 end
 
-function filter_x(U, Un, sc, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function filter_x(U, Un, sc, s0, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    c1::Float32 = -0.210383f0
-    c2::Float32 = 0.039617f0
+    c1::FT = -FT(0.210383e0)
+    c2::FT = FT(0.039617e0)
 
-    @inbounds sc1 = 0.5f0*(sc[i, j, k]+sc[i+1, j, k])
-    @inbounds sc2 = 0.5f0*(sc[i, j, k]+sc[i-1, j, k])
+    @inbounds sc1 = FT(0.5)*(sc[i, j, k]+sc[i+1, j, k])
+    @inbounds sc2 = FT(0.5)*(sc[i, j, k]+sc[i-1, j, k])
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (sc1 * (c1 * (Un[i+1, j, k, n] - Un[i, j, k, n]) +
@@ -192,20 +386,20 @@ function filter_x(U, Un, sc, s0)
     return
 end
 
-function filter_y(U, Un, sc, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function filter_y(U, Un, sc, s0, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    c1::Float32 = -0.210383f0
-    c2::Float32 = 0.039617f0
+    c1::FT = -FT(0.210383e0)
+    c2::FT = FT(0.039617e0)
 
-    @inbounds sc1 = 0.5f0*(sc[i, j, k]+sc[i, j+1, k])
-    @inbounds sc2 = 0.5f0*(sc[i, j, k]+sc[i, j-1, k])
+    @inbounds sc1 = FT(0.5)*(sc[i, j, k]+sc[i, j+1, k])
+    @inbounds sc2 = FT(0.5)*(sc[i, j, k]+sc[i, j-1, k])
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (sc1 * (c1 * (Un[i, j+1, k, n] - Un[i, j, k, n]) +
@@ -216,20 +410,20 @@ function filter_y(U, Un, sc, s0)
     return
 end
 
-function filter_z(U, Un, sc, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function filter_z(U, Un, sc, s0, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
         return
     end
 
-    c1::Float32 = -0.210383f0
-    c2::Float32 = 0.039617f0
+    c1::FT = -FT(0.210383e0)
+    c2::FT = FT(0.039617e0)
 
-    @inbounds sc1 = 0.5f0*(sc[i, j, k]+sc[i, j, k+1])
-    @inbounds sc2 = 0.5f0*(sc[i, j, k]+sc[i, j, k-1])
+    @inbounds sc1 = FT(0.5)*(sc[i, j, k]+sc[i, j, k+1])
+    @inbounds sc2 = FT(0.5)*(sc[i, j, k]+sc[i, j, k-1])
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (sc1 * (c1 * (Un[i, j, k+1, n] - Un[i, j, k, n]) +
@@ -240,20 +434,25 @@ function filter_z(U, Un, sc, s0)
     return
 end
 
-function linearFilter_x(U, Un, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+# 8th-order Pirozzoli-style spatial filter kernels
+# ilo/ihi (jlo/jhi, klo/khi): filter range bounds — shrunk near physical
+# boundaries to avoid reading from non-physical ghost cells.
+# At MPI/periodic boundaries the full stencil is safe.
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+function linearFilter_x(U, Un, s0, nxp, nyp, nzp, ilo, ihi)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > ihi || j > nyp+NG || k > nzp+NG || i < ilo || j < NG+1 || k < NG+1
         return
     end
 
-    d0::Float32 = 0.243527493120f0
-    d1::Float32 =-0.204788880640f0
-    d2::Float32 = 0.120007591680f0
-    d3::Float32 =-0.045211119360f0
-    d4::Float32 = 0.008228661760f0
+    d0::FT = FT(0.243527493120e0)
+    d1::FT =-FT(0.204788880640e0)
+    d2::FT = FT(0.120007591680e0)
+    d3::FT =-FT(0.045211119360e0)
+    d4::FT = FT(0.008228661760e0)
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (d0 * Un[i, j, k, n] +
@@ -265,20 +464,20 @@ function linearFilter_x(U, Un, s0)
     return
 end
 
-function linearFilter_y(U, Un, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function linearFilter_y(U, Un, s0, nxp, nyp, nzp, jlo, jhi)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > jhi || k > nzp+NG || i < NG+1 || j < jlo || k < NG+1
         return
     end
 
-    d0::Float32 = 0.243527493120f0
-    d1::Float32 =-0.204788880640f0
-    d2::Float32 = 0.120007591680f0
-    d3::Float32 =-0.045211119360f0
-    d4::Float32 = 0.008228661760f0
+    d0::FT = FT(0.243527493120e0)
+    d1::FT =-FT(0.204788880640e0)
+    d2::FT = FT(0.120007591680e0)
+    d3::FT =-FT(0.045211119360e0)
+    d4::FT = FT(0.008228661760e0)
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (d0 * Un[i, j, k, n] +
@@ -290,20 +489,20 @@ function linearFilter_y(U, Un, s0)
     return
 end
 
-function linearFilter_z(U, Un, s0)
-    i = (blockIdx().x-1i32)* blockDim().x + threadIdx().x
-    j = (blockIdx().y-1i32)* blockDim().y + threadIdx().y
-    k = (blockIdx().z-1i32)* blockDim().z + threadIdx().z
+function linearFilter_z(U, Un, s0, nxp, nyp, nzp, klo, khi)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
 
-    if i > Nxp+NG || j > Nyp+NG || k > Nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+    if i > nxp+NG || j > nyp+NG || k > khi || i < NG+1 || j < NG+1 || k < klo
         return
     end
 
-    d0::Float32 = 0.243527493120f0
-    d1::Float32 =-0.204788880640f0
-    d2::Float32 = 0.120007591680f0
-    d3::Float32 =-0.045211119360f0
-    d4::Float32 = 0.008228661760f0
+    d0::FT = FT(0.243527493120e0)
+    d1::FT =-FT(0.204788880640e0)
+    d2::FT = FT(0.120007591680e0)
+    d3::FT =-FT(0.045211119360e0)
+    d4::FT = FT(0.008228661760e0)
 
     for n = 1:Ncons
         @inbounds U[i, j, k, n] = Un[i, j, k, n] - s0 * (d0 * Un[i, j, k, n] +
@@ -311,6 +510,273 @@ function linearFilter_z(U, Un, s0)
                                                          d2 * (Un[i, j, k-2, n] + Un[i, j, k+2, n]) +
                                                          d3 * (Un[i, j, k-3, n] + Un[i, j, k+3, n]) +
                                                          d4 * (Un[i, j, k-4, n] + Un[i, j, k+4, n]))
+    end
+    return
+end
+
+function positivity_clipping(Q, U, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+        return
+    end
+
+    # AC mode: no positivity clipping needed
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        return
+    end
+
+    # MHD mode: clip ρ and p, leave B and ψ unconstrained
+    if equation_type == :MHD
+        @inbounds begin
+            ρ = Q[i, j, k, 1]
+            p = Q[i, j, k, 5]
+            ρ_min = FT(1.0e-5)
+            p_min = FT(1.0e-5)
+            if ρ < ρ_min || p < p_min
+                ρ = max(ρ, ρ_min)
+                p = max(p, p_min)
+                Q[i, j, k, 1] = ρ
+                Q[i, j, k, 5] = p
+                Q[i, j, k, 6] = p / (ρ * Rg)
+                u = Q[i, j, k, 2]; v = Q[i, j, k, 3]; w = Q[i, j, k, 4]
+                Bx = Q[i, j, k, 7]; By = Q[i, j, k, 8]; Bz = Q[i, j, k, 9]
+                B2 = Bx*Bx + By*By + Bz*Bz
+                U[i,j,k,1] = ρ
+                U[i,j,k,2] = ρ * u; U[i,j,k,3] = ρ * v; U[i,j,k,4] = ρ * w
+                U[i,j,k,5] = p / (γ-one(FT)) + FT(0.5) * ρ * (u*u + v*v + w*w) + FT(0.5) * B2
+            end
+        end
+        return
+    end
+
+    @inbounds begin
+        ρ = Q[i, j, k, 1]
+        p = Q[i, j, k, 5]
+        T_val = Q[i, j, k, 6]
+        
+        # Positivity check
+        need_fix = (ρ < ρ_min) || (p < p_min) || (T_val < eps(FT))
+        if need_fix
+            ρ = max(ρ, ρ_min)
+            T_val = max(T_val, eps(FT))
+            p = max(ρ * Rg * T_val, p_min)
+            
+            Q[i, j, k, 1] = ρ
+            Q[i, j, k, 5] = p
+            Q[i, j, k, 6] = T_val
+            
+            u = Q[i, j, k, 2]
+            v = Q[i, j, k, 3]
+            w = Q[i, j, k, 4]
+            
+            U[i, j, k, 1] = ρ
+            U[i, j, k, 2] = ρ * u
+            U[i, j, k, 3] = ρ * v
+            U[i, j, k, 4] = ρ * w
+            U[i, j, k, 5] = p / (γ-one(FT)) + FT(0.5) * ρ * (u*u + v*v + w*w)
+        end
+    end
+    return
+end
+
+# ── Fused kernel: linComb + c2Prim + positivity_clipping ──
+# Performs RK linear combination, then derives Q from U and clips.
+# Saves 2 kernel launches per RK substep (KRK=2,3).
+function linComb_clip_prim(U, Un, Q, NV, a::FT, b::FT, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG+1
+        return
+    end
+
+    # Step 1: RK linear combination  U = Un + a*(U - Un)
+    # Equivalent to U = a*U + (1-a)*Un, but guaranteed exact when U==Un
+    # (avoids systematic drift from FT(2/3)+FT(1/3) ≠ 1.0)
+    for n = 1:NV
+        @inbounds U[i, j, k, n] = Un[i, j, k, n] + a * (U[i, j, k, n] - Un[i, j, k, n])
+    end
+
+    # Step 2: Conservative -> Primitive
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        # AC: Q == U (identity), no clipping
+        for n = 1:Ncons
+            @inbounds Q[i, j, k, n] = U[i, j, k, n]
+        end
+        return
+    end
+
+    # MHD mode: linComb + c2Prim + clipping
+    if equation_type == :MHD
+        @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+        ρinv = one(FT) / ρ
+        @inbounds u = U[i, j, k, 2] * ρinv
+        @inbounds v = U[i, j, k, 3] * ρinv
+        @inbounds w = U[i, j, k, 4] * ρinv
+        @inbounds Bx = U[i,j,k,6]; @inbounds By = U[i,j,k,7]; @inbounds Bz = U[i,j,k,8]
+        B2 = Bx*Bx + By*By + Bz*Bz
+        @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
+        p = (γ - one(FT)) * ei
+        ρ = max(ρ, FT(1.0e-5)); p = max(p, FT(1.0e-5))
+        T = p / (ρ * Rg)
+        @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+        @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+        @inbounds Q[i,j,k,7] = Bx; Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
+        @inbounds Q[i,j,k,10] = U[i, j, k, 9]
+        # Write back clamped U
+        @inbounds U[i,j,k,1] = ρ
+        @inbounds U[i,j,k,2] = ρ * u; U[i,j,k,3] = ρ * v; U[i,j,k,4] = ρ * w
+        @inbounds U[i,j,k,5] = p/(γ-one(FT)) + FT(0.5)*ρ*(u*u+v*v+w*w) + FT(0.5)*B2
+        return
+    end
+
+    # Step 2 (compressible): Conservative -> Primitive (c2Prim)
+    @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+    ρinv = one(FT) / ρ
+    @inbounds u = U[i, j, k, 2] * ρinv
+    @inbounds v = U[i, j, k, 3] * ρinv
+    @inbounds w = U[i, j, k, 4] * ρinv
+    @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w), eps(FT))
+    p = (γ - one(FT)) * ei
+
+    ρ = max(ρ, ρ_min)
+    p = max(p, p_min)
+
+    T = p / (ρ * Rg)
+    T = max(T, eps(FT))
+    p = ρ * Rg * T  # recompute p from clamped T for consistency
+
+    @inbounds Q[i, j, k, 1] = ρ
+    @inbounds Q[i, j, k, 2] = u
+    @inbounds Q[i, j, k, 3] = v
+    @inbounds Q[i, j, k, 4] = w
+    @inbounds Q[i, j, k, 5] = p
+    @inbounds Q[i, j, k, 6] = T
+
+    # Always write back consistent U (T clamp may have changed p)
+    @inbounds U[i, j, k, 1] = ρ
+    @inbounds U[i, j, k, 2] = ρ * u
+    @inbounds U[i, j, k, 3] = ρ * v
+    @inbounds U[i, j, k, 4] = ρ * w
+    @inbounds U[i, j, k, 5] = p / (γ-one(FT)) + FT(0.5) * ρ * (u*u + v*v + w*w)
+    return
+end
+
+# ── Ghost-only c2Prim: only operates on ghost cells, skipping interior ──
+# Interior cells already have correct Q from positivity_clipping / linComb_clip_prim.
+# Ghost cells have U updated by MPI exchange but Q not yet refreshed.
+function c2Prim_ghost(U, Q, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+2*NG || j > nyp+2*NG || k > nzp+2*NG || i < 1 || j < 1 || k < 1
+        return
+    end
+
+    # Skip deep interior cells (leave an 4-cell outer shell to catch INTERFACE SMOOTHING updates to U)
+    if i > NG+4 && i <= nxp+NG-4 && j > NG+4 && j <= nyp+NG-4 && k > NG+4 && k <= nzp+NG-4
+        return
+    end
+
+    # AC mode: Q == U (identity)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        for n = 1:Ncons
+            @inbounds Q[i, j, k, n] = U[i, j, k, n]
+        end
+        return
+    end
+
+    # MHD mode
+    if equation_type == :MHD
+        @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+        ρinv = one(FT) / ρ
+        @inbounds u = U[i, j, k, 2] * ρinv
+        @inbounds v = U[i, j, k, 3] * ρinv
+        @inbounds w = U[i, j, k, 4] * ρinv
+        @inbounds Bx = U[i,j,k,6]; @inbounds By = U[i,j,k,7]; @inbounds Bz = U[i,j,k,8]
+        B2 = Bx*Bx + By*By + Bz*Bz
+        @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
+        p = (γ - one(FT)) * ei
+        T = p / (ρ * Rg)
+        @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+        @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+        @inbounds Q[i,j,k,7] = Bx; Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
+        @inbounds Q[i,j,k,10] = U[i, j, k, 9]
+        return
+    end
+
+    @inbounds ρ = max(U[i, j, k, 1], eps(FT))
+    ρinv = one(FT) / ρ
+    @inbounds u = U[i, j, k, 2] * ρinv
+    @inbounds v = U[i, j, k, 3] * ρinv
+    @inbounds w = U[i, j, k, 4] * ρinv
+    @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w), eps(FT))
+    p = (γ - one(FT)) * ei
+
+    ρ = max(ρ, FT(1.0e-5))
+    p = max(p, FT(1.0e-5))
+    T = p / (ρ * Rg)
+    T = max(T, eps(FT))
+    p = ρ * Rg * T
+
+    @inbounds Q[i, j, k, 1] = ρ
+    @inbounds Q[i, j, k, 2] = u
+    @inbounds Q[i, j, k, 3] = v
+    @inbounds Q[i, j, k, 4] = w
+    @inbounds Q[i, j, k, 5] = p
+    @inbounds Q[i, j, k, 6] = T
+    # NOTE: Do NOT write back to U — ghost U must remain exactly as received
+    # from MPI exchange to avoid systematic floating-point energy drift.
+    return
+end
+
+function add_source_kernel!(U, dU_forced, dt, Vol, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp
+        return
+    end
+    
+    # Range is 1:nxp in local indices
+    # Pad to Global-in-rank (NG+1)
+    ii, jj, kk = i+NG, j+NG, k+NG
+    
+    # Apply source term: U += S * dt
+    @inbounds fact = dt
+    for n = 1:Ncons
+        @inbounds U[ii, jj, kk, n] += dU_forced[i, j, k, n] * fact
+    end
+    return
+end
+
+function accumulate_avg_kernel!(Q_avg, Q, U, count::Int32, n_prim::Int, nxp::Int, nyp::Int, nzp::Int, NG_val::Int, do_favre::Bool)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+2*NG_val || j > nyp+2*NG_val || k > nzp+2*NG_val || i < 1 || j < 1 || k < 1
+        return
+    end
+
+    inv_c = 1.0f0 / Float32(count)
+    weight_old = Float32(count - 1) * inv_c
+
+    for n = 1:n_prim
+        @inbounds val = Q[i, j, k, n]
+        
+        if do_favre
+            if n == 2 || n == 3 || n == 4
+                @inbounds val = U[i, j, k, n]
+            end
+        end
+
+        @inbounds Q_avg[i, j, k, n] = Q_avg[i, j, k, n] * weight_old + val * inv_c
     end
     return
 end

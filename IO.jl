@@ -1,291 +1,261 @@
-function plotFile_xdmf(tt, Q, ϕ, Q_h, ϕ_h, comm_cart, rank, rankx, ranky, rankz)
-    # Output
-    if plt_out && (tt % step_plt == 0 || abs(Time-dt*tt) < dt || tt == maxStep)
-        copyto!(Q_h, Q)
-        copyto!(ϕ_h, ϕ)
+# =============================================================================
+# Multi-block I/O for butterfly grid (CUDA)
+# Each block outputs to separate parallel HDF5 files
+# XDMF uses GridType="Collection" to combine all blocks
+# =============================================================================
 
-        if rank == 0
+function plotFile_multiblock(tt, time, blocks, world_rank, Nblocks, Block_Nprocs, block_comms)
+    if plt_out && (tt % step_plt == 0 || tt == maxStep)
+        if world_rank == 0
             mkpath("./PLT")
-            write_XDMF(tt)
+            write_XDMF_multiblock(tt, time, Nblocks)
         end
+        # Ensure directory is ready
+        MPI.Barrier(MPI.COMM_WORLD)
 
-        ρ = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 1]
-        u = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 2]
-        v = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 3]
-        w = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 4]
-        p = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 5]
-        T = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, 6]
+        for (bid, b) in blocks
+            # Multi-block: Each block writes its own parallel HDF5 file
+            fname = string("./PLT/plt-", tt, "-b", b.id, ".h5")
+            
+            # Host buffers for writing (HDF5.jl parallel writing requires Array)
+            Q_h = Array(b.Q)
+            ϕ_h = Array(b.ϕ)
 
-        ϕ_ng = @view ϕ_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG]
+            # Extract real cells (no ghost)
+            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+                p_ac = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 1]
+                u    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 2]
+                v    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 3]
+                w    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 4]
+                ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
+                var_list = [("p", p_ac), ("u", u), ("v", v), ("w", w), ("phi", ϕ_ng)]
+            else
+                ρ    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 1]
+                u    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 2]
+                v    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 3]
+                w    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 4]
+                p    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 5]
+                T    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 6]
+                ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
+                var_list = [("rho", ρ), ("u", u), ("v", v), ("w", w), ("p", p), ("T", T), ("phi", ϕ_ng)]
+            end
 
-        # global indices no ghost
-        lox = rankx*Nxp+1
-        hix = (rankx+1)*Nxp
+            # Global indices within this block for this rank (no ghost)
+            lox = b.ox + 1; hix = b.ox + b.Nx
+            loy = b.oy + 1; hiy = b.oy + b.Ny
+            loz = b.oz + 1; hiz = b.oz + b.Nz
 
-        loy = ranky*Nyp+1
-        hiy = (ranky+1)*Nyp
+            # HDF5 write (serial fallback for single-rank, parallel for multi-rank)
+            single_rank = MPI.Comm_size(block_comms[bid]) == 1
+            _h5f = single_rank ? h5open(fname, "w") : h5open(fname, "w", block_comms[bid])
+            try
+                # Block dimensions
+                _md = @isdefined(mesh_dir) ? mesh_dir : "MESH"
+                m_path = "$(mesh[1:end-length(basename(mesh))])mesh_b$(b.id).h5"
+                if !isfile(m_path); m_path = joinpath(_md, "mesh_b$(b.id).h5"); end
+                Nx_b = h5read(m_path, "Nx")
+                Ny_b = h5read(m_path, "Ny")
+                Nz_b = h5read(m_path, "Nz")
 
-        loz = rankz*Nzp+1
-        hiz = (rankz+1)*Nzp
-
-        fname::String = string("./PLT/plt-", tt, ".h5")
-        h5open(fname, "w", comm_cart) do f
-            dset1 = create_dataset(
-                f,
-                "rho",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset1[lox:hix, loy:hiy, loz:hiz] = ρ
-            dset2 = create_dataset(
-                f,
-                "u",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset2[lox:hix, loy:hiy, loz:hiz] = u
-            dset3 = create_dataset(
-                f,
-                "v",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset3[lox:hix, loy:hiy, loz:hiz] = v
-            dset4 = create_dataset(
-                f,
-                "w",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset4[lox:hix, loy:hiy, loz:hiz] = w
-            dset5 = create_dataset(
-                f,
-                "p",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset5[lox:hix, loy:hiy, loz:hiz] = p
-            dset6 = create_dataset(
-                f,
-                "T",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset6[lox:hix, loy:hiy, loz:hiz] = T
-            dset7 = create_dataset(
-                f,
-                "phi",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz);
-                chunk=(Nxp, Nyp, Nzp),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset7[lox:hix, loy:hiy, loz:hiz] = ϕ_ng
+                for (name, data) in var_list
+                    if single_rank
+                        _h5f[name] = Array(data)
+                    else
+                        dset = create_dataset(
+                            _h5f, name, datatype(FT),
+                            dataspace(Nx_b, Ny_b, Nz_b);
+                            chunk=(Nx_b, Ny_b, Nz_b),
+                            dxpl_mpio=:collective
+                        )
+                        dset[lox:hix, loy:hiy, loz:hiz] = data
+                    end
+                end
+            finally
+                close(_h5f)
+            end
+            # Free host buffers immediately to prevent OOM
+            Q_h = nothing; ϕ_h = nothing
+            GC.gc()
         end
+        # Final block sync
+        MPI.Barrier(MPI.COMM_WORLD)
     end
 end
 
-function plotFile_h5(tt, Q, Q_h, comm_cart, rank, rankx, ranky, rankz)
-    # Output
-    if plt_out && (tt % step_plt == 0 || abs(Time-dt*tt) < dt || tt == maxStep)
-        copyto!(Q_h, Q)
-
-        if rank == 0
-            mkpath("./PLT")
-        end
-
-        primitives = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, :]
-
-        # global indices no ghost
-        lox = rankx*Nxp+1
-        hix = (rankx+1)*Nxp
-
-        loy = ranky*Nyp+1
-        hiy = (ranky+1)*Nyp
-
-        loz = rankz*Nzp+1
-        hiz = (rankz+1)*Nzp
-
-        fname::String = string("./PLT/plt-", tt, ".h5")
-        h5open(fname, "w", comm_cart) do f
-            dset1 = create_dataset(
-                f,
-                "Q",
-                datatype(Float32),
-                dataspace(Nx, Ny, Nz, Nprim);
-                chunk=(Nxp, Nyp, Nzp, Nprim),
-                shuffle=plt_shuffle,
-                compress=plt_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset1[lox:hix, loy:hiy, loz:hiz, :] = primitives
-        end
-    end
-end
-
-function checkpointFile(tt, Q_h, Q, comm_cart, rank)
-    # restart file, in Float32
-    if chk_out && (tt % step_chk == 0 || abs(Time-dt*tt) < dt || tt == maxStep)
-        Nx_tot = Nxp+2*NG
-        Ny_tot = Nyp+2*NG
-        Nz_tot = Nzp+2*NG
-
-        copyto!(Q_h, Q)
-
-        if rank == 0
+function checkpointFile(tt, time, blocks, world_rank, Block_Nprocs, block_comms)
+    if chk_out && (tt % step_chk == 0 || tt == maxStep)
+        if world_rank == 0
             mkpath("./CHK")
         end
-        chkname::String = string("./CHK/chk-", tt, ".h5")
-        h5open(chkname, "w", comm_cart) do f
-            dset1 = create_dataset(
-                f,
-                "Q_h",
-                datatype(Float32),
-                dataspace(Nx_tot, Ny_tot, Nz_tot, Nprim, prod(Nprocs));
-                chunk=(Nx_tot, Ny_tot, Nz_tot, Nprim, 1),
-                shuffle=chk_shuffle,
-                compress=chk_compress_level,
-                dxpl_mpio=:collective
-            )
-            dset1[:, :, :, :, rank + 1] = Q_h
+        MPI.Barrier(MPI.COMM_WORLD)
+
+        for (bid, b) in blocks
+            chkname = "./CHK/chk-$(tt)-b$(b.id).h5"
+            
+            # GPU → CPU
+            Q_h = Array(b.Q)
+
+            # Extract interior cells (no ghost) for this rank's sub-domain
+            Q_interior = Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, :]
+
+            # Global offsets within the block (same as plotFile)
+            lox = b.ox + 1; hix = b.ox + b.Nx
+            loy = b.oy + 1; hiy = b.oy + b.Ny
+            loz = b.oz + 1; hiz = b.oz + b.Nz
+
+            # Read global block dimensions from mesh
+            _md = @isdefined(mesh_dir) ? mesh_dir : "MESH"
+            m_path = joinpath(_md, "mesh_b$(b.id).h5")
+            Nx_b = h5read(m_path, "Nx")
+            Ny_b = h5read(m_path, "Ny")
+            Nz_b = h5read(m_path, "Nz")
+
+            # HDF5 write (serial fallback for single-rank, parallel for multi-rank)
+            single_rank = MPI.Comm_size(block_comms[bid]) == 1
+            _h5f = single_rank ? h5open(chkname, "w") : h5open(chkname, "w", block_comms[bid])
+            try
+                if single_rank
+                    _h5f["Q"] = Array(Q_interior)
+                else
+                    dset = create_dataset(
+                        _h5f, "Q", datatype(FT),
+                        dataspace(Nx_b, Ny_b, Nz_b, Nprim);
+                        chunk=(Nx_b, Ny_b, Nz_b, Nprim),
+                        dxpl_mpio=:collective
+                    )
+                    dset[lox:hix, loy:hiy, loz:hiz, :] = Q_interior
+                end
+            finally
+                close(_h5f)
+            end
+
+            Q_h = nothing; Q_interior = nothing
         end
+        GC.gc()
+        MPI.Barrier(MPI.COMM_WORLD)
+
+        # Write metadata separately (rank 0 only, serial HDF5)
+        if world_rank == 0
+            for bid in 0:(length(Block_Nprocs)-1)
+                chkname = "./CHK/chk-$(tt)-b$(bid).h5"
+                h5open(chkname, "r+") do f
+                    f["step"] = Int64(tt)
+                    f["time"] = Float64(time)
+                end
+            end
+            println(">>> Checkpoint saved at step $tt")
+        end
+        MPI.Barrier(MPI.COMM_WORLD)
     end
 end
 
-function averageFile(tt, Q_avg, Q_h, comm_cart, rankx, ranky, rankz)
-    copyto!(Q_h, Q_avg)
+function averageFile(tt, blocks, world_rank, Block_Nprocs, block_comms)
+    if !average; return; end
+    if (tt % avg_total == 0 || tt == maxStep)
+        if world_rank == 0
+            mkpath("./AVG")
+        end
+        MPI.Barrier(MPI.COMM_WORLD)
 
-    avg = @view Q_h[1+NG:Nxp+NG, 1+NG:Nyp+NG, 1+NG:Nzp+NG, :]
+        for (bid, b) in blocks
+            fname = string("./AVG/avg-", tt, "-b", b.id, ".h5")
+            if hasfield(typeof(b), :Q_avg) && b.Q_avg !== nothing
+                Q_h = Array(b.Q_avg)
+                # Apply inverse density weighting right before writing output if Favre averaged
+                if isdefined(Main, :avg_density_weighted) && avg_density_weighted && isdefined(Main, :equation_type) && equation_type != :incompressible_AC && equation_type != :incompressible_PISO
+                    for n in 2:4
+                        @views Q_h[:,:,:,n] ./= Q_h[:,:,:,1]
+                    end
+                end
+                avg = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, :]
+                
+                lox = b.ox + 1; hix = b.ox + b.Nx
+                loy = b.oy + 1; hiy = b.oy + b.Ny
+                loz = b.oz + 1; hiz = b.oz + b.Nz
 
-    # global indices no ghost
-    lox = rankx*Nxp+1
-    hix = (rankx+1)*Nxp
+                # Parallel HDF5 write (serial fallback for single-rank, parallel for multi-rank)
+                single_rank = MPI.Comm_size(block_comms[bid]) == 1
+                _h5f = single_rank ? h5open(fname, "w") : h5open(fname, "w", block_comms[bid])
+                try
+                    _md = @isdefined(mesh_dir) ? mesh_dir : "MESH"
+                    m_path = joinpath(_md, "mesh_b$(b.id).h5")
+                    Nx_b = h5read(m_path, "Nx")
+                    Ny_b = h5read(m_path, "Ny")
+                    Nz_b = h5read(m_path, "Nz")
 
-    loy = ranky*Nyp+1
-    hiy = (ranky+1)*Nyp
-
-    loz = rankz*Nzp+1
-    hiz = (rankz+1)*Nzp
-
-    fname::String = string("./AVG/avg-", tt, ".h5")
-    h5open(fname, "w", comm_cart) do f
-        dset1 = create_dataset(
-            f,
-            "avg",
-            datatype(Float32),
-            dataspace(Nx, Ny, Nz, Nprim);
-            chunk=(Nxp, Nyp, Nzp, Nprim),
-            shuffle=avg_shuffle,
-            compress=avg_compress_level,
-            dxpl_mpio=:collective
-        )
-        dset1[lox:hix, loy:hiy, loz:hiz, :] = avg
+                    if single_rank
+                        _h5f["avg"] = Array(avg)
+                    else
+                        dset = create_dataset(
+                            _h5f, "avg", datatype(FT),
+                            dataspace(Nx_b, Ny_b, Nz_b, Nprim);
+                            chunk=(Nx_b, Ny_b, Nz_b, Nprim),
+                            dxpl_mpio=:collective
+                        )
+                        dset[lox:hix, loy:hiy, loz:hiz, :] = avg
+                    end
+                finally
+                    close(_h5f)
+                end
+            end
+        end
+        MPI.Barrier(MPI.COMM_WORLD)
     end
 end
 
-# provide debug output with ghost cells
-function debugOutput(Q, Q_h, x_h, y_h, z_h, rank)
-    copyto!(Q_h, Q)
-
-    fname::String = string("debug", "-", rank)
-
-    rho = @view Q_h[:, :, :, 1]
-    u   = @view Q_h[:, :, :, 2]
-    v   = @view Q_h[:, :, :, 3]
-    w   = @view Q_h[:, :, :, 4]
-    p   = @view Q_h[:, :, :, 5]
-    T   = @view Q_h[:, :, :, 6]
-
-    vtk_grid(fname, x_h, y_h, z_h) do vtk
-        vtk["rho"] = rho
-        vtk["u"] = u
-        vtk["v"] = v
-        vtk["w"] = w
-        vtk["p"] = p
-        vtk["T"] = T
-    end 
-end
-
-# XDMF metadata, note that julia in column major
-function write_XDMF(tt)
+# ── XDMF metadata for multi-block (GridType="Collection") ──
+function write_XDMF_multiblock(tt, time, Nblocks)
     fname = string("./PLT/plt-", tt, ".xmf")
-    h5name = string("plt-", tt, ".h5")
-    time = tt*dt
 
     open(fname, "w") do f
-        write(f, "<?xml version=\"1.0\" ?>")
+        write(f, "<?xml version=\"1.0\" ?>\n")
         write(f, "<!DOCTYPE Xdmf SYSTEM \"Xdmf.dtd\" []>\n")
         write(f, "<Xdmf xmlns:xi=\"http://www.w3.org/2003/XInclude\" Version=\"2.2\">\n")
         write(f, " <Domain>\n")
-        write(f, "  <Grid Name=\"Grid\" GridType=\"Uniform\">\n")
+        write(f, "  <Grid Name=\"MultiBlock\" GridType=\"Collection\" CollectionType=\"Spatial\">\n")
         write(f, "  <Time Value=\"$time\" />\n")
-        write(f, "   <Topology TopologyType=\"3DSMesh\" NumberOfElements=\"$Nz $Ny $Nx\" />\n")
-        write(f, "   <Geometry GeometryType=\"XYZ\">\n")
-        write(f, "   <DataItem Name=\"coords\" Dimensions=\"$Nz $Ny $Nx 3\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    ./mesh.h5:/coords\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Geometry>\n")
-        write(f, "   <Attribute Name=\"rho\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/rho\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"u\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/u\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"v\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/v\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"w\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/w\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"p\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/p\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"T\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/T\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
-        write(f, "   <Attribute Name=\"phi\" AttributeType=\"Scalar\" Center=\"Node\">\n")
-        write(f, "    <DataItem Dimensions=\"$Nz $Ny $Nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
-        write(f, "    $h5name:/phi\n")
-        write(f, "   </DataItem>\n")
-        write(f, "   </Attribute>\n")
+
+        for bid = 0:Nblocks-1
+            # Use mesh_dir from config; fallback to "MESH" for legacy run scripts
+            _mesh_dir = @isdefined(mesh_dir) ? mesh_dir : "MESH"
+            meshname = string("../", _mesh_dir, "/mesh_b", bid, ".h5")
+            m_path = joinpath(_mesh_dir, "mesh_b$bid.h5")
+            nx = h5read(m_path, "Nx")
+            ny = h5read(m_path, "Ny")
+            nz = h5read(m_path, "Nz")
+            # For coordinate selection from mesh with ghost cells
+            # Total size in HDF5 (C-style): (nz_tot, ny_tot, nx_tot, 3)
+            # NI_tot = nx + 1 + 2*NG, etc.
+            # Physical nodes are start at NG (0-indexed)
+            
+            h5name = string("plt-", tt, "-b", bid, ".h5")
+
+            write(f, "   <Grid Name=\"Block_$bid\" GridType=\"Uniform\">\n")
+            write(f, "    <Topology TopologyType=\"3DSMesh\" NumberOfElements=\"$(nz+1) $(ny+1) $(nx+1)\" />\n")
+            
+            # Geometry: X_Y_Z with separate x, y, z datasets (most compatible format)
+            # Each dataset shape in HDF5 (C-style): (nz+1, ny+1, nx+1) — matches topology
+            nz_tot = nz + 1; ny_tot = ny + 1; nx_tot = nx + 1
+            write(f, "    <Geometry GeometryType=\"X_Y_Z\">\n")
+            for coord_name in ["x", "y", "z"]
+                write(f, "     <DataItem Dimensions=\"$nz_tot $ny_tot $nx_tot\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
+                write(f, "      $meshname:/$coord_name\n")
+                write(f, "     </DataItem>\n")
+            end
+            write(f, "    </Geometry>\n")
+
+            varnames = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? ["p", "u", "v", "w", "phi"] : ["rho", "u", "v", "w", "p", "T", "phi"]
+            for varname in varnames
+                write(f, "    <Attribute Name=\"$varname\" AttributeType=\"Scalar\" Center=\"Cell\">\n")
+                write(f, "     <DataItem Dimensions=\"$nz $ny $nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")
+                write(f, "      $h5name:/$varname\n")
+                write(f, "     </DataItem>\n")
+                write(f, "    </Attribute>\n")
+            end
+
+            write(f, "   </Grid>\n")
+        end
+
         write(f, "  </Grid>\n")
         write(f, " </Domain>\n")
         write(f, "</Xdmf>\n")
