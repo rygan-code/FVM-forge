@@ -1,5 +1,5 @@
 # =============================================================================
-# Geometry Jump Correction for Multiblock Interface Kinks (2nd-Order)
+# Geometry Jump Correction for Multiblock Interface Kinks (3rd-Order)
 # =============================================================================
 
 """
@@ -20,16 +20,17 @@ function compute_geometric_jump_coefficients(x_full, y_full, z_full, bid::Int,
     y_ext = copy(y_full)
     z_ext = copy(z_full)
     
-    # 2. Apply linear coordinate extrapolation at BC_INTERBLOCK faces
+    # 2. Apply quadratic coordinate extrapolation at BC_INTERBLOCK faces
     # ── η- (face 3) ──
     if get(face_bc, (bid, 3), -1) == BC_INTERBLOCK
         for g in 1:NG
             j_g = NG + 1 - g
             j_ref = NG + 1 + g
+            j_ref2 = NG + 1 + 2*g
             for k in 1:nzp+2*NG+1, i in 1:nxp+2*NG+1
-                x_ext[i, j_g, k] = 2.0 * x_full[i, NG+1, k] - x_full[i, j_ref, k]
-                y_ext[i, j_g, k] = 2.0 * y_full[i, NG+1, k] - y_full[i, j_ref, k]
-                z_ext[i, j_g, k] = 2.0 * z_full[i, NG+1, k] - z_full[i, j_ref, k]
+                x_ext[i, j_g, k] = 3.0 * x_full[i, NG+1, k] - 3.0 * x_full[i, j_ref, k] + x_full[i, j_ref2, k]
+                y_ext[i, j_g, k] = 3.0 * y_full[i, NG+1, k] - 3.0 * y_full[i, j_ref, k] + y_full[i, j_ref2, k]
+                z_ext[i, j_g, k] = 3.0 * z_full[i, NG+1, k] - 3.0 * z_full[i, j_ref, k] + z_full[i, j_ref2, k]
             end
         end
     end
@@ -39,10 +40,11 @@ function compute_geometric_jump_coefficients(x_full, y_full, z_full, bid::Int,
         for g in 1:NG
             j_g = nyp + NG + 1 + g
             j_ref = nyp + NG + 1 - g
+            j_ref2 = nyp + NG + 1 - 2*g
             for k in 1:nzp+2*NG+1, i in 1:nxp+2*NG+1
-                x_ext[i, j_g, k] = 2.0 * x_full[i, nyp+NG+1, k] - x_full[i, j_ref, k]
-                y_ext[i, j_g, k] = 2.0 * y_full[i, nyp+NG+1, k] - y_full[i, j_ref, k]
-                z_ext[i, j_g, k] = 2.0 * z_full[i, nyp+NG+1, k] - z_full[i, j_ref, k]
+                x_ext[i, j_g, k] = 3.0 * x_full[i, nyp+NG+1, k] - 3.0 * x_full[i, j_ref, k] + x_full[i, j_ref2, k]
+                y_ext[i, j_g, k] = 3.0 * y_full[i, nyp+NG+1, k] - 3.0 * y_full[i, j_ref, k] + y_full[i, j_ref2, k]
+                z_ext[i, j_g, k] = 3.0 * z_full[i, nyp+NG+1, k] - 3.0 * z_full[i, j_ref, k] + z_full[i, j_ref2, k]
             end
         end
     end
@@ -52,10 +54,11 @@ function compute_geometric_jump_coefficients(x_full, y_full, z_full, bid::Int,
         for g in 1:NG
             k_g = NG + 1 - g
             k_ref = NG + 1 + g
+            k_ref2 = NG + 1 + 2*g
             for j in 1:nyp+2*NG+1, i in 1:nxp+2*NG+1
-                x_ext[i, j, k_g] = 2.0 * x_full[i, j, NG+1] - x_full[i, j, k_ref]
-                y_ext[i, j, k_g] = 2.0 * y_full[i, j, NG+1] - y_full[i, j, k_ref]
-                z_ext[i, j, k_g] = 2.0 * z_full[i, j, NG+1] - z_full[i, j, k_ref]
+                x_ext[i, j, k_g] = 3.0 * x_full[i, j, NG+1] - 3.0 * x_full[i, j, k_ref] + x_full[i, j, k_ref2]
+                y_ext[i, j, k_g] = 3.0 * y_full[i, j, NG+1] - 3.0 * y_full[i, j, k_ref] + y_full[i, j, k_ref2]
+                z_ext[i, j, k_g] = 3.0 * z_full[i, j, NG+1] - 3.0 * z_full[i, j, k_ref] + z_full[i, j, k_ref2]
             end
         end
     end
@@ -65,10 +68,11 @@ function compute_geometric_jump_coefficients(x_full, y_full, z_full, bid::Int,
         for g in 1:NG
             k_g = nzp + NG + 1 + g
             k_ref = nzp + NG + 1 - g
+            k_ref2 = nzp + NG + 1 - 2*g
             for j in 1:nyp+2*NG+1, i in 1:nxp+2*NG+1
-                x_ext[i, j, k_g] = 2.0 * x_full[i, j, nzp+NG+1] - x_full[i, j, k_ref]
-                y_ext[i, j, k_g] = 2.0 * y_full[i, j, nzp+NG+1] - y_full[i, j, k_ref]
-                z_ext[i, j, k_g] = 2.0 * z_full[i, j, nzp+NG+1] - z_full[i, j, k_ref]
+                x_ext[i, j, k_g] = 3.0 * x_full[i, j, nzp+NG+1] - 3.0 * x_full[i, j, k_ref] + x_full[i, j, k_ref2]
+                y_ext[i, j, k_g] = 3.0 * y_full[i, j, nzp+NG+1] - 3.0 * y_full[i, j, k_ref] + y_full[i, j, k_ref2]
+                z_ext[i, j, k_g] = 3.0 * z_full[i, j, nzp+NG+1] - 3.0 * z_full[i, j, k_ref] + z_full[i, j, k_ref2]
             end
         end
     end
@@ -200,7 +204,7 @@ function compute_geometric_jump_coefficients(x_full, y_full, z_full, bid::Int,
 end
 
 # =============================================================================
-# GPU Jump Correction Kernel
+# GPU Jump Correction Kernel (3rd-Order Taylor Expansion)
 # =============================================================================
 function correct_ghost_kinks_kernel!(U, U_old, D_i, D_j, D_k, Nx_tot, Ny_tot, Nz_tot, Ncons)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -220,6 +224,8 @@ function correct_ghost_kinks_kernel!(U, U_old, D_i, D_j, D_k, Nx_tot, Ny_tot, Nz
     ip1 = clamp(i+1, 1, Nx_tot); im1 = clamp(i-1, 1, Nx_tot)
     jp1 = clamp(j+1, 1, Ny_tot); jm1 = clamp(j-1, 1, Ny_tot)
     kp1 = clamp(k+1, 1, Nz_tot); km1 = clamp(k-1, 1, Nz_tot)
+    jp2 = clamp(j+2, 1, Ny_tot); jm2 = clamp(j-2, 1, Ny_tot)
+    kp2 = clamp(k+2, 1, Nz_tot); km2 = clamp(k-2, 1, Nz_tot)
     
     @inbounds for c in 1:Ncons
         # 1st-order derivatives in computational space
@@ -237,12 +243,17 @@ function correct_ghost_kinks_kernel!(U, U_old, D_i, D_j, D_k, Nx_tot, Ny_tot, Nz
         d2u_detadzeta = 0.25 * (U_old[i, jp1, kp1, c] - U_old[i, jm1, kp1, c] - U_old[i, jp1, km1, c] + U_old[i, jm1, km1, c])
         d2u_dzetadxi  = 0.25 * (U_old[ip1, j, kp1, c] - U_old[im1, j, kp1, c] - U_old[ip1, j, km1, c] + U_old[im1, j, km1, c])
         
-        # 2nd-order Taylor expansion correction
+        # Taylor expansion correction (up to 3rd order)
         corr_1 = d1 * du_dxi + d2 * du_deta + d3 * du_dzeta
         corr_2 = 0.5 * (d1*d1 * d2u_dxi2 + d2*d2 * d2u_deta2 + d3*d3 * d2u_dzeta2) +
                  d1*d2 * d2u_dxideta + d2*d3 * d2u_detadzeta + d3*d1 * d2u_dzetadxi
         
-        corr = corr_1 + corr_2
+        # 3rd-order pure derivatives (cross terms vanish due to 1D band filtering)
+        d3u_deta3  = 0.5 * (U_old[i, jp2, k, c] - 2.0 * U_old[i, jp1, k, c] + 2.0 * U_old[i, jm1, k, c] - U_old[i, jm2, k, c])
+        d3u_dzeta3 = 0.5 * (U_old[i, j, kp2, c] - 2.0 * U_old[i, j, kp1, c] + 2.0 * U_old[i, j, km1, c] - U_old[i, j, km2, c])
+        corr_3 = (1.0/6.0) * (d2*d2*d2 * d3u_deta3 + d3*d3*d3 * d3u_dzeta3)
+        
+        corr = corr_1 + corr_2 + corr_3
         limit_val = 0.10 * (abs(U_old[i, j, k, c]) + 1.0e-6)
         if corr > limit_val
             corr = limit_val
