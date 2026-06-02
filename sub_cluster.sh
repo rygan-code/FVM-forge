@@ -8,11 +8,11 @@
 #SBATCH --ntasks-per-socket=1
 #SBATCH -p kshdnormal
 #SBATCH --exclude=e07r3n[07,09-12]
-#SBATCH -t 02:10:00
+#SBATCH -t 08:00:00
 #SBATCH -o slurm-out
 #SBATCH -e slurm-err
 
 module purge; 
 module load compiler/dtk/25.04.2  compiler/devtoolset/7.3.1 compiler/cmake/3.25.0 mpi/hpcx/2.7.4-gcc-7.3.1
 
-mpirun -np 20 julia run_pipe_diffrot.jl 209000
+mpirun -np 20 julia run_pipe_cebl_diffrot.jl 200000

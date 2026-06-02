@@ -13,5 +13,5 @@ module load compiler/dtk/25.04.2 compiler/devtoolset/7.3.1 compiler/cmake/3.25.0
 cd /public/home/ac6narhq4l/gry/rotating_pipe/inhomo
 
 echo "=== Running Mesh Generator on CPU Compute Node ==="
-julia --project=. Utils/gen_butterfly_spatial.jl
+julia --project=. Utils/gen_butterfly_cebl_len15.jl
 echo "=== Mesh Generator Completed ==="

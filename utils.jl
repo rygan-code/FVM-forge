@@ -8,13 +8,7 @@ function c2Prim(U, Q, nxp, nyp, nzp)
         return
     end
 
-    # AC mode: Q == U (identity conversion)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        for n = 1:Ncons
-            @inbounds Q[i, j, k, n] = U[i, j, k, n]
-        end
-        return
-    end
+
 
     # MHD mode: U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ) → Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ)
     if equation_type == :MHD
@@ -75,13 +69,7 @@ function c2Prim_global(U, Q, nxp, nyp, nzp)
         return
     end
 
-    # AC mode: Q == U (identity)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        for n = 1:Ncons
-            @inbounds Q[i, j, k, n] = U[i, j, k, n]
-        end
-        return
-    end
+
 
     # MHD mode
     if equation_type == :MHD
@@ -141,13 +129,7 @@ function prim2c(U, Q, nxp, nyp, nzp)
         return
     end
 
-    # AC mode: U == Q (identity)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        for n = 1:Ncons
-            @inbounds U[i, j, k, n] = Q[i, j, k, n]
-        end
-        return
-    end
+
 
     # MHD mode: Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ) → U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ)
     if equation_type == :MHD
@@ -220,10 +202,8 @@ function compute_dt(dt, Q, J, S1, S2, S3,
 
     @inbounds Vol = one(FT) / J[i, j, k]
 
-    # Wave speed: compressible uses sound speed, AC uses β, MHD uses fast magnetosonic
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        c = β_AC
-    elseif equation_type == :MHD
+    # Wave speed: compressible uses sound speed, MHD uses fast magnetosonic
+    if equation_type == :MHD
         @inbounds ρ_val = Q[i, j, k, 1]
         @inbounds T_val = Q[i, j, k, 6]
         c2 = γ * Rg * T_val  # sound speed squared
@@ -270,9 +250,7 @@ function compute_dt(dt, Q, J, S1, S2, S3,
         dx = Vol / (Ai + FT(1.0e-30))
         dy = Vol / (Aj + FT(1.0e-30))
         dz = Vol / (Ak + FT(1.0e-30))
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            nu_eff = ν_AC
-        elseif equation_type == :MHD
+        if equation_type == :MHD
             @inbounds rho = Q[i, j, k, 1]
             mu = get_viscosity(T_val)
             nu_eff = mu / (rho * Pr + FT(1.0e-30))
@@ -299,7 +277,7 @@ function pre_x(Q, sc, rth, nxp, nyp, nzp)
         return
     end
 
-    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    local p_idx::Int32 = Int32(5)
     @inbounds p1 = Q[i-2, j, k, p_idx]
     @inbounds p2 = Q[i-1, j, k, p_idx]
     @inbounds p3 = Q[i,   j, k, p_idx]
@@ -323,7 +301,7 @@ function pre_y(Q, sc, rth, nxp, nyp, nzp)
         return
     end
 
-    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    local p_idx::Int32 = Int32(5)
     @inbounds p1 = Q[i, j-2, k, p_idx]
     @inbounds p2 = Q[i, j-1, k, p_idx]
     @inbounds p3 = Q[i, j,   k, p_idx]
@@ -347,7 +325,7 @@ function pre_z(Q, sc, rth, nxp, nyp, nzp)
         return
     end
 
-    local p_idx::Int32 = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? Int32(1) : Int32(5)
+    local p_idx::Int32 = Int32(5)
     @inbounds p1 = Q[i, j, k-2, p_idx]
     @inbounds p2 = Q[i, j, k-1, p_idx]
     @inbounds p3 = Q[i, j, k,   p_idx]
@@ -523,10 +501,7 @@ function positivity_clipping(Q, U, nxp, nyp, nzp)
         return
     end
 
-    # AC mode: no positivity clipping needed
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        return
-    end
+
 
     # MHD mode: clip ρ and p, leave B and ψ unconstrained
     if equation_type == :MHD
@@ -602,13 +577,6 @@ function linComb_clip_prim(U, Un, Q, NV, a::FT, b::FT, nxp, nyp, nzp)
     end
 
     # Step 2: Conservative -> Primitive
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        # AC: Q == U (identity), no clipping
-        for n = 1:Ncons
-            @inbounds Q[i, j, k, n] = U[i, j, k, n]
-        end
-        return
-    end
 
     # MHD mode: linComb + c2Prim + clipping
     if equation_type == :MHD
@@ -683,13 +651,7 @@ function c2Prim_ghost(U, Q, nxp, nyp, nzp)
         return
     end
 
-    # AC mode: Q == U (identity)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        for n = 1:Ncons
-            @inbounds Q[i, j, k, n] = U[i, j, k, n]
-        end
-        return
-    end
+
 
     # MHD mode
     if equation_type == :MHD

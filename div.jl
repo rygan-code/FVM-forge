@@ -110,14 +110,7 @@ function div_rk_clip_prim(U, Un, Q, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z,
         @inbounds U[ii, jj, kk, n] = Un[ii, jj, kk, n] + rk_a * (U[ii, jj, kk, n] - Un[ii, jj, kk, n])
     end
 
-    # Step 3: Clipping + Conservative → Primitive
-    # AC mode: Q == U (identity, no clipping)
-    if equation_type == :incompressible_AC
-        for n = 1:Ncons
-            @inbounds Q[ii, jj, kk, n] = U[ii, jj, kk, n]
-        end
-        return
-    end
+
 
     # MHD mode: c2Prim with B²/2 in energy
     if equation_type == :MHD

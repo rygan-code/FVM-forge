@@ -1,9 +1,6 @@
 
 @inline function Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID, ch_glm::FT)
-    @static if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        # ── AC mode: always use AC_Rusanov ──
-        return AC_Rusanov_Flux(UL_vec, UR_vec, nx, ny, nz)
-    elseif equation_type == :MHD
+    @static if equation_type == :MHD
         # ── MHD mode: use MHD-specific Riemann solvers ──
         if splitMethodID == Int32(5)
             return MHD_KEP_Flux(UL_vec, UR_vec, nx, ny, nz, ch_glm)
@@ -100,11 +97,7 @@ function Eigen_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nz
     # 3. 激波传感器
     @inbounds ϕx = max(ϕ[i-2, j, k], ϕ[i-1, j, k], ϕ[i, j, k], ϕ[i+1, j, k], ϕ[i+2, j, k], ϕ[i+3, j, k])
 
-    # AC: always use linear reconstruction (branch A). Branch B performs
-    # 5-variable Roe decomposition that reads Q[...,5:6] — out of bounds for AC.
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕx = zero(FT)
-    end
+
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -358,10 +351,7 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
     # 3. 激波传感器 (J 方向)
     @inbounds ϕx = max(ϕ[i, j-2, k], ϕ[i, j-1, k], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
 
-    # AC: always use linear reconstruction (branch A)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕx = zero(FT)
-    end
+
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -622,10 +612,7 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
     # 3. 激波传感器 (K 方向)
     @inbounds ϕx = max(ϕ[i, j, k-2], ϕ[i, j, k-1], ϕ[i, j, k], ϕ[i, j, k+1], ϕ[i, j, k+2], ϕ[i, j, k+3])
 
-    # AC: always use linear reconstruction (branch A)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕx = zero(FT)
-    end
+
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -885,10 +872,7 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, n
     # 3. 激波传感器
     @inbounds ϕx = max(ϕ[i-2, j, k], ϕ[i-1, j, k], ϕ[i, j, k], ϕ[i+1, j, k], ϕ[i+2, j, k], ϕ[i+3, j, k])
 
-    # AC: always use linear reconstruction (branch A)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕx = zero(FT)
-    end
+
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -1126,10 +1110,7 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, n
     # 3. 激波传感器
     @inbounds ϕy = max(ϕ[i, j-2, k], ϕ[i, j-1, k], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
 
-    # AC: always use linear reconstruction (branch A)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕy = zero(FT)
-    end
+
 
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -1348,10 +1329,7 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
     # 3. 激波传感器
     @inbounds ϕz = max(ϕ[i, j, k-2], ϕ[i, j, k-1], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
 
-    # AC: always use linear reconstruction (branch A)
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        ϕz = zero(FT)
-    end
+
 
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))

@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 # physics.jl — Equation system abstraction layer
 # ═══════════════════════════════════════════════════════════════════════
-# Defines the equation type (compressible / incompressible_AC / MHD)
+# Defines the equation type (compressible / MHD)
 # and derived constants (Ncons, Nprim). All downstream code uses these
 # compile-time constants for dispatch — zero runtime overhead.
 #
@@ -19,7 +19,7 @@ end
 @assert FT === Float32 || FT === Float64 "FT must be Float32 or Float64, got $FT"
 
 # ─── Equation system type ───
-# Must be defined as `const equation_type = :compressible` (or :incompressible_AC, :MHD)
+# Must be defined as `const equation_type = :compressible` (or :MHD)
 # in the run script BEFORE including this file.
 # If not defined, default to compressible:
 if !@isdefined(equation_type)
@@ -27,28 +27,17 @@ if !@isdefined(equation_type)
 end
 
 # ─── Variable counts (compile-time constants) ───
-const Ncons = if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-    4   # p, u, v, w
-elseif equation_type == :MHD
+const Ncons = if equation_type == :MHD
     9   # ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ
 else
     5   # ρ, ρu, ρv, ρw, ρE (compressible Euler/NS)
 end
 
-const Nprim = if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-    4   # p, u, v, w (same as conservative)
-elseif equation_type == :MHD
+const Nprim = if equation_type == :MHD
     10  # ρ, u, v, w, p, T, Bx, By, Bz, ψ
 else
     6   # ρ, u, v, w, p, T (compressible)
 end
-
-# ─── AC (Artificial Compressibility) parameters ───
-# These can be overridden by defining them in the run script BEFORE including physics.jl
-if !@isdefined(β_AC);  const β_AC::FT  = FT(10.0);   end
-if !@isdefined(ρ_ref); const ρ_ref::FT = FT(1.0);    end
-if !@isdefined(ν_AC);  const ν_AC::FT  = FT(1.0e-3); end
-if !@isdefined(U_lid_AC); const U_lid_AC::FT = FT(1.0); end
 
 # ─── MHD parameters ───
 # GLM divergence cleaning (Dedner et al. 2002):

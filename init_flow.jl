@@ -289,33 +289,6 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
         @gpu_launch threads=nthreads blocks=nb init_flatplate(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp),
                                                                fp_T_inf, fp_p_inf)
     elseif test_case == "PipeFlow"
-        if isdefined(Main, :equation_type) && equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            # AC pipe flow: Hagen-Poiseuille + SEM perturbation, Q = [p, u, v, w]
-            # ── SEM: generate synthetic eddies on CPU, transfer to GPU ──
-            N_sem_ac = 1000
-            l_sem_ac = FT(0.15 * R0)   # eddy size ~ 15% of pipe radius
-            amp_sem_ac = FT(0.10)       # 10% of u_bulk (=1.0 for AC)
-
-            pos_x_h = FT.(rand(N_sem_ac) .* Lx)
-            pos_y_h = FT.((rand(N_sem_ac) .- FT(0.5)) .* FT(2.0) .* R0)
-            pos_z_h = FT.((rand(N_sem_ac) .- FT(0.5)) .* FT(2.0) .* R0)
-            sign1_h = FT.((rand(N_sem_ac) .> 0.5) .* 2.0 .- 1.0)
-            sign2_h = FT.((rand(N_sem_ac) .> 0.5) .* 2.0 .- 1.0)
-            sign3_h = FT.((rand(N_sem_ac) .> 0.5) .* 2.0 .- 1.0)
-
-            pos_x_d = GPUArray(pos_x_h)
-            pos_y_d = GPUArray(pos_y_h)
-            pos_z_d = GPUArray(pos_z_h)
-            sign1_d = GPUArray(sign1_h)
-            sign2_d = GPUArray(sign2_h)
-            sign3_d = GPUArray(sign3_h)
-
-            @gpu_launch threads=nthreads blocks=nb init_pipe_flow_AC(
-                Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp),
-                pos_x_d, pos_y_d, pos_z_d,
-                sign1_d, sign2_d, sign3_d,
-                Int32(N_sem_ac), l_sem_ac, amp_sem_ac)
-        else
         # ── SEM: generate synthetic eddies on CPU, transfer to GPU ──
         N_sem = 1000
         l_sem = FT(0.15 * R0)   # eddy size ~ 15% of pipe radius
@@ -345,9 +318,6 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
             sign1_d, sign2_d, sign3_d,
             Int32(N_sem), l_sem, amp_sem
         )
-        end
-    elseif test_case == "Cavity"
-        @gpu_launch threads=nthreads blocks=nb init_cavity_AC(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     elseif test_case == "BrioWu"
         @gpu_launch threads=nthreads blocks=nb init_brio_wu(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     elseif test_case == "OrszagTang"
@@ -383,95 +353,6 @@ function init_tg5_debug(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
     return
 end
 
-# ── AC Pipe Flow: Hagen-Poiseuille parabolic profile + SEM perturbation ──
-# Q = [p, u, v, w] — 4 conserved variables for AC
-# Uses Synthetic Eddy Method (Jarrin et al. 2006) for initial turbulence
-function init_pipe_flow_AC(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
-                           eddy_pos_x, eddy_pos_y, eddy_pos_z,
-                           eddy_sign1, eddy_sign2, eddy_sign3,
-                           n_sem::Int32, l_sem::FT, amp_sem::FT)
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-
-    if i > nxp+Int32(2*NG) || j > nyp+Int32(2*NG) || k > nzp+Int32(2*NG); return; end
-    if i < Int32(NG+1) || i > nxp+Int32(NG) || j < Int32(NG+1) || j > nyp+Int32(NG) || k < Int32(NG+1) || k > nzp+Int32(NG); return; end
-
-    # Hagen-Poiseuille parabolic profile
-    # u_bulk = 1.0 (normalized), u_max = 2 * u_bulk
-    @inbounds xi = x[i,j,k]
-    @inbounds yi = y[i,j,k]
-    @inbounds zi = z[i,j,k]
-    r2 = yi*yi + zi*zi
-    r2_norm = r2 / (R0*R0)
-    u_hp = FT(2.0) * max(one(FT) - r2_norm, zero(FT))  # u_bulk = 1.0
-
-    # ── SEM (Synthetic Eddy Method) perturbation ──
-    # Spatially correlated fluctuations via superposition of tent-function eddies.
-    vol_sem = Lx * (FT(2.0) * R0) * (FT(2.0) * R0)
-
-    upr = zero(FT)
-    vpr = zero(FT)
-    wpr = zero(FT)
-
-    for jj = Int32(1):n_sem
-        @inbounds dx_e = abs(xi - eddy_pos_x[jj])
-        @inbounds dy_e = abs(yi - eddy_pos_y[jj])
-        @inbounds dz_e = abs(zi - eddy_pos_z[jj])
-
-        # Periodic in x
-        dx_e = min(dx_e, Lx - dx_e)
-
-        if dx_e < l_sem && dy_e < l_sem && dz_e < l_sem
-            ftent = (one(FT) - dx_e/l_sem) * (one(FT) - dy_e/l_sem) * (one(FT) - dz_e/l_sem)
-            ftent = ftent / (sqrt(FT(2.0)/FT(3.0) * l_sem))^3
-
-            @inbounds upr += eddy_sign1[jj] * ftent
-            @inbounds vpr += eddy_sign2[jj] * ftent
-            @inbounds wpr += eddy_sign3[jj] * ftent
-        end
-    end
-
-    scale = sqrt(vol_sem / FT(n_sem))
-    upr *= scale
-    vpr *= scale
-    wpr *= scale
-
-    # Radial envelope: vanishes at wall, scales with sqrt(TKE)
-    envelope = max(one(FT) - r2_norm, zero(FT))
-    turb_scale = amp_sem * sqrt(FT(2.0)/FT(3.0) * envelope)
-
-    u_final = u_hp + upr * turb_scale
-    v_final = vpr * turb_scale
-    w_final = wpr * turb_scale
-
-    @inbounds begin
-        Q[i, j, k, 1] = FT(0.5) * ρ_ref * FT(0.01e0)
-        Q[i, j, k, 2] = u_final
-        Q[i, j, k, 3] = v_final
-        Q[i, j, k, 4] = w_final
-    end
-    return
-end
-
-# ── AC Cavity: quiescent initial condition ──
-# Q = [p, u, v, w] = [0, 0, 0, 0] everywhere
-function init_cavity_AC(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-
-    if i > nxp+Int32(2*NG) || j > nyp+Int32(2*NG) || k > nzp+Int32(2*NG); return; end
-    if i < Int32(NG+1) || i > nxp+Int32(NG) || j < Int32(NG+1) || j > nyp+Int32(NG) || k < Int32(NG+1) || k > nzp+Int32(NG); return; end
-
-    @inbounds begin
-        Q[i, j, k, 1] = FT(0.5) * ρ_ref * U_lid_AC * U_lid_AC
-        Q[i, j, k, 2] = zero(FT)
-        Q[i, j, k, 3] = zero(FT)
-        Q[i, j, k, 4] = zero(FT)
-    end
-    return
-end
 
 # ═══════════════════════════════════════════════════════════════════════
 # Brio-Wu MHD Shock Tube (Brio & Wu, 1988)
