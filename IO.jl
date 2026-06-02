@@ -22,23 +22,14 @@ function plotFile_multiblock(tt, time, blocks, world_rank, Nblocks, Block_Nprocs
             ϕ_h = Array(b.ϕ)
 
             # Extract real cells (no ghost)
-            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                p_ac = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 1]
-                u    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 2]
-                v    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 3]
-                w    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 4]
-                ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
-                var_list = [("p", p_ac), ("u", u), ("v", v), ("w", w), ("phi", ϕ_ng)]
-            else
-                ρ    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 1]
-                u    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 2]
-                v    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 3]
-                w    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 4]
-                p    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 5]
-                T    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 6]
-                ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
-                var_list = [("rho", ρ), ("u", u), ("v", v), ("w", w), ("p", p), ("T", T), ("phi", ϕ_ng)]
-            end
+            ρ    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 1]
+            u    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 2]
+            v    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 3]
+            w    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 4]
+            p    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 5]
+            T    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 6]
+            ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
+            var_list = [("rho", ρ), ("u", u), ("v", v), ("w", w), ("p", p), ("T", T), ("phi", ϕ_ng)]
 
             # Global indices within this block for this rank (no ghost)
             lox = b.ox + 1; hix = b.ox + b.Nx
@@ -162,7 +153,7 @@ function averageFile(tt, blocks, world_rank, Block_Nprocs, block_comms)
             if hasfield(typeof(b), :Q_avg) && b.Q_avg !== nothing
                 Q_h = Array(b.Q_avg)
                 # Apply inverse density weighting right before writing output if Favre averaged
-                if isdefined(Main, :avg_density_weighted) && avg_density_weighted && isdefined(Main, :equation_type) && equation_type != :incompressible_AC && equation_type != :incompressible_PISO
+                if isdefined(Main, :avg_density_weighted) && Main.avg_density_weighted
                     for n in 2:4
                         @views Q_h[:,:,:,n] ./= Q_h[:,:,:,1]
                     end
@@ -244,7 +235,7 @@ function write_XDMF_multiblock(tt, time, Nblocks)
             end
             write(f, "    </Geometry>\n")
 
-            varnames = equation_type == :incompressible_AC || equation_type == :incompressible_PISO ? ["p", "u", "v", "w", "phi"] : ["rho", "u", "v", "w", "p", "T", "phi"]
+            varnames = ["rho", "u", "v", "w", "p", "T", "phi"]
             for varname in varnames
                 write(f, "    <Attribute Name=\"$varname\" AttributeType=\"Scalar\" Center=\"Cell\">\n")
                 write(f, "     <DataItem Dimensions=\"$nz $ny $nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")

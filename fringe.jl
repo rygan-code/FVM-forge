@@ -94,6 +94,37 @@ function Assign_rotation_var_nonuniform(Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp,
     return
 end
 
+# ─── Three-stage piecewise rotation assignment ───
+# x < x_rot_start:                     Ωx = omega_min
+# x_rot_start <= x <= x_rot_end:       Ωx grows linearly from omega_min to omega_max
+# x > x_rot_end:                       Ωx = omega_max
+function Assign_rotation_var_threestage(Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp,
+        omega_min, omega_max, x_rot_start, x_rot_end)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp + 2*NG || j > nyp + 2*NG || k > nzp + 2*NG
+        return
+    end
+
+    @inbounds x_local = x[i, j, k]
+
+    if x_local < x_rot_start
+        @inbounds Ωx[i, j, k] = omega_min
+    elseif x_local > x_rot_end
+        @inbounds Ωx[i, j, k] = omega_max
+    else
+        frac = (x_local - x_rot_start) / (x_rot_end - x_rot_start)
+        @inbounds Ωx[i, j, k] = omega_min + (omega_max - omega_min) * frac
+    end
+
+    @inbounds Ωy[i, j, k] = zero(FT)
+    @inbounds Ωz[i, j, k] = zero(FT)
+
+    return
+end
+
+
 # ─── Fringe forcing kernel: apply λ(x)(U_target - U) ───
 # Called every RK sub-step, adds to dU_forced.
 # U_target is the precursor mean profile (only depends on y, z).

@@ -46,13 +46,9 @@ function compute_spectral_radius_i!(σ_i, Q, Areai, nxi, nyi, nzi, nxp, nyp, nzp
         V_n = u_f * fnx + v_f * fny + w_f * fnz
 
         # Sound speed: β_AC for AC, √(γRgT) for compressible
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            c = β_AC
-        else
-            TL = Q[ig, jg, kg, 6]; TR = Q[ig+1, jg, kg, 6]
-            T_f = FT(0.5) * (TL + TR)
-            c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
-        end
+        TL = Q[ig, jg, kg, 6]; TR = Q[ig+1, jg, kg, 6]
+        T_f = FT(0.5) * (TL + TR)
+        c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
 
         σ_i[i, j, k] = (abs(V_n) + c) * area
     end
@@ -83,12 +79,8 @@ function compute_spectral_radius_j!(σ_j, Q, Areaj, nxj, nyj, nzj, nxp, nyp, nzp
         area = Areaj[ig, jg+1, kg]
 
         V_n = u_f * fnx + v_f * fny + w_f * fnz
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            c = β_AC
-        else
-            T_f = FT(0.5) * (Q[ig, jg, kg, 6] + Q[ig, jg+1, kg, 6])
-            c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
-        end
+        T_f = FT(0.5) * (Q[ig, jg, kg, 6] + Q[ig, jg+1, kg, 6])
+        c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
 
         σ_j[i, j, k] = (abs(V_n) + c) * area
     end
@@ -119,12 +111,8 @@ function compute_spectral_radius_k!(σ_k, Q, Areak, nxk, nyk, nzk, nxp, nyp, nzp
         area = Areak[ig, jg, kg+1]
 
         V_n = u_f * fnx + v_f * fny + w_f * fnz
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            c = β_AC
-        else
-            T_f = FT(0.5) * (Q[ig, jg, kg, 6] + Q[ig, jg, kg+1, 6])
-            c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
-        end
+        T_f = FT(0.5) * (Q[ig, jg, kg, 6] + Q[ig, jg, kg+1, 6])
+        c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
 
         σ_k[i, j, k] = (abs(V_n) + c) * area
     end
@@ -167,35 +155,16 @@ function compute_lusgs_diagonal!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
             Aj = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
             Ak = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
 
-            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                # AC: kinematic viscosity is directly ν_AC (no temperature dependence)
-                nu_eff = ν_AC
-            else
-                ρ_c = max(Q[ig, jg, kg, 1], FT(1.0e-10))
-                T_c = max(Q[ig, jg, kg, 6], FT(1.0e-10))
-                μ_c = get_viscosity(T_c)
-                nu_eff = max(FT(4.0)/FT(3.0) * μ_c, γ * μ_c / Pr) / ρ_c
-            end
+            ρ_c = max(Q[ig, jg, kg, 1], FT(1.0e-10))
+            T_c = max(Q[ig, jg, kg, 6], FT(1.0e-10))
+            μ_c = get_viscosity(T_c)
+            nu_eff = max(FT(4.0)/FT(3.0) * μ_c, γ * μ_c / Pr) / ρ_c
 
             σ_visc = nu_eff * (Ai*Ai + Aj*Aj + Ak*Ak) / (cell_vol + FT(1.0e-30))
             σ_sum += FT(2.0) * σ_visc  # factor 2 for both sides of the cell
         end
 
-        # HPDC spectral radius: pressure diffusion ε_p·∇²p acts like diffusion
-        # with effective diffusivity ε_p. Must be included in D to ensure
-        # implicit stability for any α_hpdc value.
-        @static if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            if ac_hpdc
-                # Reuse Ai,Aj,Ak if viscous already computed them; else compute now
-                if !viscous
-                    Ai = FT(0.5) * (Areai[ig, jg, kg] + Areai[ig+1, jg, kg])
-                    Aj = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
-                    Ak = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
-                end
-                σ_hpdc = ε_p_AC * (Ai*Ai + Aj*Aj + Ak*Ak) / (cell_vol + FT(1.0e-30))
-                σ_sum += FT(2.0) * σ_hpdc
-            end
-        end
+
 
         # w_LU: LU-SGS relaxation factor (EC uses 1~2, default 1.5)
         # Larger w_LU → stronger diagonal dominance → more stable but slower convergence
@@ -443,43 +412,36 @@ function implicit_update!(U, Q, ΔU, nxp, nyp, nzp)
             U[i, j, k, n] += ΔU[i, j, k, n]
         end
 
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            # AC mode: Q ≡ U (identity conversion), just copy
-            for n = Int32(1):Int32(Ncons)
-                Q[i, j, k, n] = U[i, j, k, n]
-            end
-        else
-            # In-place c2Prim + positivity clipping (same as linComb_clip_prim)
-            ρ = max(U[i, j, k, 1], eps(FT))
-            ρinv = one(FT) / ρ
-            u = U[i, j, k, 2] * ρinv
-            v = U[i, j, k, 3] * ρinv
-            w = U[i, j, k, 4] * ρinv
-            ei = max(U[i, j, k, 5] - FT(0.5) * ρ * (u * u + v * v + w * w), eps(FT))
-            p = (γ - one(FT)) * ei
+        # In-place c2Prim + positivity clipping (same as linComb_clip_prim)
+        ρ = max(U[i, j, k, 1], eps(FT))
+        ρinv = one(FT) / ρ
+        u = U[i, j, k, 2] * ρinv
+        v = U[i, j, k, 3] * ρinv
+        w = U[i, j, k, 4] * ρinv
+        ei = max(U[i, j, k, 5] - FT(0.5) * ρ * (u * u + v * v + w * w), eps(FT))
+        p = (γ - one(FT)) * ei
 
-            # Positivity clipping
-            ρ_min = FT(1.0e-5)
-            p_min = FT(1.0e-5)
-            ρ = max(ρ, ρ_min)
-            p = max(p, p_min)
-            T = p / (ρ * Rg)
+        # Positivity clipping
+        ρ_min = FT(1.0e-5)
+        p_min = FT(1.0e-5)
+        ρ = max(ρ, ρ_min)
+        p = max(p, p_min)
+        T = p / (ρ * Rg)
 
-            Q[i, j, k, 1] = ρ
-            Q[i, j, k, 2] = u
-            Q[i, j, k, 3] = v
-            Q[i, j, k, 4] = w
-            Q[i, j, k, 5] = p
-            Q[i, j, k, 6] = T
+        Q[i, j, k, 1] = ρ
+        Q[i, j, k, 2] = u
+        Q[i, j, k, 3] = v
+        Q[i, j, k, 4] = w
+        Q[i, j, k, 5] = p
+        Q[i, j, k, 6] = T
 
-            # Write back clamped U
-            if ρ != U[i, j, k, 1] || p != (γ - one(FT)) * ei
-                U[i, j, k, 1] = ρ
-                U[i, j, k, 2] = ρ * u
-                U[i, j, k, 3] = ρ * v
-                U[i, j, k, 4] = ρ * w
-                U[i, j, k, 5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u * u + v * v + w * w)
-            end
+        # Write back clamped U
+        if ρ != U[i, j, k, 1] || p != (γ - one(FT)) * ei
+            U[i, j, k, 1] = ρ
+            U[i, j, k, 2] = ρ * u
+            U[i, j, k, 3] = ρ * v
+            U[i, j, k, 4] = ρ * w
+            U[i, j, k, 5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u * u + v * v + w * w)
         end
     end
     return
@@ -548,15 +510,10 @@ function implicit_step!(block::Block, dt_val::FT,
 
     # 3b. Volume forces (reuse existing logic)
     if flow_forcing
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-            if forcing_mode == 1
-                @gpu_launch threads=nthreads blocks=nb_f ac_pipe_force_rhs_kernel!(shared_dU_forced, ac_f1_val, nxp, nyp, nzp)
-            end
-        else
+            ramp_val = tanh(FT(activeTime) / FT(0.05))
             @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
                 shared_dU_forced, block.Q, block.x, block.y, block.z,
-                nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
+                nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, ramp_val)
             if forcing_mode == 1
                 Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
             elseif forcing_mode == 2
@@ -564,7 +521,6 @@ function implicit_step!(block::Block, dt_val::FT,
             end
             Apply_trip_force!(shared_dU_forced, block.Q, block.x, block.y, block.z,
                               nxp, nyp, nzp, activeTime)
-        end
     end
     if test_case == "HIT"
         Apply_HIT_forcing!(shared_dU_forced, block.Q, hit_forcing_A,
@@ -577,12 +533,7 @@ function implicit_step!(block::Block, dt_val::FT,
         shared_Fvx, shared_Fvy, shared_Fvz,
         shared_dU_forced, dt_val, block.Vol, nxp, nyp, nzp)
 
-    # 3c-HPDC: add ε_p·∇²p to pressure equation RHS
-    if ac_hpdc
-        @gpu_launch threads=nthreads blocks=nb_real ac_hpdc_rhs_kernel!(
-            block.dU_rhs, block.Q, block.Vol, block.Areai, block.Areaj, block.Areak,
-            ε_p_AC, nxp, nyp, nzp)
-    end
+
 
     # ── Step 3d: Implicit Residual Smoothing (EC-style) ──
     # Smooth dU_rhs to damp high-frequency modes before LU-SGS
@@ -726,30 +677,15 @@ function compute_lusgs_diagonal_bdf2!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
             Aj = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
             Ak = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
 
-            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                nu_eff = ν_AC
-            else
-                ρ_c = max(Q[ig, jg, kg, 1], FT(1.0e-10))
-                T_c = max(Q[ig, jg, kg, 6], FT(1.0e-10))
-                μ_c = get_viscosity(T_c)
-                nu_eff = max(FT(4.0)/FT(3.0) * μ_c, γ * μ_c / Pr) / ρ_c
-            end
+            ρ_c = max(Q[ig, jg, kg, 1], FT(1.0e-10))
+            T_c = max(Q[ig, jg, kg, 6], FT(1.0e-10))
+            μ_c = get_viscosity(T_c)
+            nu_eff = max(FT(4.0)/FT(3.0) * μ_c, γ * μ_c / Pr) / ρ_c
             σ_visc = nu_eff * (Ai*Ai + Aj*Aj + Ak*Ak) / (cell_vol + FT(1.0e-30))
             σ_sum += FT(2.0) * σ_visc
         end
 
-        # HPDC spectral radius (same as 1st-order diagonal)
-        @static if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            if ac_hpdc
-                if !viscous
-                    Ai = FT(0.5) * (Areai[ig, jg, kg] + Areai[ig+1, jg, kg])
-                    Aj = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
-                    Ak = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
-                end
-                σ_hpdc = ε_p_AC * (Ai*Ai + Aj*Aj + Ak*Ak) / (cell_vol + FT(1.0e-30))
-                σ_sum += FT(2.0) * σ_hpdc
-            end
-        end
+
 
         # BDF2 diagonal: D = 1.5V/dt + w_LU·Σσ (consistent with add_bdf2_source!)
         # For AC: keeping temporal term ensures diagonal-source consistency
@@ -802,8 +738,7 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
                          threads_recon_i, threads_recon_j, threads_recon_k,
                          threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
                          forcex, flowx, cmf_f1_val, ac_f1_val,
-                         hit_u_mean, hit_v_mean, hit_w_mean, activeTime;
-                         sync_ghost_fn=nothing)  # ghost exchange callback for GMRES matvec
+                         hit_u_mean, hit_v_mean, hit_w_mean, activeTime)
     nxp = block.Nx; nyp = block.Ny; nzp = block.Nz
     Nx_tot = nxp + 2 * NG; Ny_tot = nyp + 2 * NG; Nz_tot = nzp + 2 * NG
 
@@ -820,23 +755,17 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
 
     # Volume forces
     if flow_forcing
-        if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-            nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-            if forcing_mode == 1
-                @gpu_launch threads=nthreads blocks=nb_f ac_pipe_force_rhs_kernel!(shared_dU_forced, ac_f1_val, nxp, nyp, nzp)
-            end
-        else
-            @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
-                shared_dU_forced, block.Q, block.x, block.y, block.z,
-                nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
-            if forcing_mode == 1
-                Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
-            elseif forcing_mode == 2
-                Apply_const_massflux_force!(shared_dU_forced, block.Q, cmf_f1_val, nxp, nyp, nzp)
-            end
-            Apply_trip_force!(shared_dU_forced, block.Q, block.x, block.y, block.z,
-                              nxp, nyp, nzp, activeTime)
+        ramp_val = tanh(FT(activeTime) / FT(0.05))
+        @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
+            shared_dU_forced, block.Q, block.x, block.y, block.z,
+            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, ramp_val)
+        if forcing_mode == 1
+            Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
+        elseif forcing_mode == 2
+            Apply_const_massflux_force!(shared_dU_forced, block.Q, cmf_f1_val, nxp, nyp, nzp)
         end
+        Apply_trip_force!(shared_dU_forced, block.Q, block.x, block.y, block.z,
+                          nxp, nyp, nzp, activeTime)
     end
     if test_case == "HIT"
         Apply_HIT_forcing!(shared_dU_forced, block.Q, hit_forcing_A,
@@ -849,18 +778,7 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
         shared_Fvx, shared_Fvy, shared_Fvz,
         shared_dU_forced, dt_val, block.Vol, nxp, nyp, nzp)
 
-    # HPDC: add ε_p·∇²p to pressure equation RHS
-    if ac_hpdc
-        @gpu_launch threads=nthreads blocks=nb_real ac_hpdc_rhs_kernel!(
-            block.dU_rhs, block.Q, block.Vol, block.Areai, block.Areaj, block.Areak,
-            ε_p_AC, nxp, nyp, nzp)
-    end
 
-    # Save spatial RHS (before BDF2 source) for GMRES matvec if using GMRES
-    _use_gmres_solver = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
-    if _use_gmres_solver && block.R_base !== nothing
-        copyto!(block.R_base, block.dU_rhs)
-    end
 
     # Add BDF2 temporal source terms to dU_rhs
     @gpu_launch threads=nthreads blocks=nb_real add_bdf2_source!(
@@ -869,25 +787,9 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
     # ── Solve linear system ──
     fill!(block.ΔU, zero(FT))
 
-    if _use_gmres_solver && block.V_krylov !== nothing
-        # GMRES(m) with Block-Jacobi preconditioning
-        _gm = isdefined(@__MODULE__, :gmres_m) ? gmres_m : 10
-        _gr = isdefined(@__MODULE__, :gmres_max_restarts) ? gmres_max_restarts : 2
-        gmres_solve!(block, dt_val, FT(1.5e0),  # alpha_bdf = 1.5 for BDF2
-                     _gm, _gr, Float64(dual_time_tol),
-                     block.V_krylov, block.R_base,
-                     shared_Fx, shared_Fy, shared_Fz,
-                     shared_Fvx, shared_Fvy, shared_Fvz,
-                     shared_dU_forced, world_rank, tt,
-                     threads_recon_i, threads_recon_j, threads_recon_k,
-                     threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
-                     forcex, flowx, cmf_f1_val, ac_f1_val,
-                     hit_u_mean, hit_v_mean, hit_w_mean, activeTime,
-                     sync_ghost_fn !== nothing ? sync_ghost_fn : () -> nothing)
-    else
-        # LU-SGS sweep (existing path)
-        lusgs_debug_jacobi = isdefined(@__MODULE__, :implicit_lusgs_debug_jacobi) ? implicit_lusgs_debug_jacobi : false
-        if lusgs_debug_jacobi
+    # LU-SGS sweep (existing path)
+    lusgs_debug_jacobi = isdefined(@__MODULE__, :implicit_lusgs_debug_jacobi) ? implicit_lusgs_debug_jacobi : false
+    if lusgs_debug_jacobi
             @gpu_launch threads=nthreads blocks=nb_real jacobi_update!(
                 block.ΔU, block.dU_rhs, block.D_inv, nxp, nyp, nzp)
         else
@@ -917,7 +819,6 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
                 end
             end
         end
-    end
 
     # Update: U^{n+1,m+1} = U^{n+1,m} + δU
     @gpu_launch threads=threads_light blocks=nb_light implicit_update!(

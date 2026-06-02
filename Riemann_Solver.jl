@@ -408,67 +408,6 @@ end
     return SVector{5, FT}(fp1, fp2, fp3, fp4, fp5)
 end
 
-# ═══════════════════════════════════════════════════════════════════════
-# AC (Artificial Compressibility) flux functions
-# U = (p, u, v, w), wave speeds = |q_n| ± β
-# ═══════════════════════════════════════════════════════════════════════
-
-@inline function AC_Rusanov_Flux(UL, UR, nx, ny, nz)
-    # UL/UR = (p, u, v, w)
-    pL = UL[1]; uL = UL[2]; vL = UL[3]; wL = UL[4]
-    pR = UR[1]; uR = UR[2]; vR = UR[3]; wR = UR[4]
-
-    # Normal velocities
-    qL = uL*nx + vL*ny + wL*nz
-    qR = uR*nx + vR*ny + wR*nz
-
-    # Physical fluxes:
-    #   F_p = β²·q_n                    (pressure equation)
-    #   F_u = q_n·u + (p/ρ_ref)·nx      (x-momentum)
-    #   F_v = q_n·v + (p/ρ_ref)·ny      (y-momentum)
-    #   F_w = q_n·w + (p/ρ_ref)·nz      (z-momentum)
-    β2 = β_AC * β_AC
-    inv_ρ = one(FT) / ρ_ref
-
-    FL1 = β2 * qL
-    FL2 = qL * uL + pL * inv_ρ * nx
-    FL3 = qL * vL + pL * inv_ρ * ny
-    FL4 = qL * wL + pL * inv_ρ * nz
-
-    FR1 = β2 * qR
-    FR2 = qR * uR + pR * inv_ρ * nx
-    FR3 = qR * vR + pR * inv_ρ * ny
-    FR4 = qR * wR + pR * inv_ρ * nz
-
-    # Maximum wave speed: λ_max = max(|q_L|+β, |q_R|+β)
-    λ_max = max(abs(qL) + β_AC, abs(qR) + β_AC)
-
-    # Rusanov: F = 0.5(FL+FR) - 0.5·λ_max·(UR-UL)
-    return SVector{4, FT}(
-        FT(0.5)*(FL1+FR1) - FT(0.5)*λ_max*(pR-pL),
-        FT(0.5)*(FL2+FR2) - FT(0.5)*λ_max*(uR-uL),
-        FT(0.5)*(FL3+FR3) - FT(0.5)*λ_max*(vR-vL),
-        FT(0.5)*(FL4+FR4) - FT(0.5)*λ_max*(wR-wL)
-    )
-end
-
-@inline function AC_Central_Flux(UL, UR, nx, ny, nz)
-    # KEP-style central flux for AC (zero numerical dissipation, DNS use)
-    p_avg = FT(0.5)*(UL[1]+UR[1])
-    u_avg = FT(0.5)*(UL[2]+UR[2])
-    v_avg = FT(0.5)*(UL[3]+UR[3])
-    w_avg = FT(0.5)*(UL[4]+UR[4])
-    q_avg = u_avg*nx + v_avg*ny + w_avg*nz
-    inv_ρ = one(FT) / ρ_ref
-
-    return SVector{4, FT}(
-        β_AC * β_AC * q_avg,
-        q_avg * u_avg + p_avg * inv_ρ * nx,
-        q_avg * v_avg + p_avg * inv_ρ * ny,
-        q_avg * w_avg + p_avg * inv_ρ * nz
-    )
-end
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # Riemann_Solver_MHD.jl — MHD flux functions with GLM divergence cleaning

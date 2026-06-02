@@ -341,11 +341,6 @@ include("IO.jl")
 include("Riemann_Solver.jl")
 include("Reconstruct.jl")
 include("volume_force.jl")
-include("ac_staggered.jl")
-include("piso.jl")
-include("piso_pcg.jl")
-include("piso_nonortho.jl")
-include("piso_multigrid.jl")
 
 include("ghost_coords.jl")
 include("auto_tune.jl")
@@ -547,16 +542,7 @@ mutable struct Block
     σ_k::Union{GPUArray{FT, 3}, Nothing}
     # ─── BDF2 dual-time stepping (nothing when dual_time==false) ───
     U_nm1::Union{GPUArray{FT, 4}, Nothing}   # U^{n-1} for BDF2
-    # ─── GMRES Krylov buffers (nothing when not using GMRES) ───
-    V_krylov::Union{GPUArray{FT, 5}, Nothing}  # (Nx_tot, Ny_tot, Nz_tot, Ncons, m+1)
-    R_base::Union{GPUArray{FT, 4}, Nothing}    # Base RHS for matvec (nxp, nyp, nzp, Ncons)
-    # ─── AC staggered grid face velocities (nothing when equation_type != :incompressible_AC) ───
-    Uf_i::Union{GPUArray{FT, 3}, Nothing}     # I-face normal velocity (nxp+1, nyp, nzp)
-    Uf_j::Union{GPUArray{FT, 3}, Nothing}     # J-face normal velocity (nxp, nyp+1, nzp)
-    Uf_k::Union{GPUArray{FT, 3}, Nothing}     # K-face normal velocity (nxp, nyp, nzp+1)
-    Uf_i_n::Union{GPUArray{FT, 3}, Nothing}   # I-face velocity, previous RK stage
-    Uf_j_n::Union{GPUArray{FT, 3}, Nothing}   # J-face velocity, previous RK stage
-    Uf_k_n::Union{GPUArray{FT, 3}, Nothing}   # K-face velocity, previous RK stage
+
     # ─── Spectral warmup: per-direction-layer stencil coefficients ───
     stencil_i::GPUArray{FT, 2}    # (Nx+2NG, 7)  LEFT state
     Δstencil_i::GPUArray{FT, 2}   # (Nx+2NG, 7)
@@ -616,7 +602,6 @@ mutable struct Block
 end
 
 include("implicit.jl")
-include("gmres.jl")
 
 function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                     face_bc, connectivity)
@@ -709,22 +694,6 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     @gpu_launch threads=nthreads blocks=nb prim2c(U, Q, nxp, nyp, nzp)
     @check_nan(U, "U after prim2c (initial)", bid, world_rank, 0)
 
-    # ─── Initialize AC face velocities from cell-center velocity ───
-    # Only needed for the explicit staggered path (implicit AC uses collocated scheme)
-    if (equation_type == :incompressible_AC && !implicit) || equation_type == :incompressible_PISO
-        ac_Uf_i   = gpu_zeros(FT, nxp+1, nyp, nzp)
-        ac_Uf_j   = gpu_zeros(FT, nxp, nyp+1, nzp)
-        ac_Uf_k   = gpu_zeros(FT, nxp, nyp, nzp+1)
-        ac_Uf_i_n = gpu_zeros(FT, nxp+1, nyp, nzp)
-        ac_Uf_j_n = gpu_zeros(FT, nxp, nyp+1, nzp)
-        ac_Uf_k_n = gpu_zeros(FT, nxp, nyp, nzp+1)
-        # Single launch covers all 3 face types (kernel has internal bounds checks)
-        nb_fmax = (cld(nxp+1, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp+1, nthreads[3]))
-        @gpu_launch threads=nthreads blocks=nb_fmax ac_cell_to_face_vel!(ac_Uf_i, ac_Uf_j, ac_Uf_k, Q, nxp, nyp, nzp)
-    else
-        ac_Uf_i = nothing; ac_Uf_j = nothing; ac_Uf_k = nothing
-        ac_Uf_i_n = nothing; ac_Uf_j_n = nothing; ac_Uf_k_n = nothing
-    end
 
     LTS_dt = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
     # Un used for RK time stepping (Ncons components) AND edge ghost backup (Nprim components)
@@ -759,10 +728,11 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     
     nb = (cld(Nx_tot, nthreads[1]), cld(Ny_tot, nthreads[2]), cld(Nz_tot, nthreads[3]))
     if isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled
-        # Non-uniform rotation: Ω(x) linearly varies in physical zone, smooth return in fringe
-        @gpu_launch threads=nthreads blocks=nb Assign_rotation_var_nonuniform(
+        x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : zero(FT)
+        x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : FT(1.0e10)
+        @gpu_launch threads=nthreads blocks=nb Assign_rotation_var_threestage(
             Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp,
-            FT(Omega_x_min), FT(Omega_x_max), FT(L_phys), FT(L_total), FT(fringe_rise_fraction))
+            FT(Omega_x_min), FT(Omega_x_max), x_rot_start_val, x_rot_end_val)
     else
         x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : zero(FT)
         x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : FT(1.0e10)
@@ -778,38 +748,45 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
             FT(L_phys), FT(L_total), FT(fringe_lambda_max), FT(fringe_rise_fraction))
         # U_target: load precursor mean profile or initialize to zero
         U_target_cpu = zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
-        if isdefined(@__MODULE__, :precursor_mean_path) && isfile(precursor_mean_path)
-            # Load (Ny_block, Nz_block, Ncons) cross-section and tile along x
-            h5open(precursor_mean_path, "r") do fid
-                grp_name = "b$(bid)"
-                if haskey(fid, grp_name)
-                    U_cross = FT.(read(fid["$(grp_name)/U_mean"]))  # (Ny_block, Nz_block, Ncons)
-                    # Fill interior cells: tile the cross-section along x
-                    for n in 1:Ncons, k in 1:nzp, j in 1:nyp
-                        jg = j + NG; kg = k + NG
-                        # Map local (j,k) to global block (j,k) for precursor lookup
-                        j_glob = j + oy  # oy = offset in block
-                        k_glob = k + oz
-                        if j_glob >= 1 && j_glob <= size(U_cross, 1) &&
-                           k_glob >= 1 && k_glob <= size(U_cross, 2)
-                            val = U_cross[j_glob, k_glob, n]
-                            for i in 1:nxp
-                                U_target_cpu[i + NG, jg, kg, n] = val
+        if isdefined(@__MODULE__, :precursor_mean_path)
+            path_val = getfield(@__MODULE__, :precursor_mean_path)
+            if isfile(path_val)
+                # Load (Ny_block, Nz_block, Ncons) cross-section and tile along x
+                h5open(path_val, "r") do fid
+                    grp_name = "b$(bid)"
+                    if haskey(fid, grp_name)
+                        U_cross = FT.(read(fid["$(grp_name)/U_mean"]))  # (Ny_block, Nz_block, Ncons)
+                        # Fill interior cells: tile the cross-section along x
+                        for n in 1:Ncons, k in 1:nzp, j in 1:nyp
+                            jg = j + NG; kg = k + NG
+                            # Map local (j,k) to global block (j,k) for precursor lookup
+                            j_glob = j + oy  # oy = offset in block
+                            k_glob = k + oz
+                            if j_glob >= 1 && j_glob <= size(U_cross, 1) &&
+                               k_glob >= 1 && k_glob <= size(U_cross, 2)
+                                val = U_cross[j_glob, k_glob, n]
+                                for i in 1:nxp
+                                    U_target_cpu[i + NG, jg, kg, n] = val
+                                end
                             end
                         end
+                        if world_rank == 0
+                            println("  Fringe U_target loaded from: $(path_val)")
+                        end
+                    else
+                        if world_rank == 0
+                            @warn "Block $grp_name not found in $(path_val), U_target = 0"
+                        end
                     end
-                    if world_rank == 0
-                        println("  Fringe U_target loaded from: $(precursor_mean_path)")
-                    end
-                else
-                    if world_rank == 0
-                        @warn "Block $grp_name not found in $(precursor_mean_path), U_target = 0"
-                    end
+                end
+            else
+                if world_rank == 0
+                    @warn "Precursor file specified but not found: $(path_val), U_target = 0"
                 end
             end
         else
             if world_rank == 0
-                @warn "Precursor file not found: $(precursor_mean_path), U_target = 0"
+                @warn "Precursor file not specified or found, U_target = 0"
             end
         end
         U_target_arr = GPUArray(U_target_cpu)
@@ -828,16 +805,6 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
         imp_σ_k    = gpu_zeros(FT, nxp, nyp, nzp+1)
         # BDF2 dual-time stepping: store U^{n-1}
         imp_U_nm1 = dual_time ? gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons) : nothing
-        # GMRES Krylov buffers
-        _use_gmres = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
-        if _use_gmres
-            _gmres_m = isdefined(@__MODULE__, :gmres_m) ? gmres_m : 10
-            imp_V_krylov = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons, _gmres_m + 1)
-            imp_R_base = gpu_zeros(FT, nxp, nyp, nzp, Ncons)
-        else
-            imp_V_krylov = nothing
-            imp_R_base = nothing
-        end
         if rx == 0 && ry == 0 && rz == 0
             imp_mem_mb = (prod((nxp, nyp, nzp, Ncons)) + prod((Nx_tot, Ny_tot, Nz_tot, Ncons)) +
                           prod((Nx_tot, Ny_tot, Nz_tot)) +
@@ -845,20 +812,12 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
             if dual_time
                 imp_mem_mb += prod((Nx_tot, Ny_tot, Nz_tot, Ncons)) * 4 / 1024^2
             end
-            if _use_gmres
-                gmres_mem = prod((Nx_tot, Ny_tot, Nz_tot, Ncons, _gmres_m + 1)) * 4 / 1024^2
-                gmres_mem += prod((nxp, nyp, nzp, Ncons)) * 4 / 1024^2
-                imp_mem_mb += gmres_mem
-                println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB) [BDF2+GMRES($(_gmres_m))]")
-            else
-                println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB)$(dual_time ? " [BDF2]" : "")")
-            end
+            println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB)$(dual_time ? " [BDF2]" : "")")
         end
     else
         imp_dU_rhs = nothing; imp_ΔU = nothing; imp_D_inv = nothing
         imp_σ_i = nothing; imp_σ_j = nothing; imp_σ_k = nothing
         imp_U_nm1 = nothing
-        imp_V_krylov = nothing; imp_R_base = nothing
     end
 
     # ─── Initialize stencil arrays with compile-time constants (default) ───
@@ -949,8 +908,6 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                  sbuf_hy, sbuf_dy, rbuf_hy, rbuf_dy, sbuf_hz, sbuf_dz, rbuf_hz, rbuf_dz,
                  Ωx, Ωy, Ωz, nb,
                  imp_dU_rhs, imp_ΔU, imp_D_inv, imp_σ_i, imp_σ_j, imp_σ_k, imp_U_nm1,
-                 imp_V_krylov, imp_R_base,
-                 ac_Uf_i, ac_Uf_j, ac_Uf_k, ac_Uf_i_n, ac_Uf_j_n, ac_Uf_k_n,
                  stencil_i, Δstencil_i, lin_phi_i,
                  stencil_j, Δstencil_j, lin_phi_j,
                  stencil_k, Δstencil_k, lin_phi_k,
@@ -965,6 +922,199 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                  isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled ? U_target_arr : nothing,
                  D_i, D_j, D_k, U_tmp,
                  # Interface flux sync buffers
+                 my_fv_ilo, peer_fv_ilo, my_fv_ihi, peer_fv_ihi,
+                 my_fv_jlo, peer_fv_jlo, my_fv_jhi, peer_fv_jhi,
+                 my_fv_klo, peer_fv_klo, my_fv_khi, peer_fv_khi,
+                 my_fh_ilo, peer_fh_ilo, my_fh_ihi, peer_fh_ihi,
+                 my_fh_jlo, peer_fh_jlo, my_fh_jhi, peer_fh_jhi,
+                 my_fh_klo, peer_fh_klo, my_fh_khi, peer_fh_khi)
+end
+
+# ═══════════════════════════════════════════════════════════════════════
+# CEBL Auxiliary Block Generation and Initialization
+# ═══════════════════════════════════════════════════════════════════════
+
+function init_cebl_Q_kernel!(Q_cebl, Q_inlet, nx_cebl, ny_inlet, nz_inlet, NG)
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if j > ny_inlet + 2*NG || k > nz_inlet + 2*NG
+        return
+    end
+    i_src = NG + 1
+    for i in 1:(nx_cebl + 2*NG)
+        for n in 1:size(Q_cebl, 4)
+            @inbounds Q_cebl[i, j, k, n] = Q_inlet[i_src, j, k, n]
+        end
+    end
+    return
+end
+
+function create_cebl_block(b_inlet::Block, Nx_cebl::Int, Lx_cebl::FT, cebl_bid::Int, NG::Int, Ncons::Int, Nprim::Int, face_bc, bc_params)
+    Nx_cebl_tot = Nx_cebl + 2*NG + 1
+    Ny_cebl_tot = b_inlet.Ny + 2*NG + 1
+    Nz_cebl_tot = b_inlet.Nz + 2*NG + 1
+    
+    x_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
+    y_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
+    z_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
+    
+    dx = Lx_cebl / Nx_cebl
+    for i in 1:Nx_cebl_tot
+        x_val = (i - NG - 1.0) * dx
+        x_h[i, :, :] .= x_val
+    end
+    
+    y_inlet_slice = Array(b_inlet.y)[NG+1, :, :]
+    z_inlet_slice = Array(b_inlet.z)[NG+1, :, :]
+    for i in 1:Nx_cebl_tot
+        y_h[i, :, :] .= y_inlet_slice
+        z_h[i, :, :] .= z_inlet_slice
+    end
+    
+    FT_coords = (FT.(x_h), FT.(y_h), FT.(z_h))
+    Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, Vol = 
+        compute_fvm_metrics_runtime(FT_coords[1], FT_coords[2], FT_coords[3], Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG)
+        
+    Areai = GPUArray(Ai); nxi_g = GPUArray(nxi); nyi_g = GPUArray(nyi); nzi_g = GPUArray(nzi)
+    Areaj_g = GPUArray(Aj); nxj_g = GPUArray(nxj); nyj_g = GPUArray(nyj); nzj_g = GPUArray(nzj)
+    Areak_g = GPUArray(Ak); nxk_g = GPUArray(nxk); nyk_g = GPUArray(nyk); nzk_g = GPUArray(nzk)
+    Vol_g = GPUArray(Vol)
+    
+    Nx_tot = Nx_cebl + 2*NG
+    Ny_tot = b_inlet.Ny + 2*NG
+    Nz_tot = b_inlet.Nz + 2*NG
+    
+    Q = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Nprim)
+    U = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
+    ϕ = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
+    
+    x = GPUArray(FT_coords[1])
+    y = GPUArray(FT_coords[2])
+    z = GPUArray(FT_coords[3])
+    
+    nb_init = (1, cld(Ny_tot, 16), cld(Nz_tot, 16))
+    @gpu_launch threads=(1, 16, 16) blocks=nb_init init_cebl_Q_kernel!(Q, b_inlet.Q, Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG)
+    
+    nb_c2p = (cld(Nx_tot, nthreads[1]), cld(Ny_tot, nthreads[2]), cld(Nz_tot, nthreads[3]))
+    @gpu_launch threads=nthreads blocks=nb_c2p prim2c(U, Q, Nx_cebl, b_inlet.Ny, b_inlet.Nz)
+    
+    face_bc[(cebl_bid, 3)] = face_bc[(b_inlet.id, 3)]
+    face_bc[(cebl_bid, 4)] = face_bc[(b_inlet.id, 4)]
+    face_bc[(cebl_bid, 5)] = face_bc[(b_inlet.id, 5)]
+    face_bc[(cebl_bid, 6)] = face_bc[(b_inlet.id, 6)]
+    
+    if haskey(bc_params, (b_inlet.id, 3)); bc_params[(cebl_bid, 3)] = bc_params[(b_inlet.id, 3)]; end
+    if haskey(bc_params, (b_inlet.id, 4)); bc_params[(cebl_bid, 4)] = bc_params[(b_inlet.id, 4)]; end
+    if haskey(bc_params, (b_inlet.id, 5)); bc_params[(cebl_bid, 5)] = bc_params[(b_inlet.id, 5)]; end
+    if haskey(bc_params, (b_inlet.id, 6)); bc_params[(cebl_bid, 6)] = bc_params[(b_inlet.id, 6)]; end
+    
+    face_bc[(cebl_bid, 1)] = BC_PERIODIC
+    face_bc[(cebl_bid, 2)] = BC_PERIODIC
+    
+    LTS_dt = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
+    Un = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Nprim)
+    
+    sbuf_hx = zeros(FT, 0, 0, 0, 0); rbuf_hx = zeros(FT, 0, 0, 0, 0)
+    sbuf_dx = GPUArray(sbuf_hx); rbuf_dx = GPUArray(rbuf_hx)
+    sbuf_hx2 = zeros(FT, 0, 0, 0, 0); rbuf_hx2 = zeros(FT, 0, 0, 0, 0)
+    sbuf_dx2 = GPUArray(sbuf_hx2); rbuf_dx2 = GPUArray(rbuf_hx2)
+    sbuf_hy = zeros(FT, 0, 0, 0, 0); rbuf_hy = zeros(FT, 0, 0, 0, 0)
+    sbuf_dy = GPUArray(sbuf_hy); rbuf_dy = GPUArray(rbuf_hy)
+    sbuf_hz = zeros(FT, 0, 0, 0, 0); rbuf_hz = zeros(FT, 0, 0, 0, 0)
+    sbuf_dz = GPUArray(sbuf_hz); rbuf_dz = GPUArray(rbuf_hz)
+    
+    Ωx = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
+    Ωy = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
+    Ωz = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
+    
+    Ni = Nx_cebl + 2*NG; Nj = b_inlet.Ny + 2*NG; Nk = b_inlet.Nz + 2*NG
+    _Lin_h = repeat(reshape(FT.(Linear), 1, 7), Ni, 1)
+    _ΔLin_h = repeat(reshape(FT.(ΔLinear), 1, 7), Ni, 1)
+    _phi_h = fill(FT(Linear_ϕ), Ni)
+    stencil_i = GPUArray(_Lin_h); Δstencil_i = GPUArray(_ΔLin_h); lin_phi_i = GPUArray(_phi_h)
+    stencil_R_i = GPUArray(_Lin_h); Δstencil_R_i = GPUArray(_ΔLin_h)
+    
+    _Lin_j = repeat(reshape(FT.(Linear), 1, 1, 7), Nj, Nk, 1)
+    _ΔLin_j = repeat(reshape(FT.(ΔLinear), 1, 1, 7), Nj, Nk, 1)
+    _phi_j = fill(FT(Linear_ϕ), Nj, Nk)
+    _Lin_k = repeat(reshape(FT.(Linear), 1, 1, 7), Nj, Nk, 1)
+    _ΔLin_k = repeat(reshape(FT.(ΔLinear), 1, 1, 7), Nj, Nk, 1)
+    _phi_k = fill(FT(Linear_ϕ), Nj, Nk)
+    
+    apply_interface_taper!(_Lin_j, _ΔLin_j, _phi_j, _Lin_k, _ΔLin_k, _phi_k, face_bc, cebl_bid, b_inlet.Ny, b_inlet.Nz, NG)
+    apply_geometric_smoothness_protection!(_Lin_j, _ΔLin_j, _phi_j, _Lin_k, _ΔLin_k, _phi_k, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, face_bc, cebl_bid, Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG; verbose=false)
+    
+    stencil_j = GPUArray(_Lin_j); Δstencil_j = GPUArray(_ΔLin_j); lin_phi_j = GPUArray(_phi_j)
+    stencil_k = GPUArray(_Lin_k); Δstencil_k = GPUArray(_ΔLin_k); lin_phi_k = GPUArray(_phi_k)
+    stencil_R_j = GPUArray(_Lin_j); Δstencil_R_j = GPUArray(_ΔLin_j)
+    stencil_R_k = GPUArray(_Lin_k); Δstencil_R_k = GPUArray(_ΔLin_k)
+    filter_σ_init = (FT(filtering_s0), FT(filtering_s0), FT(filtering_s0))
+    
+    D_i = gpu_zeros(FT, Ni, Nj, Nk)
+    D_j = gpu_zeros(FT, Ni, Nj, Nk)
+    D_k = gpu_zeros(FT, Ni, Nj, Nk)
+    U_tmp = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
+    
+    is_inter = (
+        false,
+        false,
+        get(face_bc, (cebl_bid, 3), -1) == 0,
+        get(face_bc, (cebl_bid, 4), -1) == 0,
+        get(face_bc, (cebl_bid, 5), -1) == 0,
+        get(face_bc, (cebl_bid, 6), -1) == 0
+    )
+
+    _alloc_intf_gpu(cond, dims...) = cond ? gpu_zeros(FT, dims...) : nothing
+    _alloc_intf_h(cond, dims...)   = cond ? zeros(FT, dims...)     : nothing
+    ifs_ilo = is_inter[1]; ifs_ihi = is_inter[2]
+    ifs_jlo = is_inter[3]; ifs_jhi = is_inter[4]
+    ifs_klo = is_inter[5]; ifs_khi = is_inter[6]
+
+    my_fv_ilo   = _alloc_intf_gpu(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
+    peer_fv_ilo = _alloc_intf_gpu(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
+    my_fv_ihi   = _alloc_intf_gpu(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
+    peer_fv_ihi = _alloc_intf_gpu(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
+
+    my_fv_jlo   = _alloc_intf_gpu(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
+    peer_fv_jlo = _alloc_intf_gpu(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
+    my_fv_jhi   = _alloc_intf_gpu(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
+    peer_fv_jhi = _alloc_intf_gpu(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
+
+    my_fv_klo   = _alloc_intf_gpu(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
+    peer_fv_klo = _alloc_intf_gpu(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
+    my_fv_khi   = _alloc_intf_gpu(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
+    peer_fv_khi = _alloc_intf_gpu(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
+
+    my_fh_ilo   = _alloc_intf_h(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
+    peer_fh_ilo = _alloc_intf_h(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
+    my_fh_ihi   = _alloc_intf_h(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
+    peer_fh_ihi = _alloc_intf_h(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
+
+    my_fh_jlo   = _alloc_intf_h(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
+    peer_fh_jlo = _alloc_intf_h(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
+    my_fh_jhi   = _alloc_intf_h(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
+    peer_fh_jhi = _alloc_intf_h(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
+
+    my_fh_klo   = _alloc_intf_h(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
+    peer_fh_klo = _alloc_intf_h(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
+    my_fh_khi   = _alloc_intf_h(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
+    peer_fh_khi = _alloc_intf_h(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
+    
+    return Block(cebl_bid, Nx_cebl, b_inlet.Ny, b_inlet.Nz, 0, b_inlet.ry, b_inlet.rz, 0, b_inlet.oy, b_inlet.oz, Q, U, ϕ, Areai, Areaj_g, Areak_g, nxi_g, nyi_g, nzi_g, nxj_g, nyj_g, nzj_g, nxk_g, nyk_g, nzk_g, Vol_g, x, y, z, LTS_dt, Un,
+                 sbuf_hx, sbuf_dx, rbuf_hx, rbuf_dx, sbuf_hx2, sbuf_dx2, rbuf_hx2, rbuf_dx2,
+                 sbuf_hy, sbuf_dy, rbuf_hy, rbuf_dy, sbuf_hz, sbuf_dz, rbuf_hz, rbuf_dz,
+                 Ωx, Ωy, Ωz, nb_c2p,
+                 nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+                 stencil_i, Δstencil_i, lin_phi_i,
+                 stencil_j, Δstencil_j, lin_phi_j,
+                 stencil_k, Δstencil_k, lin_phi_k,
+                 stencil_R_i, Δstencil_R_i,
+                 stencil_R_j, Δstencil_R_j,
+                 stencil_R_k, Δstencil_R_k,
+                 filter_σ_init,
+                 nothing,
+                 is_inter,
+                 nothing, nothing, D_i, D_j, D_k, U_tmp,
                  my_fv_ilo, peer_fv_ilo, my_fv_ihi, peer_fv_ihi,
                  my_fv_jlo, peer_fv_jlo, my_fv_jhi, peer_fv_jhi,
                  my_fv_klo, peer_fv_klo, my_fv_khi, peer_fv_khi,
@@ -1064,15 +1214,7 @@ function blockAdvance(block::Block, dt, ϕ, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, world_
     _intf_klo = block.is_interblock[5] ? Int32(NG) : Int32(-1)
     _intf_khi = block.is_interblock[6] ? Int32(nzp + NG) : Int32(-1)
 
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        # ── AC skew-symmetric convection (2nd-order central, energy-preserving) ──
-        nb_fi = (cld(nxp+1, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-        nb_fj = (cld(nxp, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp, nthreads[3]))
-        nb_fk = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp+1, nthreads[3]))
-        @gpu_launch threads=nthreads blocks=nb_fi ac_skew_sym_flux_i!(Fx, Q, Areai, nxi, nyi, nzi, nxp, nyp, nzp)
-        @gpu_launch threads=nthreads blocks=nb_fj ac_skew_sym_flux_j!(Fy, Q, Areaj, nxj, nyj, nzj, nxp, nyp, nzp)
-        @gpu_launch threads=nthreads blocks=nb_fk ac_skew_sym_flux_k!(Fz, Q, Areak, nxk, nyk, nzk, nxp, nyp, nzp)
-    elseif eigen_reconstruction
+    if eigen_reconstruction
         @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0), _intf_ilo, _intf_ihi, block.my_face_val_ihi, block.my_face_val_ilo)
         @check_nan(Fx, "Fx after Eigen_reconstruct_i", block.id, world_rank, tt)
         @gpu_launch threads=threads_recon_j blocks=nb_recon_j Eigen_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0), _intf_jlo, _intf_jhi, block.my_face_val_jhi, block.my_face_val_jlo)
@@ -1198,6 +1340,69 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     conn_path = isdefined(Main, :connectivity_file) ? connectivity_file : joinpath(_mesh_base_conn, "block_connectivity.h5")
     Nblocks, connectivity, face_bc, bc_params, Nx_b, Ny_b, Nz_b = load_multiblock_connectivity(conn_path)
     
+    # Programmatic override to test CEBL forcing on periodic mesh
+    if isdefined(Main, :cebl_forcing) && Main.cebl_forcing
+        # Compute dynamic reference pressure p_ref to avoid pressure mismatch
+        local p_ref = FT(106.2) # default fallback
+        local ρ_ref_val = isdefined(Main, :ρ_ref) ? FT(Main.ρ_ref) : FT(1.176)
+        if isdefined(Main, :Re_target) && isdefined(Main, :Ma_target) && isdefined(Main, :Tw)
+            try
+                c_wall = sqrt(Main.γ * Main.Rg * Main.Tw)
+                u_bulk = Main.Ma_target * c_wall
+                μw = Main.C_s * Main.Tw * sqrt(Main.Tw) / (Main.Tw + Main.T_s)
+                ρ_ref_val = Main.Re_target * μw / (u_bulk * 2 * Main.R0)
+                β = 0.5 * Main.Pr * (Main.γ - 1.0) * (Main.Ma_target^2)
+                if β > 1e-6
+                    A = sqrt(1.0 + β)
+                    sqrt_β = sqrt(β)
+                    integral_factor = (1.0 / (2.0 * A * sqrt_β)) * log((A + sqrt_β) / (A - sqrt_β))
+                    p_ref = ρ_ref_val * Main.Rg * Main.Tw / integral_factor
+                else
+                    p_ref = ρ_ref_val * Main.Rg * Main.Tw
+                end
+            catch e
+                println("Warning: failed to compute dynamic p_ref: ", e)
+            end
+        end
+
+        local Omega_val = FT(0.0)
+        if isdefined(Main, :Omega_x)
+            Omega_val = FT(Main.Omega_x)
+        elseif isdefined(Main, :Ro_target) && isdefined(Main, :Ma_target) && isdefined(Main, :Tw) && isdefined(Main, :R0)
+            try
+                c_wall = sqrt(Main.γ * Main.Rg * Main.Tw)
+                U_bulk = Main.Ma_target * c_wall
+                Omega_val = Main.Ro_target * U_bulk / Main.R0
+            catch e
+            end
+        end
+        local R0_val = isdefined(Main, :R0) ? FT(Main.R0) : FT(0.5)
+
+        if world_rank == 0
+            println(">>> NSCBC Outflow parameter override values:")
+            println("    p_ref = ", p_ref)
+            println("    ρ_ref_val = ", ρ_ref_val)
+            println("    Omega_val = ", Omega_val)
+            println("    R0_val = ", R0_val)
+            flush(stdout)
+        end
+
+        for bid in 0:Nblocks-1
+            face_bc[(bid, 1)] = BC_CEBL_INFLOW
+            face_bc[(bid, 2)] = BC_NSCBC_OUTFLOW
+            params_tuple = get(bc_params, (bid, 2), ntuple(i -> zero(FT), N_BC_PARAMS))
+            params_list = collect(params_tuple)
+            params_list[BCP_P_TARGET] = FT(p_ref)
+            params_list[BCP_SIGMA] = FT(0.25)
+            params_list[BCP_LREF] = isdefined(Main, :L_total) ? FT(Main.L_total) : FT(15.0)
+            params_list[BCP_OMEGA] = FT(Omega_val)
+            params_list[BCP_RHO_BULK] = FT(ρ_ref_val)
+            params_list[BCP_R0] = FT(R0_val)
+            bc_params[(bid, 2)] = Tuple(params_list)
+        end
+    end
+
+    
     # Print BC configuration
     if world_rank == 0
         face_names = ["ξ-", "ξ+", "η-", "η+", "ζ-", "ζ+"]
@@ -1233,6 +1438,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     blocks = Dict{Int, Block}()
     block_comms = Dict{Int, MPI.Comm}()  # per-block communicator
     rankx = 0; ranky = 0; rankz = 0
+    Iperiodic_main_val = isdefined(Main, :Iperiodic_main) ? Main.Iperiodic_main : (isdefined(Main, :Iperiodic) ? Main.Iperiodic : (false, false, false))
 
     if multi_block_mode
         # ── Multi-block-per-rank: each block is whole (1,1,1) ──
@@ -1244,7 +1450,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 Nprocs_block = Block_Nprocs[bid + 1]  # always (1,1,1)
                 blocks[bid] = load_block(bid, 0, 0, 0, NG, Ncons, Nprim, Nprocs_block, world_rank, face_bc, connectivity)
                 # No sub-domain splitting →use COMM_SELF for intra-block exchange
-                block_comms[bid] = MPI.Cart_create(MPI.COMM_SELF, [1,1,1]; periodic=collect(Iperiodic))
+                block_comms[bid] = MPI.Cart_create(MPI.COMM_SELF, [1,1,1]; periodic=collect(Iperiodic_main_val))
             end
         end
         # Set rank_offsets so copy_ghost_face! maps block →owning rank correctly
@@ -1275,9 +1481,81 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         blocks[my_block_id] = load_block(my_block_id, rankx, ranky, rankz, NG, Ncons, Nprim, Nprocs_my_block, world_rank, face_bc, connectivity)
 
         block_comm = MPI.Comm_split(MPI.COMM_WORLD, my_block_id, local_rank)
-        block_comms[my_block_id] = MPI.Cart_create(block_comm, collect(Nprocs_my_block); periodic=collect(Iperiodic))
+        block_comms[my_block_id] = MPI.Cart_create(block_comm, collect(Nprocs_my_block); periodic=collect(Iperiodic_main_val))
 
         _rank_offsets_setup = copy(rank_offsets)
+    end
+
+    # ─── Instantiate CEBL Forcing State ───
+    cebl_enabled = isdefined(Main, :cebl_forcing) ? cebl_forcing : false
+    cebl_forcing_type = isdefined(Main, :cebl_forcing_type) ? Main.cebl_forcing_type : :ctbl
+    cebl_state = create_dummy_cebl_state(FT)
+    cebl_blocks = Dict{Int, Block}()
+    cebl_states = Dict{Int, CEBLForcingState}()
+    
+    cebl_connectivity = Dict{Tuple{Int, Int}, Connectivity}()
+    # Arrays for cebl ghost pool initialization
+    cebl_Block_Nprocs = Vector{SVector{3, Int64}}(undef, Nblocks + 101)
+    cebl_rank_offsets = Vector{Int}(undef, Nblocks + 101)
+    cebl_Nx_b = Vector{Int64}(undef, Nblocks + 101)
+    cebl_Ny_b = Vector{Int64}(undef, Nblocks + 101)
+    cebl_Nz_b = Vector{Int64}(undef, Nblocks + 101)
+    
+    if cebl_enabled
+        cebl_Nx_val = isdefined(Main, :cebl_Nx) ? cebl_Nx : 256
+        cebl_Lx_val = isdefined(Main, :cebl_Lx) ? FT(cebl_Lx) : FT(1.0)
+        
+        # 1. Create local CEBL blocks & CEBL states
+        for (bid, b) in blocks
+            if get(face_bc, (bid, 1), -1) == BC_CEBL_INFLOW && b.rx == 0
+                cebl_bid = bid + 100
+                if cebl_forcing_type == :deschamps
+                    c_state = create_dummy_cebl_state(FT)
+                    c_state.enabled = true
+                else
+                    source_file = isdefined(Main, :cebl_source_file) ? cebl_source_file : "cebl_source_profiles.h5"
+                    c_state = init_cebl_state(source_file)
+                end
+                
+                c_block = create_cebl_block(b, cebl_Nx_val, cebl_Lx_val, cebl_bid, NG, Ncons, Nprim, face_bc, bc_params)
+                c_state.Q_cebl = c_block.Q
+                
+                cebl_blocks[cebl_bid] = c_block
+                cebl_states[bid] = c_state
+            end
+        end
+        
+        # 2. Build cebl_connectivity by shifting main connectivity by 100
+        # Only copy connections in the transverse directions (faces 3, 4, 5, 6)
+        for (conn_key, conn) in connectivity
+            dst_b, dst_f = conn_key
+            if dst_f in (3, 4, 5, 6)
+                src_b, src_f = conn.src_b, conn.src_f
+                cebl_connectivity[(dst_b + 100, dst_f)] = Connectivity(src_b + 100, src_f, conn.reverse_tan, conn.flip_normal)
+            end
+        end
+        
+        # 3. Setup Block_Nprocs, rank_offsets, and dimensions for CEBL blocks
+        for bid in 0:Nblocks-1
+            cebl_bid = bid + 100
+            cebl_idx = cebl_bid + 1
+            px, py, pz = Block_Nprocs[bid + 1]
+            cebl_Block_Nprocs[cebl_idx] = SVector(1, py, pz)
+            cebl_rank_offsets[cebl_idx] = Block_to_rank[bid + 1]
+            
+            cebl_Nx_b[cebl_idx] = cebl_Nx_val
+            cebl_Ny_b[cebl_idx] = Ny_b[bid + 1]
+            cebl_Nz_b[cebl_idx] = Nz_b[bid + 1]
+        end
+        
+        # 4. Initialize buffer pool for CEBL blocks
+        if world_rank == 0
+            println(">>> Initializing CEBL transverse ghost cell exchange pool...")
+        end
+        cebl_ghost_pool = init_ghost_buffer_pool(
+            cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets,
+            cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, Ncons
+        )
     end
 
     # Global dimensions for flux buffers (max across all local blocks)
@@ -1293,134 +1571,30 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     shared_Fvz = gpu_zeros(FT, max_nxp, max_nyp, max_nzp+1, Ncons)
     shared_dU_forced = gpu_zeros(FT, max_nxp, max_nyp, max_nzp, Ncons)
 
-    # AC staggered grid shared buffers (only for explicit staggered path)
-    if equation_type == :incompressible_AC && !implicit
-        shared_dpdt  = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-        shared_dUf_i = gpu_zeros(FT, max_nxp+1, max_nyp, max_nzp)
-        shared_dUf_j = gpu_zeros(FT, max_nxp, max_nyp+1, max_nzp)
-        shared_dUf_k = gpu_zeros(FT, max_nxp, max_nyp, max_nzp+1)
+    # Separate flux arrays for CEBL blocks to prevent interface overwriting/interference
+    local cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz
+    local cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz
+    if cebl_enabled
+        cebl_max_nx = isdefined(Main, :cebl_Nx) ? Main.cebl_Nx : 256
+        cebl_max_ny = maximum(Ny_b)
+        cebl_max_nz = maximum(Nz_b)
+        cebl_shared_Fx  = gpu_zeros(FT, cebl_max_nx+1, cebl_max_ny, cebl_max_nz, Ncons)
+        cebl_shared_Fy  = gpu_zeros(FT, cebl_max_nx, cebl_max_ny+1, cebl_max_nz, Ncons)
+        cebl_shared_Fz  = gpu_zeros(FT, cebl_max_nx, cebl_max_ny, cebl_max_nz+1, Ncons)
+        cebl_shared_Fvx = gpu_zeros(FT, cebl_max_nx+1, cebl_max_ny, cebl_max_nz, Ncons)
+        cebl_shared_Fvy = gpu_zeros(FT, cebl_max_nx, cebl_max_ny+1, cebl_max_nz, Ncons)
+        cebl_shared_Fvz = gpu_zeros(FT, cebl_max_nx, cebl_max_ny, cebl_max_nz+1, Ncons)
     else
-        shared_dpdt = nothing
-        shared_dUf_i = nothing; shared_dUf_j = nothing; shared_dUf_k = nothing
+        # Define dummy/empty arrays so they are in scope
+        cebl_shared_Fx  = gpu_zeros(FT, 1, 1, 1, 1)
+        cebl_shared_Fy  = gpu_zeros(FT, 1, 1, 1, 1)
+        cebl_shared_Fz  = gpu_zeros(FT, 1, 1, 1, 1)
+        cebl_shared_Fvx = gpu_zeros(FT, 1, 1, 1, 1)
+        cebl_shared_Fvy = gpu_zeros(FT, 1, 1, 1, 1)
+        cebl_shared_Fvz = gpu_zeros(FT, 1, 1, 1, 1)
     end
 
-    # PISO shared buffers
-    if equation_type == :incompressible_PISO
-        shared_dpdt   = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)   # div(u*) / Poisson RHS
-        shared_dUf_i  = gpu_zeros(FT, max_nxp+1, max_nyp, max_nzp) # momentum RHS i-faces
-        shared_dUf_j  = gpu_zeros(FT, max_nxp, max_nyp+1, max_nzp) # momentum RHS j-faces
-        shared_dUf_k  = gpu_zeros(FT, max_nxp, max_nyp, max_nzp+1) # momentum RHS k-faces
-        # Per-block p_prime allocated in Block struct via Uf_i_n (reused as scratch)
-        # Actually, allocate a shared p_prime buffer (ghost-padded)
-        shared_p_prime = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)
-        # PCG solver buffers (only when piso_solver_type == :PCG)
-        _use_pcg = isdefined(@__MODULE__, :piso_solver_type) && piso_solver_type == :PCG
-        if _use_pcg
-            pcg_r = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-            pcg_z = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-            pcg_d = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)
-            pcg_q = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-            pcg_ztmp = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)  # SOR/MG precond workspace
-            # TRUE ZERO-ALLOC: pre-allocate CPU staging + MPI buffers + 4D ghost buffer
-            pcg_reduce_cpu = zeros(FT, max_nxp, max_nyp, max_nzp)           # CPU staging for GPU reductions
-            pcg_mpi_sbuf   = zeros(Float64, 1)                              # MPI.Allreduce! send buffer
-            pcg_mpi_rbuf   = zeros(Float64, 1)                              # MPI.Allreduce! recv buffer
-            pcg_ghost_4d   = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG, 1)  # 4D ghost exchange buffer
-        else
-            pcg_r = nothing; pcg_z = nothing; pcg_d = nothing; pcg_q = nothing; pcg_ztmp = nothing
-            pcg_reduce_cpu = nothing; pcg_mpi_sbuf = nothing; pcg_mpi_rbuf = nothing; pcg_ghost_4d = nothing
-        end
-        # ── MG level allocation ──
-        _use_mg = _use_pcg && isdefined(@__MODULE__, :piso_pcg_precond) && piso_pcg_precond == :mg
-        if _use_mg
-            _mg_n_levels = isdefined(@__MODULE__, :piso_mg_levels) ? piso_mg_levels : 2
-            mg_levels_dict = Dict{Int, Vector{MGLevel}}()
-            for (bid, b) in blocks
-                levels = mg_init_levels(b, _mg_n_levels, nthreads)
-                mg_levels_dict[bid] = levels
-                if world_rank == 0
-                    println("    MG levels for block $bid: ", length(levels),
-                        " coarse grids [", join(["$(l.nxp)×$(l.nyp)×$(l.nzp)" for l in levels], " → "), "]")
-                end
-            end
-        else
-            mg_levels_dict = nothing
-        end
-        # ── Non-orthogonality correction (NOC) buffers ──
-        _noc_iters = isdefined(@__MODULE__, :piso_noc_iters) ? piso_noc_iters : 0
-        if _noc_iters > 0
-            # Per-block precomputed k_f vectors (real-face indexed)
-            noc_kf_dict = Dict{Int, NamedTuple}()
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                # i-faces: (nxp+1, nyp, nzp)
-                _ki_x = gpu_zeros(FT, nxp+1, nyp, nzp)
-                _ki_y = gpu_zeros(FT, nxp+1, nyp, nzp)
-                _ki_z = gpu_zeros(FT, nxp+1, nyp, nzp)
-                # j-faces: (nxp, nyp+1, nzp)
-                _kj_x = gpu_zeros(FT, nxp, nyp+1, nzp)
-                _kj_y = gpu_zeros(FT, nxp, nyp+1, nzp)
-                _kj_z = gpu_zeros(FT, nxp, nyp+1, nzp)
-                # k-faces: (nxp, nyp, nzp+1)
-                _kk_x = gpu_zeros(FT, nxp, nyp, nzp+1)
-                _kk_y = gpu_zeros(FT, nxp, nyp, nzp+1)
-                _kk_z = gpu_zeros(FT, nxp, nyp, nzp+1)
 
-                # Precompute k_f from mesh geometry
-                nb_fi = (cld(nxp+1, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_fi piso_precompute_kf_i!(
-                    _ki_x, _ki_y, _ki_z,
-                    b.x, b.y, b.z, b.nxi, b.nyi, b.nzi, b.Areai, b.Vol,
-                    nxp, nyp, nzp)
-
-                nb_fj = (cld(nxp, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_fj piso_precompute_kf_j!(
-                    _kj_x, _kj_y, _kj_z,
-                    b.x, b.y, b.z, b.nxj, b.nyj, b.nzj, b.Areaj, b.Vol,
-                    nxp, nyp, nzp)
-
-                nb_fk = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp+1, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_fk piso_precompute_kf_k!(
-                    _kk_x, _kk_y, _kk_z,
-                    b.x, b.y, b.z, b.nxk, b.nyk, b.nzk, b.Areak, b.Vol,
-                    nxp, nyp, nzp)
-
-                noc_kf_dict[bid] = (ki_x=_ki_x, ki_y=_ki_y, ki_z=_ki_z,
-                                    kj_x=_kj_x, kj_y=_kj_y, kj_z=_kj_z,
-                                    kk_x=_kk_x, kk_y=_kk_y, kk_z=_kk_z)
-            end
-            gpu_sync()
-            # Shared gradient arrays (ghost-padded, for cell-center ∇p')
-            noc_grad_px = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)
-            noc_grad_py = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)
-            noc_grad_pz = gpu_zeros(FT, max_nxp+2*NG, max_nyp+2*NG, max_nzp+2*NG)
-            # Shared NOC source (real-cell)
-            noc_source  = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-            # Shared correction RHS (real-cell, reuses dpdt format)
-            noc_dpdt_corr = gpu_zeros(FT, max_nxp, max_nyp, max_nzp)
-        else
-            noc_kf_dict = nothing
-            noc_grad_px = nothing; noc_grad_py = nothing; noc_grad_pz = nothing
-            noc_source = nothing; noc_dpdt_corr = nothing
-        end
-        if world_rank == 0
-            _sname = _use_pcg ? "PCG (Jacobi)" : "SOR"
-            if _use_pcg && isdefined(@__MODULE__, :piso_pcg_precond) && piso_pcg_precond == :sor
-                _nsw = isdefined(@__MODULE__, :piso_pcg_sor_sweeps) ? piso_pcg_sor_sweeps : 5
-                _sname = "PCG (SOR-$(_nsw) precond)"
-            elseif _use_mg
-                _sname = "MG V-cycle standalone ($(_mg_n_levels) coarse levels)"
-            end
-            _noc_str = _noc_iters > 0 ? ", NOC=$(_noc_iters)" : ""
-            println("  > PISO buffers allocated: dpdt, dUf_i/j/k, p_prime [solver: $(_sname)$(_noc_str)]")
-        end
-    else
-        shared_p_prime = nothing
-        pcg_r = nothing; pcg_z = nothing; pcg_d = nothing; pcg_q = nothing; pcg_ztmp = nothing
-        pcg_reduce_cpu = nothing; pcg_mpi_sbuf = nothing; pcg_mpi_rbuf = nothing; pcg_ghost_4d = nothing
-        mg_levels_dict = nothing
-        _use_pcg = false
-    end
 
     forcex = zero(FT)
     flowx  = zero(FT)
@@ -1668,12 +1842,33 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         if profiling; _ts = time_ns(); end
         copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
                          full_range=false)
+        if cebl_enabled
+            copy_ghost_face!(cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, :U, Ncons, cebl_ghost_pool;
+                             full_range=false)
+        end
         for (bid, b) in blocks
             @check_nan(b.U, "U after copy_ghost_face!", b.id, world_rank, tt_val)
+        end
+        if cebl_enabled
+            for (cebl_bid, c_block) in cebl_blocks
+                @check_nan(c_block.U, "cebl_block U after copy_ghost_face!", cebl_bid, world_rank, tt_val)
+            end
         end
         if profiling; gpu_sync(); t_sync_sub[1] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
 
         # Step 2: Physical Boundary Conditions (fills wall/periodic ghost)
+        if cebl_enabled
+            for (cebl_bid, c_block) in cebl_blocks
+                Apply_local_periodic_x!(c_block.U, c_block.Nx, c_block.Ny, c_block.Nz, NG, Ncons)
+                c_state = get(cebl_states, cebl_bid - 100, cebl_state)
+                fillGhost(c_block.Q, c_block.U, 0, c_block.ry, c_block.rz,
+                          c_block.nxi, c_block.nyi, c_block.nzi, c_block.nxj, c_block.nyj, c_block.nzj, c_block.nxk, c_block.nyk, c_block.nzk,
+                          c_block.x, c_block.y, c_block.z, c_block.id, c_block.Nx, c_block.Ny, c_block.Nz, cebl_Block_Nprocs[c_block.id + 1], tt_val, face_bc, bc_params,
+                          @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params,
+                          c_state.enabled, c_state.Q_cebl)
+            end
+        end
+
         for (bid, b) in blocks
             Nprocs_b = Block_Nprocs[bid + 1]
             rx_b = multi_block_mode ? 0 : rankx
@@ -1682,7 +1877,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             fillGhost(b.Q, b.U, rx_b, ry_b, rz_b,
                       b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj, b.nxk, b.nyk, b.nzk,
                       b.x, b.y, b.z, b.id, b.Nx, b.Ny, b.Nz, Nprocs_b, tt_val, face_bc, bc_params,
-                      @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params)
+                      @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params,
+                      get(cebl_states, b.id, cebl_state).enabled, get(cebl_states, b.id, cebl_state).Q_cebl)
             @check_nan(b.U, "U after fillGhost", b.id, world_rank, tt_val)
         end
         if profiling; gpu_sync(); t_sync_sub[2] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
@@ -1705,6 +1901,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         # (now includes ghost from ξ-exchange in step 3)
         copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
                          full_range=true, delta_mode=true)
+        if cebl_enabled
+            copy_ghost_face!(cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, :U, Ncons, cebl_ghost_pool;
+                             full_range=true, delta_mode=true)
+        end
         
         # ─── GEOMETRIC JUMP CORRECTION FOR INTERBLOCK KINKS ───
         for (bid, b) in blocks
@@ -1712,6 +1912,13 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             nb_loc = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
             @gpu_launch threads=nthreads blocks=nb_loc correct_ghost_kinks_kernel!(b.U, b.U_tmp, b.D_i, b.D_j, b.D_k, b.Nx+2*NG, b.Ny+2*NG, b.Nz+2*NG, Ncons)
             @check_nan(b.U, "U after geometric jump correction", b.id, world_rank, tt_val)
+        end
+        if cebl_enabled
+            for (cebl_bid, c_block) in cebl_blocks
+                copyto!(c_block.U_tmp, c_block.U)
+                nb_loc_cebl = (cld(c_block.Nx+2*NG, nthreads[1]), cld(c_block.Ny+2*NG, nthreads[2]), cld(c_block.Nz+2*NG, nthreads[3]))
+                @gpu_launch threads=nthreads blocks=nb_loc_cebl correct_ghost_kinks_kernel!(c_block.U, c_block.U_tmp, c_block.D_i, c_block.D_j, c_block.D_k, c_block.Nx+2*NG, c_block.Ny+2*NG, c_block.Nz+2*NG, Ncons)
+            end
         end
         
         if profiling; gpu_sync(); t_sync_sub[4] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
@@ -1727,8 +1934,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         #   lin_phi low  (central regions)       → σ high → more filter
         # Direction-specific lin_phi: η uses lin_phi_j, ζ uses lin_phi_k
         _intf_interval = @isdefined(intf_filter_interval) ? intf_filter_interval : 1
-        if equation_type != :incompressible_PISO && equation_type != :incompressible_AC && (tt % _intf_interval == 0)
-            _σ_max = FT(0.0)
+        if (tt % _intf_interval == 0)
+            _σ_max = (isdefined(Main, :filtering) && Main.filtering) ? (isdefined(Main, :filtering_s0) ? FT(Main.filtering_s0) : FT(0.1)) : FT(0.0)
             if _σ_max > FT(0.0)
             for (bid, b) in blocks
                 for ((dst_bid, fid), conn) in connectivity
@@ -1754,6 +1961,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         if profiling; gpu_sync(); t_sync_sub[5] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
 
         # Step 5: Ghost-only Primitive Refresh
+        if cebl_enabled
+            for (cebl_bid, c_block) in cebl_blocks
+                nb_loc_cebl = (cld(c_block.Nx+2*NG, nthreads[1]), cld(c_block.Ny+2*NG, nthreads[2]), cld(c_block.Nz+2*NG, nthreads[3]))
+                @gpu_launch threads=nthreads blocks=nb_loc_cebl c2Prim_ghost(c_block.U, c_block.Q, c_block.Nx, c_block.Ny, c_block.Nz)
+            end
+        end
         for (bid, b) in blocks
             nb_loc = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
             @gpu_launch threads=nthreads blocks=nb_loc c2Prim_ghost(b.U, b.Q, b.Nx, b.Ny, b.Nz)
@@ -1852,20 +2065,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
         # ── Forcing parameters (computed once per step) ──
         if flow_forcing
-            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                # AC forcing modes:
-                #   1 = constant pressure gradient (pipe flow)
-                if forcing_mode == 1
-                    ac_f1_val = Update_ac_pipe_force(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
-                end
-            else
-                if forcing_mode == 1
-                    forcex, flowx = Update_bulk_force_params(blocks, tt, 1, MPI.COMM_WORLD, world_rank)
-                elseif forcing_mode == 2
-                    cmf_f1_val = Update_const_massflux_params(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
-                elseif forcing_mode == 3
-                    deschamps_f1_val, deschamps_flowx_val = Update_deschamps_pipe_params(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
-                end
+            if forcing_mode == 1
+                forcex, flowx = Update_bulk_force_params(blocks, tt, 1, MPI.COMM_WORLD, world_rank)
+            elseif forcing_mode == 2
+                cmf_f1_val = Update_const_massflux_params(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
+            elseif forcing_mode == 3
+                deschamps_f1_val, deschamps_flowx_val = Update_deschamps_pipe_params(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
             end
         end
         if test_case == "HIT"
@@ -1906,7 +2111,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
             # ── Pseudo-time inner iterations ──
             prev_max_res = Inf
-            min_max_res = Inf
             for m_iter = 1:dual_time_sub_iters
                 # 1. Update boundary conditions and MPI ghost cells for current U^{n+1,m}
                 sync_blocks!(activeTime)
@@ -1924,8 +2128,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         threads_recon_i, threads_recon_j, threads_recon_k,
                         threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
                         forcex, flowx, cmf_f1_val, ac_f1_val,
-                        hit_u_mean, hit_v_mean, hit_w_mean, activeTime;
-                        sync_ghost_fn = () -> sync_blocks!(activeTime))
+                        hit_u_mean, hit_v_mean, hit_w_mean, activeTime)
                     local_max_res = max(local_max_res, res)
                     # Monitor solution growth (first 20 steps)
                     if tt <= 20
@@ -1960,54 +2163,17 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     break
                 end
 
-                # (AC sub-iteration break removed →skew-symmetric + GMRES handles p-u coupling)
-
                 # Safety: detect diverging sub-iterations and bail out
-                # GMRES has non-monotonic convergence →compare against best residual, not previous
-                _is_gmres = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
-                if _is_gmres
-                    # GMRES: allow temporary increase, only bail if 10× worse than best seen
-                    if m_iter > 1 && global_max_res > min_max_res * 10.0
-                        if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
-                            @printf "    →Sub-iter diverging (%.2e > 10×%.2e), breaking\n" global_max_res min_max_res
-                        end
-                        break
+                # LU-SGS: monotonic convergence expected
+                if m_iter > 1 && global_max_res > prev_max_res * 2.0
+                    if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
+                        @printf "    →Sub-iter diverging (%.2e > 2×%.2e), breaking\n" global_max_res prev_max_res
                     end
-                    min_max_res = min(min_max_res, global_max_res)
-                else
-                    # LU-SGS: monotonic convergence expected
-                    if m_iter > 1 && global_max_res > prev_max_res * 2.0
-                        if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
-                            @printf "    →Sub-iter diverging (%.2e > 2×%.2e), breaking\n" global_max_res prev_max_res
-                        end
-                        break
-                    end
+                    break
                 end
                 prev_max_res = global_max_res
             end
-            # ── AC mean pressure gauge fix ──
-            # In incompressible flow, pressure is defined up to an additive constant.
-            # The AC pressure equation ∂p/∂t = -β²∇·u accumulates a mean pressure
-            # that grows without bound (β=15 →~0.5/step). This gauge drift causes
-            # NaN when max|p| exceeds Float32 range. Fix: subtract <p> every step.
-            if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                p_sum_local = 0.0
-                n_cells_local = 0
-                for (bid, b) in blocks
-                    NGp = NG + 1
-                    nx_end, ny_end, nz_end = b.Nx + NG, b.Ny + NG, b.Nz + NG
-                    p_v = @view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 1]
-                    p_sum_local += Float64(sum(p_v))
-                    n_cells_local += b.Nx * b.Ny * b.Nz
-                end
-                p_mean = MPI.Allreduce(p_sum_local, MPI.SUM, MPI.COMM_WORLD) /
-                         MPI.Allreduce(n_cells_local, MPI.SUM, MPI.COMM_WORLD)
-                p_mean_f32 = FT(p_mean)
-                for (bid, b) in blocks
-                    b.U[:, :, :, 1] .-= p_mean_f32
-                    b.Q[:, :, :, 1] .-= p_mean_f32
-                end
-            end
+
 
             # After advancing: shift history U^{n-1} →U^n (which is in Un)
             for (bid, b) in blocks
@@ -2040,11 +2206,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
         # ── Sync blocks (ghost exchange + BC) ──
         if profiling; _t0 = time_ns(); end
-        if equation_type == :incompressible_PISO || equation_type == :incompressible_AC
-            for (bid, b) in blocks
-                copyto!(b.U, b.Q)
-            end
-        end
+
         sync_blocks!(activeTime)
         if profiling; gpu_sync(); t_sync += (time_ns() - _t0) / 1e9; end
 
@@ -2055,583 +2217,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
       else
         # ═══════════════════════════════════════════════════════
-        #  EXPLICIT PATH
-        # ═══════════════════════════════════════════════════════
-
-        if equation_type == :incompressible_PISO
-        # ═══════════════════════════════════════════════════════
-        #  PISO STAGGERED GRID PATH
-        #  Fractional-step with dual pressure correction
-        # ═══════════════════════════════════════════════════════
-
-        if flow_forcing
-            if forcing_mode == 1
-                ac_f1_val = Update_ac_pipe_force(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
-            end
-        end
-
-        if profiling; _t0 = time_ns(); end
-
-        # Save u^n for predictor
-        for (bid, b) in blocks
-            copyto!(b.Uf_i_n, b.Uf_i)
-            copyto!(b.Uf_j_n, b.Uf_j)
-            copyto!(b.Uf_k_n, b.Uf_k)
-        end
-
-        # Helper: single PISO pressure correction cycle
-        # Returns max|div(u)| after correction
-        function _piso_pressure_correct!(pass_name)
-            # 1. Update Q cell-center from face velocities (needed by divergence)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_f ac_face_to_cell_vel!(b.Q, b.Uf_i, b.Uf_j, b.Uf_k, nxp, nyp, nzp)
-                copyto!(b.U, b.Q)
-            end
-            sync_blocks!(activeTime)
-
-            # 2. Compute divergence of current velocity
-            local_max_div = zero(FT)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_f piso_compute_divergence!(
-                    shared_dpdt, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj,
-                    b.Areak, b.nxk, b.nyk, b.nzk, b.Vol, nxp, nyp, nzp)
-                # Compute Poisson RHS: rhs = (ρ/Δt) × div(u*)
-                rho_over_dt = ρ_ref / current_dt
-                @gpu_launch threads=nthreads blocks=nb_f piso_scale_rhs!(
-                    shared_dpdt, shared_dpdt, rho_over_dt, nxp, nyp, nzp)
-                # Monitor pre-correction divergence (GPU-direct, no Array copy)
-                local_max_div = max(local_max_div,
-                    FT(maximum(abs, @view shared_dpdt[1:nxp, 1:nyp, 1:nzp])) / rho_over_dt)
-            end
-
-            # 3. Solve pressure Poisson: nabla^2(p') = rhs
-            # Zero p_prime
-            for (bid, b) in blocks
-                Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                nb_tot = (cld(Nx_t, nthreads[1]), cld(Ny_t, nthreads[2]), cld(Nz_t, nthreads[3]))
-                pp_view = @view shared_p_prime[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                @gpu_launch threads=nthreads blocks=nb_tot piso_zero_field!(pp_view, Int32(Nx_t), Int32(Ny_t), Int32(Nz_t))
-            end
-
-            _piso_max_it = isdefined(@__MODULE__, :piso_poisson_max_iters) ? piso_poisson_max_iters : 200
-            _piso_tol = isdefined(@__MODULE__, :piso_poisson_tol) ? piso_poisson_tol : FT(1.0e-5)
-
-            # ── Unified inter-block ghost exchange closure ──
-            # Packs field → b.U[:,:,:,1], calls copy_ghost_face!, unpacks.
-            # This handles η/ζ block boundaries that MPI exchange_ghost doesn't cover.
-            # Passed to PCG so its internal _ghost_exchange! is complete for ALL directions.
-            function _piso_interblock_exchange!(field)
-                for (bid, b) in blocks
-                    Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                    fv = @view field[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    copyto!(@view(b.U[1:Nx_t, 1:Ny_t, 1:Nz_t, 1]), fv)
-                end
-                copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets,
-                                 Nx_b, Ny_b, Nz_b, :U, 1, ghost_pool; full_range=false)
-                for (bid, b) in blocks
-                    Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                    fv = @view field[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    copyto!(fv, @view(b.U[1:Nx_t, 1:Ny_t, 1:Nz_t, 1]))
-                end
-            end
-
-          if _use_pcg
-            # ---- PCG path ----
-            piso_pcg_solve!(shared_p_prime, shared_dpdt, pcg_r, pcg_z, pcg_d, pcg_q,
-                            pcg_ztmp, mg_levels_dict,
-                            blocks, nthreads, face_bc, block_comms,
-                            _piso_max_it, _piso_tol, tt, world_rank,
-                            pcg_reduce_cpu, pcg_mpi_sbuf, pcg_mpi_rbuf, pcg_ghost_4d)
-          else
-            # ---- SOR path ----
-            _piso_omega = isdefined(@__MODULE__, :piso_sor_omega) ? piso_sor_omega : FT(1.85)
-            _interblock_freq = 10  # inter-block p' exchange every N SOR iterations
-
-            for poisson_iter = 1:_piso_max_it
-                for color = Int32(0):Int32(1)
-                    for (bid, b) in blocks
-                        nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                        nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                        pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                        @gpu_launch threads=nthreads blocks=nb_f piso_poisson_rb_sor!(
-                            pp_view, shared_dpdt, b.Vol, b.Areai, b.Areaj, b.Areak,
-                            nxp, nyp, nzp, _piso_omega, color)
-                    end
-                    # Apply p' Neumann BC at physical boundaries only
-                    for (bid, b) in blocks
-                        pp_view = @view shared_p_prime[1:b.Nx+2*NG, 1:b.Ny+2*NG, 1:b.Nz+2*NG]
-                        piso_apply_pprime_bc!(b, bid, face_bc, pp_view)
-                    end
-                    # Intra-block ξ-direction exchange (between sub-blocks of same block)
-                    for (bid, b) in blocks
-                        pp_view = @view shared_p_prime[1:b.Nx+2*NG, 1:b.Ny+2*NG, 1:b.Nz+2*NG]
-                        pp_4d = reshape(pp_view, size(pp_view, 1), size(pp_view, 2), size(pp_view, 3), 1)
-                        exchange_ghost(pp_4d, 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
-                            b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
-                            b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
-                            b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
-                            sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
-                            rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2)
-                    end
-                end
-
-                # ── Inter-block p' exchange (η/ζ faces) every N iterations ──
-                # Uses b.U[:,:,:,1] as temporary transport for copy_ghost_face!
-                if poisson_iter % _interblock_freq == 0
-                    # Pack p' →U[:,:,:,1]
-                    for (bid, b) in blocks
-                        Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                        pp_view = @view shared_p_prime[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                        copyto!(@view(b.U[1:Nx_t, 1:Ny_t, 1:Nz_t, 1]), pp_view)
-                    end
-                    # Inter-block ghost exchange via MPI
-                    copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets,
-                                     Nx_b, Ny_b, Nz_b, :U, 1, ghost_pool; full_range=false)
-                    # Unpack: U ghost →p' ghost
-                    for (bid, b) in blocks
-                        Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                        pp_view = @view shared_p_prime[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                        copyto!(pp_view, @view(b.U[1:Nx_t, 1:Ny_t, 1:Nz_t, 1]))
-                    end
-                end
-
-                # ── SOR convergence check (every 20 iters) ──
-                # For non-uniform/curvilinear grids, convergence rate varies greatly.
-                # Break early when converged; don't waste iterations on easy steps.
-                _sor_check_freq = 20
-                if poisson_iter % _sor_check_freq == 0
-                    _diag_res = FT(0.0)
-                    for (bid, b) in blocks
-                        nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                        nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                        pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                        res_buf = @view shared_dUf_i[1:nxp, 1:nyp, 1:nzp]
-                        @gpu_launch threads=nthreads blocks=nb_f piso_poisson_residual!(
-                            res_buf, pp_view, shared_dpdt, b.Vol, b.Areai, b.Areaj, b.Areak,
-                            nxp, nyp, nzp)
-                        _diag_res = max(_diag_res, FT(maximum(abs, res_buf)))
-                    end
-                    # MPI global max for multi-block
-                    _diag_res = FT(MPI.Allreduce(Float64(_diag_res), MPI.MAX, MPI.COMM_WORLD))
-
-                    # Print diagnostic (first 20 steps or every 100)
-                    if world_rank == 0 && (tt <= 20 || tt % 100 == 0)
-                        @printf("        [SOR iter=%d] max_res=%.3e\n", poisson_iter, _diag_res)
-                        flush(stdout)
-                    end
-
-                    # ── Early termination when converged ──
-                    if _diag_res < _piso_tol
-                        if world_rank == 0 && (tt <= 20 || tt % 100 == 0)
-                            @printf("        [SOR CONVERGED at iter=%d] max_res=%.3e < tol=%.1e\n",
-                                poisson_iter, _diag_res, _piso_tol)
-                            flush(stdout)
-                        end
-                        break
-                    end
-                end
-            end
-          end  # _use_pcg / SOR branch
-
-            # ── Non-orthogonality defect correction ──
-            # After the initial solve, apply N_noc correction iterations:
-            #   1. Compute ∇p' (Green-Gauss gradient)
-            #   2. Compute E_P = Σ k_f · (∇p')_f  (cross-diffusion flux)
-            #   3. Solve A*δp = -E (correction equation, converges fast)
-            #   4. p' += δp
-            if _noc_iters > 0 && noc_kf_dict !== nothing && _use_pcg
-              for _noc = 1:_noc_iters
-                # 0. Full p' ghost exchange: BC + MPI (ξ) + inter-block (η/ζ)
-                for (bid, b) in blocks
-                    pp_view = @view shared_p_prime[1:b.Nx+2*NG, 1:b.Ny+2*NG, 1:b.Nz+2*NG]
-                    piso_apply_pprime_bc!(b, bid, face_bc, pp_view)
-                    pp_4d = reshape(pp_view, size(pp_view, 1), size(pp_view, 2), size(pp_view, 3), 1)
-                    exchange_ghost(pp_4d, 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
-                        b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
-                        b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
-                        b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
-                        sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
-                        rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2)
-                end
-                _piso_interblock_exchange!(shared_p_prime)
-                # 1. Compute Green-Gauss gradient of current p'
-                for (bid, b) in blocks
-                    nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                    nb_g = (cld(nxp+2, nthreads[1]), cld(nyp+2, nthreads[2]), cld(nzp+2, nthreads[3]))
-                    pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                    @gpu_launch threads=nthreads blocks=nb_g piso_compute_grad_p!(
-                        noc_grad_px, noc_grad_py, noc_grad_pz, pp_view,
-                        b.Areai, b.nxi, b.nyi, b.nzi,
-                        b.Areaj, b.nxj, b.nyj, b.nzj,
-                        b.Areak, b.nxk, b.nyk, b.nzk,
-                        b.Vol, nxp, nyp, nzp)
-                end
-
-                # 2. Compute NOC source E_P
-                for (bid, b) in blocks
-                    nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                    nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                    kf = noc_kf_dict[bid]
-                    @gpu_launch threads=nthreads blocks=nb_f piso_compute_noc_source!(
-                        noc_source, noc_grad_px, noc_grad_py, noc_grad_pz,
-                        kf.ki_x, kf.ki_y, kf.ki_z,
-                        kf.kj_x, kf.kj_y, kf.kj_z,
-                        kf.kk_x, kf.kk_y, kf.kk_z,
-                        nxp, nyp, nzp)
-                end
-
-                # 3. Prepare correction RHS: dpdt_corr = -E × vol_inv
-                for (bid, b) in blocks
-                    nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                    nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                    @gpu_launch threads=nthreads blocks=nb_f piso_noc_prepare_correction_rhs!(
-                        noc_dpdt_corr, noc_source, b.Vol, nxp, nyp, nzp)
-                end
-
-                # 4. Save current p' to noc_grad_px (reused as temp), zero p', solve correction
-                # NOTE: pcg_ztmp is clobbered by PCG's SOR preconditioner, so we use
-                # noc_grad_px as save buffer. Gradient will be recomputed after this loop.
-                for (bid, b) in blocks
-                    Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                    pp_view = @view shared_p_prime[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    save_view = @view noc_grad_px[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    copyto!(save_view, pp_view)   # save p' → noc_grad_px
-                    nb_tot = (cld(Nx_t, nthreads[1]), cld(Ny_t, nthreads[2]), cld(Nz_t, nthreads[3]))
-                    @gpu_launch threads=nthreads blocks=nb_tot piso_zero_field!(pp_view, Int32(Nx_t), Int32(Ny_t), Int32(Nz_t))
-                end
-
-                # NOC correction: configurable max_iters and relaxed tolerance
-                _noc_max_it = isdefined(@__MODULE__, :piso_noc_max_iters) ? piso_noc_max_iters : _piso_max_it
-                _noc_tol = isdefined(@__MODULE__, :piso_noc_tol) ? piso_noc_tol : FT(3.0) * _piso_tol
-                piso_pcg_solve!(shared_p_prime, noc_dpdt_corr, pcg_r, pcg_z, pcg_d, pcg_q,
-                                pcg_ztmp, mg_levels_dict,
-                                blocks, nthreads, face_bc, block_comms,
-                                _noc_max_it, _noc_tol, tt, world_rank,
-                                pcg_reduce_cpu, pcg_mpi_sbuf, pcg_mpi_rbuf, pcg_ghost_4d)
-
-                # 5. p' = saved_p' + δp  (δp is in shared_p_prime, saved p' in noc_grad_px)
-                for (bid, b) in blocks
-                    nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                    Nx_t = nxp + 2*NG; Ny_t = nyp + 2*NG; Nz_t = nzp + 2*NG
-                    nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                    pp_view = @view shared_p_prime[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    save_view = @view noc_grad_px[1:Nx_t, 1:Ny_t, 1:Nz_t]
-                    @gpu_launch threads=nthreads blocks=nb_f piso_add_correction!(
-                        pp_view, save_view, nxp, nyp, nzp)
-                end
-                # Ghost exchange on corrected p'
-                for (bid, b) in blocks
-                    pp_view = @view shared_p_prime[1:b.Nx+2*NG, 1:b.Ny+2*NG, 1:b.Nz+2*NG]
-                    piso_apply_pprime_bc!(b, bid, face_bc, pp_view)
-                    pp_4d = reshape(pp_view, size(pp_view, 1), size(pp_view, 2), size(pp_view, 3), 1)
-                    exchange_ghost(pp_4d, 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
-                        b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
-                        b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
-                        b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
-                        sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
-                        rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2)
-                end
-              end  # _noc loop
-              # Recompute final ∇p' for use by non-orthogonal velocity correction
-              # (noc_grad_px was clobbered as save buffer during defect correction)
-              for (bid, b) in blocks
-                  nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                  nb_g = (cld(nxp+2, nthreads[1]), cld(nyp+2, nthreads[2]), cld(nzp+2, nthreads[3]))
-                  pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                  @gpu_launch threads=nthreads blocks=nb_g piso_compute_grad_p!(
-                      noc_grad_px, noc_grad_py, noc_grad_pz, pp_view,
-                      b.Areai, b.nxi, b.nyi, b.nzi,
-                      b.Areaj, b.nxj, b.nyj, b.nzj,
-                      b.Areak, b.nxk, b.nyk, b.nzk,
-                      b.Vol, nxp, nyp, nzp)
-              end
-            end  # _noc_iters > 0
-
-            # Restore b.U[:,:,:,1] (= ρ for incompressible flow)
-            for (bid, b) in blocks
-                Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                fill!(@view(b.U[1:Nx_t, 1:Ny_t, 1:Nz_t, 1]), FT(ρ_ref))
-            end
-
-            # ── Subtract p' mean (remove Neumann null-space constant) ──
-            # Prevents unbounded pressure drift: Q[1] += p' accumulates
-            # the arbitrary constant each step, degrading Float32 gradient precision.
-            local_pp_sum = Float64(0.0)
-            local_pp_count = Int64(0)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                pp_real = @view pp_view[NG+1:nxp+NG, NG+1:nyp+NG, NG+1:nzp+NG]
-                local_pp_sum += Float64(sum(pp_real))
-                local_pp_count += nxp * nyp * nzp
-            end
-            global_pp_sum = MPI.Allreduce(local_pp_sum, MPI.SUM, MPI.COMM_WORLD)
-            global_pp_count = MPI.Allreduce(local_pp_count, MPI.SUM, MPI.COMM_WORLD)
-            pp_mean = FT(global_pp_sum / global_pp_count)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                @gpu_launch threads=nthreads blocks=nb_f piso_subtract_mean!(
-                    pp_view, pp_mean, nxp, nyp, nzp)
-                # Update ghost cells after mean subtraction
-                piso_apply_pprime_bc!(b, bid, face_bc, pp_view)
-            end
-            # ξ exchange for p' ghost after mean subtraction
-            for (bid, b) in blocks
-                pp_view = @view shared_p_prime[1:b.Nx+2*NG, 1:b.Ny+2*NG, 1:b.Nz+2*NG]
-                pp_4d = reshape(pp_view, size(pp_view, 1), size(pp_view, 2), size(pp_view, 3), 1)
-                exchange_ghost(pp_4d, 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
-                    b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
-                    b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
-                    b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
-                    sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
-                    rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2)
-            end
-
-            # ── Poisson residual check (before correction, shared_dpdt = RHS) ──
-            local_max_res = FT(0.0)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                res_buf = @view shared_dUf_i[1:nxp, 1:nyp, 1:nzp]
-                @gpu_launch threads=nthreads blocks=nb_f piso_poisson_residual!(
-                    res_buf, pp_view, shared_dpdt, b.Vol, b.Areai, b.Areaj, b.Areak,
-                    nxp, nyp, nzp)
-                local_max_res = max(local_max_res, FT(maximum(abs, res_buf)))
-            end
-
-            # 4. Correct velocity: u = u* - (dt/ρ) × ∇p'
-            #    Face velocities only (stored Cartesian component).
-            #    The simple Uf×A divergence uses ONLY Uf, so correcting
-            #    Uf alone is sufficient and consistent with the SOR D_f.
-            #    (Cell-center Q is re-derived from corrected Uf at next step.)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_fi = (cld(nxp+1, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                nb_fj = (cld(nxp, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp, nthreads[3]))
-                nb_fk = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp+1, nthreads[3]))
-                nb_f  = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                # Face velocity corrections
-                @gpu_launch threads=nthreads blocks=nb_fi piso_correct_velocity_i!(
-                    b.Uf_i, pp_view, b.Vol, b.Areai, current_dt, nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fj piso_correct_velocity_j!(
-                    b.Uf_j, pp_view, b.Vol, b.Areaj, current_dt, nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fk piso_correct_velocity_k!(
-                    b.Uf_k, pp_view, b.Vol, b.Areak, current_dt, nxp, nyp, nzp)
-                # Non-orthogonal velocity correction: ΔUf -= (dt/ρ) × k_f·(∇p')_f / A_f
-                if _noc_iters > 0 && noc_kf_dict !== nothing
-                    kf = noc_kf_dict[bid]
-                    @gpu_launch threads=nthreads blocks=nb_fi piso_nonortho_correct_velocity_i!(
-                        b.Uf_i, noc_grad_px, noc_grad_py, noc_grad_pz,
-                        kf.ki_x, kf.ki_y, kf.ki_z, b.Areai, current_dt, nxp, nyp, nzp)
-                    @gpu_launch threads=nthreads blocks=nb_fj piso_nonortho_correct_velocity_j!(
-                        b.Uf_j, noc_grad_px, noc_grad_py, noc_grad_pz,
-                        kf.kj_x, kf.kj_y, kf.kj_z, b.Areaj, current_dt, nxp, nyp, nzp)
-                    @gpu_launch threads=nthreads blocks=nb_fk piso_nonortho_correct_velocity_k!(
-                        b.Uf_k, noc_grad_px, noc_grad_py, noc_grad_pz,
-                        kf.kk_x, kf.kk_y, kf.kk_z, b.Areak, current_dt, nxp, nyp, nzp)
-                end
-                # 5. Correct pressure: p += p' (mean-subtracted)
-                @gpu_launch threads=nthreads blocks=nb_f piso_correct_pressure!(
-                    b.Q, pp_view, nxp, nyp, nzp)
-                # Apply face velocity BCs
-                ac_apply_face_vel_bc!(b, bid, face_bc)
-                ac_apply_pressure_bc!(b, bid, face_bc)
-            end
-            # Sync after corrections
-            for (bid, b) in blocks
-                copyto!(b.U, b.Q)
-            end
-            sync_blocks!(activeTime)
-
-            # ── Post-correction divergence diagnostic ──
-            local_max_pp = FT(0.0)
-            local_max_div_post = FT(0.0)
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                pp_view = @view shared_p_prime[1:nxp+2*NG, 1:nyp+2*NG, 1:nzp+2*NG]
-                # max|p'| (GPU-direct, no Array copy)
-                local_max_pp = max(local_max_pp,
-                    FT(maximum(abs, @view pp_view[NG+1:nxp+NG, NG+1:nyp+NG, NG+1:nzp+NG])))
-                # Re-compute divergence after correction
-                @gpu_launch threads=nthreads blocks=nb_f piso_compute_divergence!(
-                    shared_dpdt, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj,
-                    b.Areak, b.nxk, b.nyk, b.nzk, b.Vol, nxp, nyp, nzp)
-                local_max_div_post = max(local_max_div_post,
-                    FT(maximum(abs, @view shared_dpdt[1:nxp, 1:nyp, 1:nzp])))
-            end
-            global_max_pp = MPI.Allreduce(Float64(local_max_pp), MPI.MAX, MPI.COMM_WORLD)
-            global_max_div_post = MPI.Allreduce(Float64(local_max_div_post), MPI.MAX, MPI.COMM_WORLD)
-            global_max_res = MPI.Allreduce(Float64(local_max_res), MPI.MAX, MPI.COMM_WORLD)
-            if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
-                @printf("      [%s] max|p'|=%.3e  div_post=%.3e  res=%.3e\n", pass_name, global_max_pp, global_max_div_post, global_max_res)
-                flush(stdout)
-            end
-
-            return MPI.Allreduce(Float64(local_max_div), MPI.MAX, MPI.COMM_WORLD)
-        end  # _piso_pressure_correct!
-
-        # ── PISO Step 1: Momentum Predictor ──
-        # u* = u^n + dt × RHS(u^n, p^n)
-        for (bid, b) in blocks
-            nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-            nb_f  = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-            nb_fi = (cld(nxp+1, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-            nb_fj = (cld(nxp, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp, nthreads[3]))
-            nb_fk = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp+1, nthreads[3]))
-
-            # Face →cell center
-            @gpu_launch threads=nthreads blocks=nb_f ac_face_to_cell_vel!(b.Q, b.Uf_i, b.Uf_j, b.Uf_k, nxp, nyp, nzp)
-            # Compute momentum RHS (convection + viscous + pressure gradient)
-            @gpu_launch threads=nthreads blocks=nb_fi ac_momentum_rhs_i_staggered!(
-                shared_dUf_i, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj,
-                b.Areak, b.nxk, b.nyk, b.nzk, b.Vol, nxp, nyp, nzp, ac_f1_val, current_dt)
-            @gpu_launch threads=nthreads blocks=nb_fj ac_momentum_rhs_j_staggered!(
-                shared_dUf_j, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj,
-                b.Areak, b.nxk, b.nyk, b.nzk, b.Vol, nxp, nyp, nzp)
-            @gpu_launch threads=nthreads blocks=nb_fk ac_momentum_rhs_k_staggered!(
-                shared_dUf_k, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj,
-                b.Areak, b.nxk, b.nyk, b.nzk, b.Vol, nxp, nyp, nzp)
-            # Forward Euler: u* = u^n + dt * RHS
-            @gpu_launch threads=nthreads blocks=nb_fi piso_euler_update_uf!(
-                b.Uf_i, shared_dUf_i, b.Uf_i_n, current_dt, Int32(nxp+1), Int32(nyp), Int32(nzp))
-            @gpu_launch threads=nthreads blocks=nb_fj piso_euler_update_uf!(
-                b.Uf_j, shared_dUf_j, b.Uf_j_n, current_dt, Int32(nxp), Int32(nyp+1), Int32(nzp))
-            @gpu_launch threads=nthreads blocks=nb_fk piso_euler_update_uf!(
-                b.Uf_k, shared_dUf_k, b.Uf_k_n, current_dt, Int32(nxp), Int32(nyp), Int32(nzp+1))
-            # Clip + BC
-            u_max_clip = FT(10.0)
-            @gpu_launch threads=nthreads blocks=nb_fi ac_clip_face_vel!(b.Uf_i, b.Uf_i_n, nxp+1, nyp, nzp, u_max_clip)
-            @gpu_launch threads=nthreads blocks=nb_fj ac_clip_face_vel!(b.Uf_j, b.Uf_j_n, nxp, nyp+1, nzp, u_max_clip)
-            @gpu_launch threads=nthreads blocks=nb_fk ac_clip_face_vel!(b.Uf_k, b.Uf_k_n, nxp, nyp, nzp+1, u_max_clip)
-            ac_apply_face_vel_bc!(b, bid, face_bc)
-        end
-
-        # ── Step 2: Pressure correction (Chorin projection / fractional step) ──
-        # For explicit time stepping, ONE correction is sufficient and exact.
-        # (PISO's 2nd correction is only needed for implicit momentum equations.)
-        div_before = _piso_pressure_correct!("proj")
-
-        # Final sync
-        for (bid, b) in blocks
-            copyto!(b.U, b.Q)
-        end
-        sync_blocks!(activeTime)
-
-        # ── Projection diagnostic output ──
-        if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
-            @printf "    [Projection] div_before=%.3e\n" div_before
-            flush(stdout)
-        end
-
-        if profiling; gpu_sync(); t_advance += (time_ns() - _t0) / 1e9; end
-
-        elseif equation_type == :incompressible_AC
-        # ── AC STAGGERED GRID RK3 PATH ──
-        # RK3
-        for KRK = 1:3
-            if KRK == 1
-                for (bid, b) in blocks
-                    copyto!(b.Un, b.U)
-                    # Save p^n in Un[:,:,:,1] for SSP-RK3 pressure reset
-                    Nx_t = b.Nx + 2*NG; Ny_t = b.Ny + 2*NG; Nz_t = b.Nz + 2*NG
-                    copyto!(view(b.Un, 1:Nx_t, 1:Ny_t, 1:Nz_t, 1),
-                            view(b.Q,  1:Nx_t, 1:Ny_t, 1:Nz_t, 1))
-                    copyto!(b.Uf_i_n, b.Uf_i)
-                    copyto!(b.Uf_j_n, b.Uf_j)
-                    copyto!(b.Uf_k_n, b.Uf_k)
-                end
-
-                if adaptive_dt
-                    dt_min = FT(1e10)
-                    for (bid, b) in blocks
-                        nb = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
-                        @gpu_launch threads=nthreads blocks=nb compute_dt(b.LTS_dt, b.Q, b.Vol, b.Areai, b.Areaj, b.Areak,
-                            b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj, b.nxk, b.nyk, b.nzk,
-                            b.Nx, b.Ny, b.Nz)
-                        dt_local = FT(mapreduce(x -> x > zero(FT) ? x : FT(Inf), min, b.LTS_dt))
-                        dt_min = min(dt_min, dt_local)
-                    end
-                    current_dt = MPI.Allreduce(dt_min, MPI.MIN, MPI.COMM_WORLD)
-                    current_dt = min(current_dt, FT(CFL * dt_min / max(β_AC, one(FT))))
-                end
-
-                if flow_forcing
-                    if forcing_mode == 1
-                        ac_f1_val = Update_ac_pipe_force(blocks, tt, 1, current_dt, MPI.COMM_WORLD, world_rank)
-                    end
-                end
-            end
-
-            # ── RK3 coefficient ──
-            rk_a = KRK == 2 ? FT(0.25) : (KRK == 3 ? FT(2)/FT(3) : one(FT))
-            u_max_clip = FT(10.0 * max(1.0, β_AC))
-            p_max_clip = FT(0.5 * ρ_ref * u_max_clip * u_max_clip)
-
-            if profiling; _t0 = time_ns(); end
-
-            # ── Per-block: compute RHS + RK3 update + clip + BC ──
-            for (bid, b) in blocks
-                nxp = b.Nx; nyp = b.Ny; nzp = b.Nz
-                nb_f  = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                nb_fi = (cld(nxp+1, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-                nb_fj = (cld(nxp, nthreads[1]), cld(nyp+1, nthreads[2]), cld(nzp, nthreads[3]))
-                nb_fk = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp+1, nthreads[3]))
-
-                @gpu_launch threads=nthreads blocks=nb_f ac_face_to_cell_vel!(b.Q, b.Uf_i, b.Uf_j, b.Uf_k, nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_f ac_pressure_rhs_staggered!(shared_dpdt, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj, b.Areak, b.nxk, b.nyk, b.nzk, b.Vol,
-                    nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fi ac_momentum_rhs_i_staggered!(shared_dUf_i, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj, b.Areak, b.nxk, b.nyk, b.nzk, b.Vol,
-                    nxp, nyp, nzp, ac_f1_val, current_dt)
-                @gpu_launch threads=nthreads blocks=nb_fj ac_momentum_rhs_j_staggered!(shared_dUf_j, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj, b.Areak, b.nxk, b.nyk, b.nzk, b.Vol,
-                    nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fk ac_momentum_rhs_k_staggered!(shared_dUf_k, b.Q, b.Uf_i, b.Uf_j, b.Uf_k,
-                    b.Areai, b.nxi, b.nyi, b.nzi, b.Areaj, b.nxj, b.nyj, b.nzj, b.Areak, b.nxk, b.nyk, b.nzk, b.Vol,
-                    nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_f ac_rk3_staggered_p!(b.Q, b.Un, shared_dpdt, current_dt, rk_a, nxp, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fi ac_rk3_staggered_uf!(b.Uf_i, b.Uf_i_n, shared_dUf_i, current_dt, rk_a, nxp+1, nyp, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fj ac_rk3_staggered_uf!(b.Uf_j, b.Uf_j_n, shared_dUf_j, current_dt, rk_a, nxp, nyp+1, nzp)
-                @gpu_launch threads=nthreads blocks=nb_fk ac_rk3_staggered_uf!(b.Uf_k, b.Uf_k_n, shared_dUf_k, current_dt, rk_a, nxp, nyp, nzp+1)
-                @gpu_launch threads=nthreads blocks=nb_f  ac_clip_pressure!(b.Q, nxp, nyp, nzp, p_max_clip)
-                @gpu_launch threads=nthreads blocks=nb_fi ac_clip_face_vel!(b.Uf_i, b.Uf_i_n, nxp+1, nyp, nzp, u_max_clip)
-                @gpu_launch threads=nthreads blocks=nb_fj ac_clip_face_vel!(b.Uf_j, b.Uf_j_n, nxp, nyp+1, nzp, u_max_clip)
-                @gpu_launch threads=nthreads blocks=nb_fk ac_clip_face_vel!(b.Uf_k, b.Uf_k_n, nxp, nyp, nzp+1, u_max_clip)
-                if isdefined(@__MODULE__, :ac_hpdc) && ac_hpdc
-                    Apply_ac_pressure_diffusion!(b.U, b.Q, b.Vol, b.Areai, b.Areaj, b.Areak, current_dt, ε_p_AC, nxp, nyp, nzp)
-                end
-                ac_apply_face_vel_bc!(b, bid, face_bc)
-                ac_apply_pressure_bc!(b, bid, face_bc)
-            end
-
-            if profiling; gpu_sync(); t_advance += (time_ns() - _t0) / 1e9; end
-
-            if profiling; _t0 = time_ns(); end
-            for (bid, b) in blocks
-                copyto!(b.U, b.Q)
-            end
-            sync_blocks!(activeTime)
-            if profiling; gpu_sync(); t_sync += (time_ns() - _t0) / 1e9; end
-        end
-
-        else
-        # ═══════════════════════════════════════════════════════
-        #  STANDARD EXPLICIT RK3 PATH (compressible / MHD)
+        #  EXPLICIT PATH (compressible / MHD)
         # ═══════════════════════════════════════════════════════
         # RK3
         for KRK = 1:3
@@ -2757,9 +2343,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             if profiling; gpu_sync(); t_advance += (time_ns() - _t0) / 1e9; end
 
             # ── Interface flux synchronization (ensures unique flux at interblock faces) ──
-            if equation_type != :incompressible_AC && equation_type != :incompressible_PISO
-                sync_interface_flux!(blocks, connectivity, rank_offsets, Block_Nprocs,
-                                     shared_Fx, shared_Fy, shared_Fz, ch_glm_current)
+            sync_interface_flux!(blocks, connectivity, rank_offsets, Block_Nprocs,
+                                 shared_Fx, shared_Fy, shared_Fz, ch_glm_current, Nx_b, Ny_b, Nz_b)
+            if cebl_enabled
+                sync_interface_flux!(cebl_blocks, cebl_connectivity, cebl_rank_offsets, cebl_Block_Nprocs,
+                                     cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz, ch_glm_current, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b)
             end
 
             # ── Forcing + Divergence ──
@@ -2767,21 +2355,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             for (bid, b) in blocks
                 nb_l = (Int32(cld(b.Nx+2*NG, threads_light[1])), Int32(cld(b.Ny+2*NG, threads_light[2])), Int32(cld(b.Nz+2*NG, threads_light[3])))
                 if flow_forcing
-                  if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-                    # ── AC forcing dispatch ──
-                    nb_f = (cld(b.Nx, nthreads[1]), cld(b.Ny, nthreads[2]), cld(b.Nz, nthreads[3]))
-                    if forcing_mode == 1
-                        # Mode 1: constant pressure gradient (pipe flow)
-                        @gpu_launch threads=nthreads blocks=nb_f ac_pipe_force_kernel!(b.U, ac_f1_val, b.Nx, b.Ny, b.Nz, current_dt)
-                    end
-                    # ── HPDC: pressure diffusion for divergence cleaning ──
-                    if isdefined(@__MODULE__, :ac_hpdc) && ac_hpdc
-                        Apply_ac_pressure_diffusion!(b.U, b.Q, b.Vol, b.Areai, b.Areaj, b.Areak, current_dt, ε_p_AC, b.Nx, b.Ny, b.Nz)
-                    end
-                  else
                     # Skip Volume_force_kernel (Coriolis + centrifugal) when rotation is zero
                     if Omega_x != zero(FT)
-                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz)
+                        ramp_val = tanh(FT(activeTime) / FT(0.05))
+                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz, ramp_val)
                         if forcing_mode == 1
                             Apply_bulk_force!(shared_dU_forced, b.Q, forcex, flowx, current_dt, b.Nx, b.Ny, b.Nz)
                         elseif forcing_mode == 2
@@ -2818,9 +2395,13 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(shared_dU_forced, b.Nx, b.Ny, b.Nz)
                             Apply_trip_force!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, activeTime)
                             @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(b.U, shared_dU_forced, current_dt, b.Vol, b.Nx, b.Ny, b.Nz)
+                        else
+                            # If forcing_mode == 0 or other, we still want trip forcing
+                            @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(shared_dU_forced, b.Nx, b.Ny, b.Nz)
+                            Apply_trip_force!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, activeTime)
+                            @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(b.U, shared_dU_forced, current_dt, b.Vol, b.Nx, b.Ny, b.Nz)
                         end
                     end
-                  end # equation_type guard
                 end
                 if test_case == "HIT"
                     Apply_HIT_forcing!(shared_dU_forced, b.Q, hit_forcing_A, hit_u_mean, hit_v_mean, hit_w_mean, b.Nx, b.Ny, b.Nz)
@@ -2854,6 +2435,46 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     # This will be done by the next c2Prim / fillGhost cycle
                 end
             end
+
+            # ── CEBL block RK3 step ──
+            if cebl_enabled
+                local cebl_f1 = zero(FT)
+                local cebl_flowx = zero(FT)
+                if cebl_forcing_type == :deschamps
+                    cebl_f1, cebl_flowx = Update_cebl_deschamps_params(cebl_blocks, tt, KRK, current_dt, MPI.COMM_WORLD, world_rank)
+                end
+                
+                for (cebl_bid, c_block) in cebl_blocks
+                    if KRK == 1
+                        copyto!(c_block.Un, c_block.U)
+                    end
+                    
+                    nb_l_cebl = (Int32(cld(c_block.Nx+2*NG, threads_light[1])), Int32(cld(c_block.Ny+2*NG, threads_light[2])), Int32(cld(c_block.Nz+2*NG, threads_light[3])))
+                    @gpu_launch threads=threads_light blocks=nb_l_cebl shockSensor(c_block.ϕ, c_block.Q, c_block.Nx, c_block.Ny, c_block.Nz)
+                    
+                    blockAdvance(c_block, current_dt, c_block.ϕ, cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz, cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz, world_rank, tt, threads_recon_i, threads_recon_j, threads_recon_k, threads_visc_i, threads_visc_j, threads_visc_k)
+                    
+                    nb_f_cebl = (cld(c_block.Nx, nthreads[1]), cld(c_block.Ny, nthreads[2]), cld(c_block.Nz, nthreads[3]))
+                    if cebl_forcing_type == :deschamps
+                        @gpu_launch threads=nthreads blocks=nb_f_cebl fused_deschamps_source_kernel!(c_block.U, c_block.Q, cebl_f1, cebl_flowx, current_dt, c_block.Nx, c_block.Ny, c_block.Nz)
+                    else
+                        @gpu_launch threads=nthreads blocks=nb_f_cebl zero_dU_forced_kernel!(shared_dU_forced, c_block.Nx, c_block.Ny, c_block.Nz)
+                        c_state = get(cebl_states, cebl_bid - 100, cebl_state)
+                        Apply_CEBL_force!(shared_dU_forced, c_block.Q, c_block.y, c_block.z, c_state, c_block.Nx, c_block.Ny, c_block.Nz)
+                        @gpu_launch threads=threads_light blocks=nb_l_cebl add_source_kernel!(c_block.U, shared_dU_forced, current_dt, c_block.Vol, c_block.Nx, c_block.Ny, c_block.Nz)
+                    end
+                    
+                    rk_a = KRK == 2 ? FT(0.25) : (KRK == 3 ? FT(2)/FT(3) : one(FT))
+                    @gpu_launch threads=nthreads blocks=nb_f_cebl div_rk_clip_prim(
+                        c_block.U, c_block.Un, c_block.Q,
+                        cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz,
+                        cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz,
+                        current_dt, c_block.Vol, rk_a,
+                        c_block.Nx, c_block.Ny, c_block.Nz
+                    )
+                end
+            end
+
             if profiling; gpu_sync(); t_div += (time_ns() - _t0) / 1e9; end
 
             # ── Sync blocks with comm-compute overlap (Phase 2) ──
@@ -2879,7 +2500,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             end
             if profiling; gpu_sync(); t_sync += (time_ns() - _t0) / 1e9; end
         end
-        end  # if AC staggered / else standard
       end  # if implicit/else
 
         # ══════════════════════════════════════════════════════════════
@@ -2965,7 +2585,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         if isdefined(Main, :average) && average && (tt % avg_step == 0)
             global global_avg_count += 1
             _do_favre = false
-            if isdefined(Main, :avg_density_weighted) && avg_density_weighted && isdefined(Main, :equation_type) && equation_type != :incompressible_AC && equation_type != :incompressible_PISO
+            if isdefined(Main, :avg_density_weighted) && avg_density_weighted
                 _do_favre = true
             end
             for (bid, b) in blocks
@@ -3019,8 +2639,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             printstyled("\tdt: ")
             @printf "%.2e" current_dt
             if use_implicit
-                _solver_label = (isdefined(@__MODULE__, :implicit_solver) && implicit_solver == :gmres) ? "[GMRES]" : "[LU-SGS]"
-                printstyled("\t$(_solver_label)")
+                printstyled("\t[LU-SGS]")
             else
                 printstyled("\t[RK3]")
             end
@@ -3061,41 +2680,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             flush(stdout)
         end
 
-        # ── AC divergence diagnostic: max|∇·u| and L2(∇·u) ──
-        # NOTE: MPI.Allreduce is collective →ALL ranks must call it.
-        #       This MUST be outside the world_rank==0 guard!
-        if (equation_type == :incompressible_AC || equation_type == :incompressible_PISO) && (tt % 100 == 0 || tt <= 5)
-            # Compute FVM-consistent divergence (face-flux form with metrics)
-            for (bid, b) in blocks
-                nb_div = (cld(b.Nx, nthreads[1]), cld(b.Ny, nthreads[2]), cld(b.Nz, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_div ac_fvm_divergence!(
-                    b.ϕ, b.Q, b.Vol,
-                    b.nxi, b.nyi, b.nzi, b.Areai,
-                    b.nxj, b.nyj, b.nzj, b.Areaj,
-                    b.nxk, b.nyk, b.nzk, b.Areak,
-                    b.Nx, b.Ny, b.Nz)
-            end
-            div_max_local = FT(0.0)
-            div_l2_local  = Float64(0.0)
-            n_cells_local = 0
-            for (bid, b) in blocks
-                ϕ_h = Array(b.ϕ)
-                for kk = 1+NG:b.Nz+NG, jj = 1+NG:b.Ny+NG, ii = 1+NG:b.Nx+NG
-                    val = Float64(ϕ_h[ii, jj, kk])
-                    div_max_local = max(div_max_local, FT(val))
-                    div_l2_local += val^2
-                end
-                n_cells_local += b.Nx * b.Ny * b.Nz
-            end
-            div_max_global = MPI.Allreduce(Float64(div_max_local), MPI.MAX, MPI.COMM_WORLD)
-            div_l2_global  = MPI.Allreduce(div_l2_local, MPI.SUM, MPI.COMM_WORLD)
-            n_cells_global = MPI.Allreduce(n_cells_local, MPI.SUM, MPI.COMM_WORLD)
-            div_l2_global  = sqrt(div_l2_global / max(n_cells_global, 1))
-            if world_rank == 0
-                @printf "  ∇·u diagnostic (FVM):  max|∇·u| = %.4e   L2(∇·u) = %.4e\n" div_max_global div_l2_global
-                flush(stdout)
-            end
-        end
+
 
         if tt % step_plt == 0
             # Check for NaN in all assigned blocks (allocation-free)

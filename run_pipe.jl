@@ -11,6 +11,10 @@ const debug_sync::Bool = true
 const profiling::Bool = false
 const gpu_aware_mpi::Bool = false
 
+# ─── CEBL Settings ───
+const cebl_forcing::Bool = false
+const cebl_forcing_type::Symbol = :deschamps
+
 
 const flow_forcing::Bool = true
 const forcing_mode::Int64 = 3  # 1=proportional (original), 2=constant mass flux (Deschamps, no mass source)
@@ -32,12 +36,11 @@ const hit_forcing_A::FT = FT(0.0)
 
 # GPU backend — change to `using AMDGPU` for AMD DCU or `using CUDA` for NVIDIA or comment both and use CPU
 # using CUDA
-using AMDGPU
+# using AMDGPU
 
 # ─── Physics / Equation System ───
 # Set equation_type BEFORE including physics.jl:
 #   :compressible         → 5 conserved vars (ρ, ρu, ρv, ρw, ρE)
-#   :incompressible_AC    → 4 conserved vars (p, u, v, w)
 #   :MHD                  → 9 conserved vars (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ)
 const equation_type = :compressible
 include("physics.jl")

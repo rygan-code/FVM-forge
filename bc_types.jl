@@ -20,12 +20,11 @@ const BC_NSCBC_OUTFLOW      = Int32(9)   # Non-reflecting (Poinsot & Lele 1992)
 const BC_FARFIELD           = Int32(10)  # Riemann invariant far-field
 const BC_ZERO_GRADIENT      = Int32(11)  # Neumann: copy from interior
 const BC_SLIP_WALL          = Int32(12)  # Reflect normal velocity, keep tangential
-const BC_AC_WALL            = Int32(20)  # AC no-slip wall (velocity reflection, pressure Neumann)
-const BC_AC_LID             = Int32(21)  # AC lid wall (prescribed velocity, pressure Neumann)
 const BC_MHD_WALL           = Int32(30)  # Perfectly conducting wall (B·n=0, reflect Et)
 const BC_MHD_INFLOW         = Int32(31)  # MHD inflow: all vars + B-field fixed
 const BC_MHD_OUTFLOW        = Int32(32)  # MHD outflow: zero-gradient for all
 const BC_TRANSITION_INFLOW  = Int32(40)  # Dynamic spatial transition inflow (laminar + perturbation)
+const BC_CEBL_INFLOW        = Int32(41)  # CEBL inflow (mean profile + auxiliary fluctuation copy)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -45,9 +44,9 @@ const BCP_T0        = 11   # Total temperature                (subsonic_inflow)
 const BCP_DIR_X     = 12   # Inflow direction x-component     (subsonic_inflow)
 const BCP_DIR_Y     = 13   # Inflow direction y-component     (subsonic_inflow)
 const BCP_DIR_Z     = 14   # Inflow direction z-component     (subsonic_inflow)
-const BCP_AC_U_LID  = 15   # AC lid u-velocity              (ac_lid)
-const BCP_AC_V_LID  = 16   # AC lid v-velocity              (ac_lid)
-const BCP_AC_W_LID  = 17   # AC lid w-velocity              (ac_lid)
+const BCP_OMEGA     = 15   # Swirl angular velocity Omega_x
+const BCP_RHO_BULK  = 16   # Reference/bulk density ρ_bulk
+const BCP_R0        = 17   # Pipe radius R0
 const BCP_BX_INF    = 18   # Freestream Bx                   (mhd_inflow)
 const BCP_BY_INF    = 19   # Freestream By                   (mhd_inflow)
 const BCP_BZ_INF    = 20   # Freestream Bz                   (mhd_inflow)
@@ -73,12 +72,11 @@ const BC_NAME_MAP = Dict{String, Int32}(
     "farfield"           => BC_FARFIELD,
     "zero_gradient"      => BC_ZERO_GRADIENT,
     "slip_wall"          => BC_SLIP_WALL,
-    "ac_wall"            => BC_AC_WALL,
-    "ac_lid"             => BC_AC_LID,
     "mhd_wall"           => BC_MHD_WALL,
     "mhd_inflow"         => BC_MHD_INFLOW,
     "mhd_outflow"        => BC_MHD_OUTFLOW,
     "transition_inflow"  => BC_TRANSITION_INFLOW,
+    "cebl_inflow"        => BC_CEBL_INFLOW,
 )
 
 # Reverse mapping for printing

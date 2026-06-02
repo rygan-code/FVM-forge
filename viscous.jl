@@ -102,51 +102,6 @@ function viscous_flux_i(Q, Fv_x,
     end
     near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
     near_inter_k = (is_inter[5] && k <= NG + 2) || (is_inter[6] && k >= nzp + NG - 1)
-    # ── AC mode: constant ν, no energy equation ──
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        iL = i; iR = i + 1
-        @inbounds begin
-            u_f = FT(0.5)*(Q[iL,j,k,2]+Q[iR,j,k,2]); v_f = FT(0.5)*(Q[iL,j,k,3]+Q[iR,j,k,3])
-            w_f = FT(0.5)*(Q[iL,j,k,4]+Q[iR,j,k,4])
-            area = Areai[i+1,j,k]; fnx = nxi[i+1,j,k]; fny = nyi[i+1,j,k]; fnz = nzi[i+1,j,k]
-            Vf_inv = FT(2.0) / (FT(1.0)/Vol[iL,j,k] + FT(1.0)/Vol[iR,j,k])
-            xix = nxi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
-            xiy = nyi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
-            xiz = nzi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
-            etax = FT(0.25) * (nxj[iL,j,k]*Areaj[iL,j,k] + nxj[iL,j+1,k]*Areaj[iL,j+1,k] + nxj[iR,j,k]*Areaj[iR,j,k] + nxj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
-            etay = FT(0.25) * (nyj[iL,j,k]*Areaj[iL,j,k] + nyj[iL,j+1,k]*Areaj[iL,j+1,k] + nyj[iR,j,k]*Areaj[iR,j,k] + nyj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
-            etaz = FT(0.25) * (nzj[iL,j,k]*Areaj[iL,j,k] + nzj[iL,j+1,k]*Areaj[iL,j+1,k] + nzj[iR,j,k]*Areaj[iR,j,k] + nzj[iR,j+1,k]*Areaj[iR,j+1,k]) * Vf_inv
-            zetax = FT(0.25) * (nxk[iL,j,k]*Areak[iL,j,k] + nxk[iL,j,k+1]*Areak[iL,j,k+1] + nxk[iR,j,k]*Areak[iR,j,k] + nxk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
-            zetay = FT(0.25) * (nyk[iL,j,k]*Areak[iL,j,k] + nyk[iL,j,k+1]*Areak[iL,j,k+1] + nyk[iR,j,k]*Areak[iR,j,k] + nyk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
-            zetaz = FT(0.25) * (nzk[iL,j,k]*Areak[iL,j,k] + nzk[iL,j,k+1]*Areak[iL,j,k+1] + nzk[iR,j,k]*Areak[iR,j,k] + nzk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
-        end
-        mu = ρ_ref * ν_AC
-        @inbounds begin
-            dudxi = gradFace(Q[i-2,j,k,2],Q[i-1,j,k,2],Q[i,j,k,2],Q[i+1,j,k,2],Q[i+2,j,k,2],Q[i+3,j,k,2], FT(1.0))
-            dvdxi = gradFace(Q[i-2,j,k,3],Q[i-1,j,k,3],Q[i,j,k,3],Q[i+1,j,k,3],Q[i+2,j,k,3],Q[i+3,j,k,3], FT(1.0))
-            dwdxi = gradFace(Q[i-2,j,k,4],Q[i-1,j,k,4],Q[i,j,k,4],Q[i+1,j,k,4],Q[i+2,j,k,4],Q[i+3,j,k,4], FT(1.0))
-            dudetaL=gradCell(Q[iL,j-3,k,2],Q[iL,j-2,k,2],Q[iL,j-1,k,2],Q[iL,j+1,k,2],Q[iL,j+2,k,2],Q[iL,j+3,k,2],FT(1.0));dudetaR=gradCell(Q[iR,j-3,k,2],Q[iR,j-2,k,2],Q[iR,j-1,k,2],Q[iR,j+1,k,2],Q[iR,j+2,k,2],Q[iR,j+3,k,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
-            dvdetaL=gradCell(Q[iL,j-3,k,3],Q[iL,j-2,k,3],Q[iL,j-1,k,3],Q[iL,j+1,k,3],Q[iL,j+2,k,3],Q[iL,j+3,k,3],FT(1.0));dvdetaR=gradCell(Q[iR,j-3,k,3],Q[iR,j-2,k,3],Q[iR,j-1,k,3],Q[iR,j+1,k,3],Q[iR,j+2,k,3],Q[iR,j+3,k,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
-            dwdetaL=gradCell(Q[iL,j-3,k,4],Q[iL,j-2,k,4],Q[iL,j-1,k,4],Q[iL,j+1,k,4],Q[iL,j+2,k,4],Q[iL,j+3,k,4],FT(1.0));dwdetaR=gradCell(Q[iR,j-3,k,4],Q[iR,j-2,k,4],Q[iR,j-1,k,4],Q[iR,j+1,k,4],Q[iR,j+2,k,4],Q[iR,j+3,k,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
-            dudzetaL=gradCell(Q[iL,j,k-3,2],Q[iL,j,k-2,2],Q[iL,j,k-1,2],Q[iL,j,k+1,2],Q[iL,j,k+2,2],Q[iL,j,k+3,2],FT(1.0));dudzetaR=gradCell(Q[iR,j,k-3,2],Q[iR,j,k-2,2],Q[iR,j,k-1,2],Q[iR,j,k+1,2],Q[iR,j,k+2,2],Q[iR,j,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
-            dvdzetaL=gradCell(Q[iL,j,k-3,3],Q[iL,j,k-2,3],Q[iL,j,k-1,3],Q[iL,j,k+1,3],Q[iL,j,k+2,3],Q[iL,j,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[iR,j,k-3,3],Q[iR,j,k-2,3],Q[iR,j,k-1,3],Q[iR,j,k+1,3],Q[iR,j,k+2,3],Q[iR,j,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
-            dwdzetaL=gradCell(Q[iL,j,k-3,4],Q[iL,j,k-2,4],Q[iL,j,k-1,4],Q[iL,j,k+1,4],Q[iL,j,k+2,4],Q[iL,j,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[iR,j,k-3,4],Q[iR,j,k-2,4],Q[iR,j,k-1,4],Q[iR,j,k+1,4],Q[iR,j,k+2,4],Q[iR,j,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
-        end
-        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
-        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
-        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
-        divu = dudx+dvdy+dwdz
-        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
-        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
-        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
-        @inbounds for n = 1:Ncons
-            Fv_x[i-NG+1,j-NG,k-NG,n] = FT(0e0)
-        end
-        @inbounds Fv_x[i-NG+1,j-NG,k-NG,2]=fv_rhou*area
-        @inbounds Fv_x[i-NG+1,j-NG,k-NG,3]=fv_rhov*area
-        @inbounds Fv_x[i-NG+1,j-NG,k-NG,4]=fv_rhow*area
-        return
-    end
     iL = i; iR = i + 1
     @inbounds begin
         u_f = FT(0.5)*(Q[iL,j,k,2]+Q[iR,j,k,2]); v_f = FT(0.5)*(Q[iL,j,k,3]+Q[iR,j,k,3])
@@ -235,51 +190,6 @@ function viscous_flux_j(Q, Fv_y,
     end
     near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
     near_inter_k = (is_inter[5] && k <= NG + 2) || (is_inter[6] && k >= nzp + NG - 1)
-    # ── AC mode: constant ν, no energy equation ──
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        jL = j; jR = j + 1
-        @inbounds begin
-            u_f = FT(0.5)*(Q[i,jL,k,2]+Q[i,jR,k,2]); v_f = FT(0.5)*(Q[i,jL,k,3]+Q[i,jR,k,3])
-            w_f = FT(0.5)*(Q[i,jL,k,4]+Q[i,jR,k,4])
-            area = Areaj[i,j+1,k]; fnx = nxj[i,j+1,k]; fny = nyj[i,j+1,k]; fnz = nzj[i,j+1,k]
-            Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,jL,k] + FT(1.0)/Vol[i,jR,k])
-            xix = FT(0.25) * (nxi[i,jL,k]*Areai[i,jL,k] + nxi[i+1,jL,k]*Areai[i+1,jL,k] + nxi[i,jR,k]*Areai[i,jR,k] + nxi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
-            xiy = FT(0.25) * (nyi[i,jL,k]*Areai[i,jL,k] + nyi[i+1,jL,k]*Areai[i+1,jL,k] + nyi[i,jR,k]*Areai[i,jR,k] + nyi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
-            xiz = FT(0.25) * (nzi[i,jL,k]*Areai[i,jL,k] + nzi[i+1,jL,k]*Areai[i+1,jL,k] + nzi[i,jR,k]*Areai[i,jR,k] + nzi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
-            etax = nxj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
-            etay = nyj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
-            etaz = nzj[i,j+1,k] * Areaj[i,j+1,k] * Vf_inv
-            zetax = FT(0.25) * (nxk[i,jL,k]*Areak[i,jL,k] + nxk[i,jL,k+1]*Areak[i,jL,k+1] + nxk[i,jR,k]*Areak[i,jR,k] + nxk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
-            zetay = FT(0.25) * (nyk[i,jL,k]*Areak[i,jL,k] + nyk[i,jL,k+1]*Areak[i,jL,k+1] + nyk[i,jR,k]*Areak[i,jR,k] + nyk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
-            zetaz = FT(0.25) * (nzk[i,jL,k]*Areak[i,jL,k] + nzk[i,jL,k+1]*Areak[i,jL,k+1] + nzk[i,jR,k]*Areak[i,jR,k] + nzk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
-        end
-        mu = ρ_ref * ν_AC
-        @inbounds begin
-            dudeta = gradFace(Q[i,j-2,k,2],Q[i,j-1,k,2],Q[i,j,k,2],Q[i,j+1,k,2],Q[i,j+2,k,2],Q[i,j+3,k,2], FT(1.0))
-            dvdeta = gradFace(Q[i,j-2,k,3],Q[i,j-1,k,3],Q[i,j,k,3],Q[i,j+1,k,3],Q[i,j+2,k,3],Q[i,j+3,k,3], FT(1.0))
-            dwdeta = gradFace(Q[i,j-2,k,4],Q[i,j-1,k,4],Q[i,j,k,4],Q[i,j+1,k,4],Q[i,j+2,k,4],Q[i,j+3,k,4], FT(1.0))
-            dudxiL=gradCell(Q[i-3,jL,k,2],Q[i-2,jL,k,2],Q[i-1,jL,k,2],Q[i+1,jL,k,2],Q[i+2,jL,k,2],Q[i+3,jL,k,2],FT(1.0));dudxiR=gradCell(Q[i-3,jR,k,2],Q[i-2,jR,k,2],Q[i-1,jR,k,2],Q[i+1,jR,k,2],Q[i+2,jR,k,2],Q[i+3,jR,k,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
-            dvdxiL=gradCell(Q[i-3,jL,k,3],Q[i-2,jL,k,3],Q[i-1,jL,k,3],Q[i+1,jL,k,3],Q[i+2,jL,k,3],Q[i+3,jL,k,3],FT(1.0));dvdxiR=gradCell(Q[i-3,jR,k,3],Q[i-2,jR,k,3],Q[i-1,jR,k,3],Q[i+1,jR,k,3],Q[i+2,jR,k,3],Q[i+3,jR,k,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
-            dwdxiL=gradCell(Q[i-3,jL,k,4],Q[i-2,jL,k,4],Q[i-1,jL,k,4],Q[i+1,jL,k,4],Q[i+2,jL,k,4],Q[i+3,jL,k,4],FT(1.0));dwdxiR=gradCell(Q[i-3,jR,k,4],Q[i-2,jR,k,4],Q[i-1,jR,k,4],Q[i+1,jR,k,4],Q[i+2,jR,k,4],Q[i+3,jR,k,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
-            dudzetaL=gradCell(Q[i,jL,k-3,2],Q[i,jL,k-2,2],Q[i,jL,k-1,2],Q[i,jL,k+1,2],Q[i,jL,k+2,2],Q[i,jL,k+3,2],FT(1.0));dudzetaR=gradCell(Q[i,jR,k-3,2],Q[i,jR,k-2,2],Q[i,jR,k-1,2],Q[i,jR,k+1,2],Q[i,jR,k+2,2],Q[i,jR,k+3,2],FT(1.0));dudzeta=FT(0.5)*(dudzetaL+dudzetaR)
-            dvdzetaL=gradCell(Q[i,jL,k-3,3],Q[i,jL,k-2,3],Q[i,jL,k-1,3],Q[i,jL,k+1,3],Q[i,jL,k+2,3],Q[i,jL,k+3,3],FT(1.0));dvdzetaR=gradCell(Q[i,jR,k-3,3],Q[i,jR,k-2,3],Q[i,jR,k-1,3],Q[i,jR,k+1,3],Q[i,jR,k+2,3],Q[i,jR,k+3,3],FT(1.0));dvdzeta=FT(0.5)*(dvdzetaL+dvdzetaR)
-            dwdzetaL=gradCell(Q[i,jL,k-3,4],Q[i,jL,k-2,4],Q[i,jL,k-1,4],Q[i,jL,k+1,4],Q[i,jL,k+2,4],Q[i,jL,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[i,jR,k-3,4],Q[i,jR,k-2,4],Q[i,jR,k-1,4],Q[i,jR,k+1,4],Q[i,jR,k+2,4],Q[i,jR,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
-        end
-        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
-        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
-        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
-        divu = dudx+dvdy+dwdz
-        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
-        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
-        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
-        @inbounds for n = 1:Ncons
-            Fv_y[i-NG,j-NG+1,k-NG,n] = FT(0e0)
-        end
-        @inbounds Fv_y[i-NG,j-NG+1,k-NG,2]=fv_rhou*area
-        @inbounds Fv_y[i-NG,j-NG+1,k-NG,3]=fv_rhov*area
-        @inbounds Fv_y[i-NG,j-NG+1,k-NG,4]=fv_rhow*area
-        return
-    end
     jL = j; jR = j + 1
     @inbounds begin
         u_f = FT(0.5)*(Q[i,jL,k,2]+Q[i,jR,k,2]); v_f = FT(0.5)*(Q[i,jL,k,3]+Q[i,jR,k,3])
@@ -366,51 +276,7 @@ function viscous_flux_k(Q, Fv_z,
     end
     near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
     near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
-    # ── AC mode: constant ν, no energy equation ──
-    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
-        kL = k; kR = k + 1
-        @inbounds begin
-            u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])
-            w_f = FT(0.5)*(Q[i,j,kL,4]+Q[i,j,kR,4])
-            area = Areak[i,j,k+1]; fnx = nxk[i,j,k+1]; fny = nyk[i,j,k+1]; fnz = nzk[i,j,k+1]
-            Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,j,kL] + FT(1.0)/Vol[i,j,kR])
-            xix = FT(0.25) * (nxi[i,j,kL]*Areai[i,j,kL] + nxi[i+1,j,kL]*Areai[i+1,j,kL] + nxi[i,j,kR]*Areai[i,j,kR] + nxi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
-            xiy = FT(0.25) * (nyi[i,j,kL]*Areai[i,j,kL] + nyi[i+1,j,kL]*Areai[i+1,j,kL] + nyi[i,j,kR]*Areai[i,j,kR] + nyi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
-            xiz = FT(0.25) * (nzi[i,j,kL]*Areai[i,j,kL] + nzi[i+1,j,kL]*Areai[i+1,j,kL] + nzi[i,j,kR]*Areai[i,j,kR] + nzi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
-            etax = FT(0.25) * (nxj[i,j,kL]*Areaj[i,j,kL] + nxj[i,j+1,kL]*Areaj[i,j+1,kL] + nxj[i,j,kR]*Areaj[i,j,kR] + nxj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
-            etay = FT(0.25) * (nyj[i,j,kL]*Areaj[i,j,kL] + nyj[i,j+1,kL]*Areaj[i,j+1,kL] + nyj[i,j,kR]*Areaj[i,j,kR] + nyj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
-            etaz = FT(0.25) * (nzj[i,j,kL]*Areaj[i,j,kL] + nzj[i,j+1,kL]*Areaj[i,j+1,kL] + nzj[i,j,kR]*Areaj[i,j,kR] + nzj[i,j+1,kR]*Areaj[i,j+1,kR]) * Vf_inv
-            zetax = nxk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
-            zetay = nyk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
-            zetaz = nzk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
-        end
-        mu = ρ_ref * ν_AC
-        @inbounds begin
-            dudzeta = gradFace(Q[i,j,k-2,2],Q[i,j,k-1,2],Q[i,j,k,2],Q[i,j,k+1,2],Q[i,j,k+2,2],Q[i,j,k+3,2], FT(1.0))
-            dvdzeta = gradFace(Q[i,j,k-2,3],Q[i,j,k-1,3],Q[i,j,k,3],Q[i,j,k+1,3],Q[i,j,k+2,3],Q[i,j,k+3,3], FT(1.0))
-            dwdzeta = gradFace(Q[i,j,k-2,4],Q[i,j,k-1,4],Q[i,j,k,4],Q[i,j,k+1,4],Q[i,j,k+2,4],Q[i,j,k+3,4], FT(1.0))
-            dudxiL=gradCell(Q[i-3,j,kL,2],Q[i-2,j,kL,2],Q[i-1,j,kL,2],Q[i+1,j,kL,2],Q[i+2,j,kL,2],Q[i+3,j,kL,2],FT(1.0));dudxiR=gradCell(Q[i-3,j,kR,2],Q[i-2,j,kR,2],Q[i-1,j,kR,2],Q[i+1,j,kR,2],Q[i+2,j,kR,2],Q[i+3,j,kR,2],FT(1.0));dudxi=FT(0.5)*(dudxiL+dudxiR)
-            dvdxiL=gradCell(Q[i-3,j,kL,3],Q[i-2,j,kL,3],Q[i-1,j,kL,3],Q[i+1,j,kL,3],Q[i+2,j,kL,3],Q[i+3,j,kL,3],FT(1.0));dvdxiR=gradCell(Q[i-3,j,kR,3],Q[i-2,j,kR,3],Q[i-1,j,kR,3],Q[i+1,j,kR,3],Q[i+2,j,kR,3],Q[i+3,j,kR,3],FT(1.0));dvdxi=FT(0.5)*(dvdxiL+dvdxiR)
-            dwdxiL=gradCell(Q[i-3,j,kL,4],Q[i-2,j,kL,4],Q[i-1,j,kL,4],Q[i+1,j,kL,4],Q[i+2,j,kL,4],Q[i+3,j,kL,4],FT(1.0));dwdxiR=gradCell(Q[i-3,j,kR,4],Q[i-2,j,kR,4],Q[i-1,j,kR,4],Q[i+1,j,kR,4],Q[i+2,j,kR,4],Q[i+3,j,kR,4],FT(1.0));dwdxi=FT(0.5)*(dwdxiL+dwdxiR)
-            dudetaL=gradCell(Q[i,j-3,kL,2],Q[i,j-2,kL,2],Q[i,j-1,kL,2],Q[i,j+1,kL,2],Q[i,j+2,kL,2],Q[i,j+3,kL,2],FT(1.0));dudetaR=gradCell(Q[i,j-3,kR,2],Q[i,j-2,kR,2],Q[i,j-1,kR,2],Q[i,j+1,kR,2],Q[i,j+2,kR,2],Q[i,j+3,kR,2],FT(1.0));dudeta=FT(0.5)*(dudetaL+dudetaR)
-            dvdetaL=gradCell(Q[i,j-3,kL,3],Q[i,j-2,kL,3],Q[i,j-1,kL,3],Q[i,j+1,kL,3],Q[i,j+2,kL,3],Q[i,j+3,kL,3],FT(1.0));dvdetaR=gradCell(Q[i,j-3,kR,3],Q[i,j-2,kR,3],Q[i,j-1,kR,3],Q[i,j+1,kR,3],Q[i,j+2,kR,3],Q[i,j+3,kR,3],FT(1.0));dvdeta=FT(0.5)*(dvdetaL+dvdetaR)
-            dwdetaL=gradCell(Q[i,j-3,kL,4],Q[i,j-2,kL,4],Q[i,j-1,kL,4],Q[i,j+1,kL,4],Q[i,j+2,kL,4],Q[i,j+3,kL,4],FT(1.0));dwdetaR=gradCell(Q[i,j-3,kR,4],Q[i,j-2,kR,4],Q[i,j-1,kR,4],Q[i,j+1,kR,4],Q[i,j+2,kR,4],Q[i,j+3,kR,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
-        end
-        dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
-        dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
-        dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
-        divu = dudx+dvdy+dwdz
-        tau_xx=mu*(FT(2e0)*dudx-FT(2e0)/FT(3e0)*divu); tau_yy=mu*(FT(2e0)*dvdy-FT(2e0)/FT(3e0)*divu); tau_zz=mu*(FT(2e0)*dwdz-FT(2e0)/FT(3e0)*divu)
-        tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
-        fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
-        @inbounds for n = 1:Ncons
-            Fv_z[i-NG,j-NG,k-NG+1,n] = FT(0e0)
-        end
-        @inbounds Fv_z[i-NG,j-NG,k-NG+1,2]=fv_rhou*area
-        @inbounds Fv_z[i-NG,j-NG,k-NG+1,3]=fv_rhov*area
-        @inbounds Fv_z[i-NG,j-NG,k-NG+1,4]=fv_rhow*area
-        return
-    end
+
     kL = k; kR = k + 1
     @inbounds begin
         u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])
