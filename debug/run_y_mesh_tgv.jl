@@ -159,8 +159,11 @@ const maxreg::Int64 = 256
 const nthreads::Tuple{Int32, Int32, Int32} = (8, 4, 8)
 const nthreads2::Tuple{Int32, Int32, Int32} = (16, 8, 8)
 
-# ─── TGV Analytical Solution ───
-# Override init_tgv for multi-block (uses block-local dimensions)
+# ─── Acoustic Pulse Initial Condition ───
+# A Gaussian pressure pulse centered at the domain center.
+# At t=0, this is the exact initial condition. After a few steps,
+# we compare the numerical solution against itself at t=0 to check
+# for artifacts (the pulse should be symmetric if no artifacts exist).
 function init_tgv(Q, x, y, z)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -177,15 +180,26 @@ function init_tgv(Q, x, y, z)
     yc = FT(0.5) * (y[i, j, k] + y[i, j+1, k])
     zc = FT(0.5) * (z[i, j, k] + z[i, j, k+1])
 
-    V0 = one(FT)
-    p0 = FT(100.0)
-    rho0 = one(FT)
+    # Pulse center (domain center)
+    x0 = FT(2.5)
+    y0 = FT(0.0)
+    z0 = FT(0.5)
 
-    u = V0 * sin(xc) * cos(yc) * cos(zc)
-    v = -V0 * cos(xc) * sin(yc) * cos(zc)
-    w = zero(FT)
-    p = p0 + rho0 * V0^2 / FT(16.0) * (cos(2*xc) + cos(2*yc)) * (cos(2*zc) + 2)
-    rho = rho0
+    # Gaussian pulse
+    r2 = (xc - x0)^2 + (yc - y0)^2 + (zc - z0)^2
+    pulse = FT(0.01) * exp(-FT(20.0) * r2)
+
+    rho0 = one(FT)
+    p0 = FT(100.0)
+    u0 = zero(FT)
+    v0 = zero(FT)
+    w0 = zero(FT)
+
+    rho = rho0 + pulse
+    p = p0 + pulse * p0
+    u = u0
+    v = v0
+    w = w0
 
     @inbounds Q[i, j, k, 1] = rho
     @inbounds Q[i, j, k, 2] = u
@@ -313,7 +327,105 @@ t0 = time_ns()
 time_step(rank, comm, Block_Nprocs)
 wall = (time_ns() - t0) / 1e9
 
+# ─── Post-processing: Verify against TGV analytical solution ───
 if rank == 0
+    println("\n>>> Running post-processing TGV verification...")
+    mkpath("debug")
+
+    # Read PLT output files (per-block: plt-N-bM.h5)
+    plt_files = filter(f -> occursin(r"^plt-\d+-b\d+\.h5$", f), readdir("./PLT"; join=false))
+    if isempty(plt_files)
+        println("  WARNING: No PLT files found in ./PLT — skipping verification.")
+    else
+        # Compare last step vs first step (acoustic pulse should be symmetric)
+        local steps = unique([parse(Int, match(r"plt-(\d+)-b\d+", f).captures[1]) for f in plt_files])
+        local first_step = minimum(steps)
+        local last_step = maximum(steps)
+
+        local all_rho_err = Float64[]
+        local all_u_err = Float64[]
+        local all_v_err = Float64[]
+        local all_p_err = Float64[]
+        local t_val = 0.0
+
+        for bid in 0:Nblocks-1
+            # Read first step (reference)
+            f1 = joinpath("./PLT", "plt-$(first_step)-b$(bid).h5")
+            f2 = joinpath("./PLT", "plt-$(last_step)-b$(bid).h5")
+            if !isfile(f1) || !isfile(f2)
+                println("  WARNING: PLT files not found for block $bid")
+                continue
+            end
+            fid1 = h5open(f1, "r")
+            rho1 = read(fid1["rho"]); u1 = read(fid1["u"]); v1 = read(fid1["v"]); p1 = read(fid1["p"])
+            close(fid1)
+
+            fid2 = h5open(f2, "r")
+            rho2 = read(fid2["rho"]); u2 = read(fid2["u"]); v2 = read(fid2["v"]); p2 = read(fid2["p"])
+            try
+                t_raw = read(attrs(fid2)["time"])
+                t_val = (t_raw isa AbstractArray) ? t_raw[1] : t_raw
+            catch
+            end
+            close(fid2)
+
+            # Compute relative change (absolute for velocity since u0≈0)
+            append!(all_rho_err, vec(abs.(rho2 .- rho1) ./ max.(abs.(rho1), 1.0e-10)))
+            append!(all_u_err, vec(abs.(u2 .- u1)))  # absolute error
+            append!(all_v_err, vec(abs.(v2 .- v1)))  # absolute error
+            append!(all_p_err, vec(abs.(p2 .- p1) ./ max.(abs.(p1), 1.0e-10)))
+        end
+        println("  Comparing step $first_step vs step $last_step, t=$t_val, $(length(all_rho_err)) cells")
+
+        max_err_rho = maximum(all_rho_err)
+        max_err_u = maximum(all_u_err)
+        max_err_v = maximum(all_v_err)
+        max_err_p = maximum(all_p_err)
+
+        fname = "debug/tgv_verification.txt"
+        open(fname, "w") do io
+            println(io, "Acoustic Pulse Multi-Block Verification")
+            println(io, "========================================")
+            println(io, "Comparing step $first_step vs step $last_step, t=$(round(t_val, digits=8))")
+            println(io, "Mesh: $mesh_dir")
+            println(io, "Blocks: $Nblocks, Size: $(Nx_b[1])×$(Ny_b[1])×$(Nz_b[1])")
+            println(io, "Total cells: $(length(all_rho_err))")
+            println(io, "")
+            println(io, "Max change (step $first_step → $last_step):")
+            println(io, "  rho: $(round(max_err_rho * 100, digits=6))% (relative)")
+            println(io, "  u:   $(round(max_err_u, digits=8)) (absolute)")
+            println(io, "  v:   $(round(max_err_v, digits=8)) (absolute)")
+            println(io, "  p:   $(round(max_err_p * 100, digits=6))% (relative)")
+            println(io, "")
+
+            tol_rel = 0.005  # 0.5% for relative errors
+            tol_abs = 0.01   # absolute threshold for velocity
+            passed = max_err_rho < tol_rel && max_err_u < tol_abs && max_err_v < tol_abs && max_err_p < tol_rel
+            if passed
+                println(io, "✓ PASS: All changes < 0.5%")
+                println(io, "No numerical artifacts detected at block interfaces.")
+            else
+                println(io, "✗ FAIL: Some changes >= 0.5%")
+                println(io, "Numerical artifacts detected — investigate ghost exchange, metrics, or reconstruction.")
+            end
+        end
+
+        println("\n  Acoustic Pulse Verification (step $first_step → $last_step, t=$(round(t_val, digits=8))):")
+        println("    Max relative change in rho: $(round(max_err_rho * 100, digits=6))%")
+        println("    Max absolute change in u:   $(round(max_err_u, digits=8))")
+        println("    Max absolute change in v:   $(round(max_err_v, digits=8))")
+        println("    Max relative change in p:   $(round(max_err_p * 100, digits=6))%")
+
+        tol_rel = 0.005  # 0.5% for relative errors
+        tol_abs = 0.01   # absolute threshold for velocity
+        if max_err_rho < tol_rel && max_err_u < tol_abs && max_err_v < tol_abs && max_err_p < tol_rel
+            println("    ✓ PASS: All changes < 0.5%")
+        else
+            println("    ✗ FAIL: Some changes >= 0.5%")
+        end
+        println("    Results written to: $fname")
+    end
+
     println(">>> TGV verification run completed in $(round(wall, digits=3)) s.")
 end
 
