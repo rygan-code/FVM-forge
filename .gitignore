@@ -8,7 +8,7 @@
 /CHK*
 /VW_STRESS
 /HELICITY
-/DEBUG
+# /DEBUG — removed; case-insensitive on Windows, conflicts with /debug/
 
 # ── IDE & tool caches ──
 /.mistakebook
