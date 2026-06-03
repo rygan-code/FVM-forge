@@ -9,7 +9,6 @@
 /VW_STRESS
 /HELICITY
 /DEBUG
-/debug
 
 # ── IDE & tool caches ──
 /.mistakebook
@@ -44,4 +43,5 @@ merged_conversation_history.md
 Manifest.toml
 
 # ── Debug directory ──
-/debug/
+/debug/output/
+/debug/*.txt
