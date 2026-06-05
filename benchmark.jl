@@ -2,7 +2,7 @@
 # Usage: julia benchmark.jl [list | setup | verify] [case]
 
 const BENCHMARK_DIR = "Benchmark"
-const CASES = ["SOD", "TGV", "OBL", "BL", "BL_TRANSITION", "PIPEFLOW"]
+const CASES = ["SOD", "TGV", "OBL", "BL", "BL_TRANSITION", "PIPEFLOW", "CAVITY"]
 
 function print_usage()
     println("\nFlame3D Unified Benchmark Suite")

@@ -150,7 +150,7 @@ const CFL::FT = FT(0.3)             # Lower for cold start; raise to 0.5 after t
 const LTS::Bool = false
 const dt::FT = FT(2.0e-4)
 const Time::FT = 100.0
-const maxStep::Int64 = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : (profiling ? PROFILE_STEPS : Time ÷ dt * 100)
+const maxStep::Int64 = profiling ? PROFILE_STEPS : Time ÷ dt * 100
 
 const implicit::Bool = false
 const implicit_CFL::FT = FT(10.0)

@@ -245,8 +245,8 @@ macro gpu_launch(ex...)
 
             # Distribute blocks across CPU threads; threads within block run serially
             Threads.@threads :static for _flat in 1:_total_blocks
-                _bi = Int32(Base.div(_flat - 1, Int(_by) * Int(_bz)) + 1)
-                _bj = Int32(Base.div((_flat - 1) % (Int(_by) * Int(_bz)), Int(_bz)) + 1)
+                _bi = Int32(div(_flat - 1, Int(_by) * Int(_bz)) + 1)
+                _bj = Int32(div((_flat - 1) % (Int(_by) * Int(_bz)), Int(_bz)) + 1)
                 _bk = Int32((_flat - 1) % Int(_bz) + 1)
                 task_local_storage(:_cpu_blockDim, _bdim)
                 task_local_storage(:_cpu_blockIdx, (x=_bi, y=_bj, z=_bk))
@@ -259,16 +259,8 @@ macro gpu_launch(ex...)
     end)
 end
 
-macro gpu_launch_stream(stream_expr, ex...)
-    return esc(Expr(:macrocall, Symbol("@gpu_launch"), __source__, ex...))
-end
-
-
 gpu_sync()               = nothing
 gpu_allowscalar(b::Bool) = nothing
-gpu_stream_create()      = nothing
-gpu_stream_sync(s)       = nothing
-
 
 function gpu_zeros(T::Type, dims...)
     return zeros(T, dims...)

@@ -28,7 +28,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
         if j_idx <= Ny + NG && k_idx <= Nz + NG
             for layer in 1:min(num_layers, 4)
                 ic = NG + layer
-                s256 = (sigma_max * (one(FT) - lin_phi[j_idx, k_idx])) / FT(256.0)
+                s256 = sigma_max / FT(256.0)  # fixed σ for ξ direction
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[ic-4,j_idx,k_idx,m] - FT(8.0)*U[ic-3,j_idx,k_idx,m] +
@@ -50,7 +50,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             ei = Nx + NG
             for layer in 1:min(num_layers, 4)
                 ic = ei - layer + 1
-                s256 = (sigma_max * (one(FT) - lin_phi[j_idx, k_idx])) / FT(256.0)
+                s256 = sigma_max / FT(256.0)  # fixed σ for ξ direction
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[ic-4,j_idx,k_idx,m] - FT(8.0)*U[ic-3,j_idx,k_idx,m] +
@@ -71,7 +71,10 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
         if i_idx <= Nx + NG && k_idx <= Nz + NG
             for layer in 1:min(num_layers, 4)
                 jc = NG + layer
-                s256 = (sigma_max * (one(FT) - lin_phi[jc, k_idx])) / FT(256.0)
+                # Adaptive σ: high lin_phi → low σ (already has upwind dissipation)
+                @inbounds phi_local = lin_phi[jc, k_idx]
+                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[i_idx,jc-4,k_idx,m] - FT(8.0)*U[i_idx,jc-3,k_idx,m] +
@@ -93,7 +96,9 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             ej = Ny + NG
             for layer in 1:min(num_layers, 4)
                 jc = ej - layer + 1
-                s256 = (sigma_max * (one(FT) - lin_phi[jc, k_idx])) / FT(256.0)
+                @inbounds phi_local = lin_phi[jc, k_idx]
+                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[i_idx,jc-4,k_idx,m] - FT(8.0)*U[i_idx,jc-3,k_idx,m] +
@@ -114,7 +119,9 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
         if i_idx <= Nx + NG && j_idx <= Ny + NG
             for layer in 1:min(num_layers, 4)
                 kc = NG + layer
-                s256 = (sigma_max * (one(FT) - lin_phi[j_idx, kc])) / FT(256.0)
+                @inbounds phi_local = lin_phi[j_idx, kc]
+                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[i_idx,j_idx,kc-4,m] - FT(8.0)*U[i_idx,j_idx,kc-3,m] +
@@ -136,7 +143,9 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             ek = Nz + NG
             for layer in 1:min(num_layers, 4)
                 kc = ek - layer + 1
-                s256 = (sigma_max * (one(FT) - lin_phi[j_idx, kc])) / FT(256.0)
+                @inbounds phi_local = lin_phi[j_idx, kc]
+                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
                         d8 = U[i_idx,j_idx,kc-4,m] - FT(8.0)*U[i_idx,j_idx,kc-3,m] +

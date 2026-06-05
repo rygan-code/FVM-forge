@@ -34,6 +34,8 @@
 FVM-Forge/
 ├── run_pipe.jl              # 入口：标准旋转管道 (周期性)
 ├── run_pipe_diffrot.jl      # 入口：差分旋转管道 (Fringe 区)
+├── run_pipe_ac.jl           # 入口：不可压 AC 管道
+├── run_pipe_piso.jl         # 入口：不可压 PISO 管道
 ├── run_brio_wu.jl           # 入口：MHD Brio-Wu 激波管
 ├── solver.jl                # 核心求解器：时间推进、块管理、同步
 ├── gpu_backend.jl           # GPU 后端抽象层 (CUDA / ROCm / CPU)
@@ -48,6 +50,7 @@ FVM-Forge/
 ├── volume_force.jl          # 体积力 (旋转/Bulk/HIT/Deschamps forcing)
 ├── fringe.jl                # Fringe 回复区 (差分旋转用)
 ├── implicit.jl              # 隐式 LU-SGS 时间推进 (可选)
+├── gmres.jl                 # GMRES 线性求解器
 ├── div.jl                   # 通量散度 + RK 组合
 ├── filter_interface.jl      # 块间界面滤波 (自适应 σ)
 ├── spectral_warmup.jl       # 频谱预热 (DRP/CD6 自适应)

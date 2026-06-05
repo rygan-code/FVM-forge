@@ -29,6 +29,141 @@ function checkerboard_diagnostic!(blocks, connectivity, tt_val, world_rank)
     
     ng = NG
     
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Full-Field 2Δx Energy (relative to field mean)
+    # ══════════════════════════════════════════════════════════════════════════
+    var_names = ["ρ", "u", "v", "w", "p", "T"]
+    dir_names = ["ξ", "η", "ζ"]
+    nvar = length(var_names)
+    ndir = length(dir_names)
+    
+    # Accumulators across all blocks: sum of E_2Δx, count, sum of |f|, count_f
+    E_sum  = zeros(nvar, ndir)   # sum of |f[i] - 0.5*(f[i-1]+f[i+1])|
+    E_cnt  = zeros(Int, nvar, ndir)
+    F_sum  = zeros(nvar)         # sum of |f| over all real cells (for mean)
+    F_cnt  = zeros(Int, nvar)
+    
+    # Track per-block max for location reporting
+    max_E_val = zeros(nvar, ndir)
+    max_E_bid = zeros(Int, nvar, ndir)
+    
+    for (bid, b) in blocks
+        U_cpu = Array(b.U)
+        Nx, Ny, Nz = b.Nx, b.Ny, b.Nz
+        
+        # Pre-compute primitive fields over real cells
+        # Real index ranges (in global array coords)
+        ri0, ri1 = ng+1, Nx+ng
+        rj0, rj1 = ng+1, Ny+ng
+        rk0, rk1 = ng+1, Nz+ng
+        
+        prim = Array{Float64}(undef, Nx, Ny, Nz, nvar)
+        for rk in rk0:rk1, rj in rj0:rj1, ri in ri0:ri1
+            li, lj, lk = ri - ng, rj - ng, rk - ng  # 1-based local real index
+            rho   = U_cpu[ri, rj, rk, 1]
+            u_val = U_cpu[ri, rj, rk, 2] / rho
+            v_val = U_cpu[ri, rj, rk, 3] / rho
+            w_val = U_cpu[ri, rj, rk, 4] / rho
+            ke    = 0.5 * rho * (u_val^2 + v_val^2 + w_val^2)
+            p_val = (γ - 1.0) * (U_cpu[ri, rj, rk, 5] - ke)
+            T_val = p_val / (rho * Rg)
+            prim[li, lj, lk, 1] = rho
+            prim[li, lj, lk, 2] = u_val
+            prim[li, lj, lk, 3] = v_val
+            prim[li, lj, lk, 4] = w_val
+            prim[li, lj, lk, 5] = p_val
+            prim[li, lj, lk, 6] = T_val
+        end
+        
+        # Accumulate |f| over ALL real cells for field mean
+        for v in 1:nvar
+            for rk in 1:Nz, rj in 1:Ny, ri in 1:Nx
+                F_sum[v] += abs(prim[ri, rj, rk, v])
+                F_cnt[v] += 1
+            end
+        end
+        
+        # Compute E_2Δx in each direction
+        for v in 1:nvar
+            # ξ-direction (i-direction): iterate ri from 2 to Nx-1
+            for rk in 1:Nz, rj in 1:Ny, ri in 2:(Nx-1)
+                d = abs(prim[ri, rj, rk, v] - 0.5*(prim[ri-1, rj, rk, v] + prim[ri+1, rj, rk, v]))
+                E_sum[v, 1] += d
+                E_cnt[v, 1] += 1
+                if d > max_E_val[v, 1]
+                    max_E_val[v, 1] = d
+                    max_E_bid[v, 1] = bid
+                end
+            end
+            
+            # η-direction (j-direction): iterate rj from 2 to Ny-1
+            for rk in 1:Nz, rj in 2:(Ny-1), ri in 1:Nx
+                d = abs(prim[ri, rj, rk, v] - 0.5*(prim[ri, rj-1, rk, v] + prim[ri, rj+1, rk, v]))
+                E_sum[v, 2] += d
+                E_cnt[v, 2] += 1
+                if d > max_E_val[v, 2]
+                    max_E_val[v, 2] = d
+                    max_E_bid[v, 2] = bid
+                end
+            end
+            
+            # ζ-direction (k-direction): iterate rk from 2 to Nz-1
+            for rk in 2:(Nz-1), rj in 1:Ny, ri in 1:Nx
+                d = abs(prim[ri, rj, rk, v] - 0.5*(prim[ri, rj, rk-1, v] + prim[ri, rj, rk+1, v]))
+                E_sum[v, 3] += d
+                E_cnt[v, 3] += 1
+                if d > max_E_val[v, 3]
+                    max_E_val[v, 3] = d
+                    max_E_bid[v, 3] = bid
+                end
+            end
+        end
+    end
+    
+    # Compute relative E_2Δx = (E_avg) / mean(|f|)
+    E_rel = zeros(nvar, ndir)
+    for v in 1:nvar
+        f_mean = F_cnt[v] > 0 ? F_sum[v] / F_cnt[v] : 1.0
+        for d in 1:ndir
+            E_avg = E_cnt[v, d] > 0 ? E_sum[v, d] / E_cnt[v, d] : 0.0
+            E_rel[v, d] = f_mean > 0.0 ? E_avg / f_mean : 0.0
+        end
+    end
+    
+    # Find global max
+    glob_max_val = 0.0
+    glob_max_var = 1
+    glob_max_dir = 1
+    glob_max_bid = 0
+    for v in 1:nvar, d in 1:ndir
+        if E_rel[v, d] > glob_max_val
+            glob_max_val = E_rel[v, d]
+            glob_max_var = v
+            glob_max_dir = d
+            # For the bid, use the block that had the largest pointwise E_2Δx
+            glob_max_bid = max_E_bid[v, d]
+        end
+    end
+    
+    threshold = 0.005  # 0.5%
+    passed = glob_max_val < threshold
+    
+    # Print table
+    @printf("\n── Full-Field 2Δx Energy (relative to field mean) ──\n")
+    @printf("  %-10s  %-12s %-12s %-12s\n", "Variable", "ξ (x)", "η (y)", "ζ (z)")
+    @printf("  %s\n", "─"^48)
+    for v in 1:nvar
+        @printf("  %-10s  %12.2e %12.2e %12.2e\n",
+                var_names[v], E_rel[v, 1], E_rel[v, 2], E_rel[v, 3])
+    end
+    @printf("\n  Max relative E_2Δx: %.2e (%s, %s, bid=%d)\n",
+            glob_max_val, var_names[glob_max_var], dir_names[glob_max_dir], glob_max_bid)
+    if passed
+        @printf("  RESULT: PASS  (threshold: 0.5%%)\n")
+    else
+        @printf("  RESULT: FAIL  (threshold: 0.5%%, max = %.2e)\n", glob_max_val)
+    end
+    
     # ── Test 5: Cross-type vs Same-type 2Δx energy comparison ──
     # For each interface face, compute 2Δx energy in the first 4 interior cells
     # E_2dx = Σ |U[j] - 0.5*(U[j-1] + U[j+1])|²  (averaged over the face)

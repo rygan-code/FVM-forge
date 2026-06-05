@@ -7,7 +7,11 @@ function shockSensor(ϕ, Q, nxp, nyp, nzp)
         return
     end
 
-    # MHD and compressible modes: pressure-based Ducros sensor (Q[5]=p)
+
+
+    # MHD mode: pressure-based Ducros sensor (Q[5]=p, same as compressible)
+    # Falls through to the compressible pressure sensor below
+
     @inbounds Px1 = Q[i-1, j, k, 5]
     @inbounds Px2 = Q[i,   j, k, 5]
     @inbounds Px3 = Q[i+1, j, k, 5]
@@ -27,3 +31,4 @@ end
 @inline function minmod(a, b)
     ifelse(a*b > 0, (abs(a) > abs(b)) ? b : a, zero(a))
 end
+

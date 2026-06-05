@@ -1,47 +1,23 @@
-# ── Data directories ──
 /PLT
 /PLT*
-/AVG
 /MESH
 /MESH*
 /CHK
 /CHK*
 /VW_STRESS
 /HELICITY
-# /DEBUG — removed; case-insensitive on Windows, conflicts with /debug/
-
-# ── IDE & tool caches ──
+/DEBUG
 /.mistakebook
 /.trae
-/.cursor
-/.codegraph
-/.gemini
-
-# ── Scratch & temp ──
-/scratch
-/tmp_runs
-scratch_*.jl
-
-# ── Logs ──
 *.log
-cluster_err.txt
-ssh_verbose.log
-
-# ── Old backups & temp diagnostics ──
-Reconstruct_prev.jl
-Reconstruct_prev_utf8.jl
-*.nnd_backup
-diag_remaining_artifacts.jl
-diag_temp.jl
-test_parse.jl
-merged_conversation_history.md
-
-# ── Generated data (binary, mesh, plot) ──
+scratch_*.jl
+/AVG
 *.h5
-*.xmf
-*.csv
-Manifest.toml
-
-# ── Debug directory ──
-/debug/output/
-/debug/*.txt
+*.vtm
+*.vts
+*.py
+.codegraph/
+.gemini/
+scratch/
+*.txt
+.cursor/

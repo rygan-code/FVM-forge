@@ -1,6 +1,8 @@
-
 @inline function Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID, ch_glm::FT)
-    @static if equation_type == :MHD
+    @static if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        # ── AC mode: always use AC_Rusanov ──
+        return AC_Rusanov_Flux(UL_vec, UR_vec, nx, ny, nz)
+    elseif equation_type == :MHD
         # ── MHD mode: use MHD-specific Riemann solvers ──
         if splitMethodID == Int32(5)
             return MHD_KEP_Flux(UL_vec, UR_vec, nx, ny, nz, ch_glm)
@@ -40,40 +42,10 @@
             return f_upw
         end
         f_kep = KEP_Flux(UL_vec, UR_vec, nx, ny, nz)
-        a = one(FT) - lin_ϕ
-        b = lin_ϕ
-        return SVector{5, FT}((
-            a*f_kep[1]+b*f_upw[1], a*f_kep[2]+b*f_upw[2], a*f_kep[3]+b*f_upw[3],
-            a*f_kep[4]+b*f_upw[4], a*f_kep[5]+b*f_upw[5]))
+        return SVector{Ncons, FT}(ntuple(Val(Ncons)) do n
+            (one(FT) - lin_ϕ) * f_kep[n] + lin_ϕ * f_upw[n]
+        end)
     end
-end
-
-@inline function weno_zq_blend(v0::FT, v1::FT, v2::FT, Is1::FT, Is2::FT, Is3::FT, Is4::FT, ss::FT) where {FT}
-    β1 = Is2
-    β2 = Is3
-    β0 = max(Is1, max(Is2, max(Is3, Is4)))
-    
-    τ = abs(Is1 - Is4) * ss
-    ϵ = FT(1.0e-10)
-    
-    γ0, γ1, γ2 = FT(0.90), FT(0.05), FT(0.05)
-    
-    α0 = γ0 * (one(FT) + τ / (ϵ + β0 * ss))^2
-    α1 = γ1 * (one(FT) + τ / (ϵ + β1 * ss))^2
-    α2 = γ2 * (one(FT) + τ / (ϵ + β2 * ss))^2
-    
-    invsum = one(FT) / (α0 + α1 + α2)
-    ω0 = α0 * invsum
-    ω1 = α1 * invsum
-    ω2 = α2 * invsum
-    
-    v0_star = (v0 - γ1*v1 - γ2*v2) / γ0
-    
-    w0 = ω0 / γ0
-    w1 = ω1 - ω0 * (γ1 / γ0)
-    w2 = ω2 - ω0 * (γ2 / γ0)
-    
-    return w0 * v0_star + w1 * v1 + w2 * v2
 end
 
 function Eigen_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp,
@@ -96,6 +68,12 @@ function Eigen_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nz
 
     # 3. 激波传感器
     @inbounds ϕx = max(ϕ[i-2, j, k], ϕ[i-1, j, k], ϕ[i, j, k], ϕ[i+1, j, k], ϕ[i+2, j, k], ϕ[i+3, j, k])
+
+    # AC: always use linear reconstruction (branch A). Branch B performs
+    # 5-variable Roe decomposition that reads Q[...,5:6] — out of bounds for AC.
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕx = zero(FT)
+    end
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -320,7 +298,8 @@ end
 function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp,
                              stencil_arr, Δstencil_arr, lin_phi_arr,
                              stencil_R_arr, Δstencil_R_arr,
-                             ch_glm::FT, mode::Int32)
+                             ch_glm::FT, mode::Int32,
+                             star_active, star_L, star_R)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -339,6 +318,11 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
     # 3. 激波传感器 (J 方向)
     @inbounds ϕx = max(ϕ[i, j-2, k], ϕ[i, j-1, k], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
 
+    # AC: always use linear reconstruction (branch A)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕx = zero(FT)
+    end
+
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -348,37 +332,114 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
     # ==============================
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
     if ϕx < hybrid_ϕ1
-        # ═══ Original 1D 7-point reconstruction ═══
-        α_adapt = min(ϕx / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
-        @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
-        @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
-        @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
-        @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds v1 = U[i,j-3,k,n]; v2 = U[i,j-2,k,n]; v3 = U[i,j-1,k,n]
-            @inbounds v4 = U[i,j  ,k,n]; v5 = U[i,j+1,k,n]; v6 = U[i,j+2,k,n]; v7 = U[i,j+3,k,n]
-            UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
-        end
-        @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
-        @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
-        @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
-        @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds r1 = U[i,j+4,k,n]; r2 = U[i,j+3,k,n]; r3 = U[i,j+2,k,n]
-            @inbounds r4 = U[i,j+1,k,n]; r5 = U[i,j  ,k,n]; r6 = U[i,j-1,k,n]; r7 = U[i,j-2,k,n]
-            UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
-        end
-
-        # Failsafe check for Branch A
-        @inbounds ρL_fs = UL_final[1]; @inbounds ρR_fs = UR_final[1]
-        @inbounds eiL_fs = UL_final[5] - FT(0.5)*(UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2)/ρL_fs
-        @inbounds eiR_fs = UR_final[5] - FT(0.5)*(UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2)/ρR_fs
-        if ρL_fs < FT(1.0e-10) || eiL_fs < FT(1.0e-10) || ρR_fs < FT(1.0e-10) || eiR_fs < FT(1.0e-10) || !isfinite(ρL_fs) || !isfinite(ρR_fs) || !isfinite(eiL_fs) || !isfinite(eiR_fs)
+        # Check for bend-adaptive star-stencil
+        @inbounds blend_w = star_active !== nothing ? star_active[j, k] : zero(FT)
+                    # ═══ Original 1D 7-point reconstruction ═══
+            α_adapt = min(ϕx / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
+            @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
+            @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
+            @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
+            @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
             for n = 1:Ncons
-                @inbounds UL_final[n] = U[i, j, k, n]
-                @inbounds UR_final[n] = U[i, j+1, k, n]
+                @inbounds v1 = U[i,j-3,k,n]; v2 = U[i,j-2,k,n]; v3 = U[i,j-1,k,n]
+                @inbounds v4 = U[i,j  ,k,n]; v5 = U[i,j+1,k,n]; v6 = U[i,j+2,k,n]; v7 = U[i,j+3,k,n]
+                UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
+            end
+            @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
+            @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
+            @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
+            @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds r1 = U[i,j+4,k,n]; r2 = U[i,j+3,k,n]; r3 = U[i,j+2,k,n]
+                @inbounds r4 = U[i,j+1,k,n]; r5 = U[i,j  ,k,n]; r6 = U[i,j-1,k,n]; r7 = U[i,j-2,k,n]
+                UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
+            end
+        if blend_w > 0
+            # ═══ 40-point Star-Stencil 3D Reconstruction (η-direction) ═══
+            for n = 1:Ncons
+                val_L = zero(FT); val_R = zero(FT)
+                # Main line (η): 8 points
+                @inbounds v=U[i,j-3,k,n]; val_L+=star_L[j,k,1]*v; val_R+=star_R[j,k,1]*v
+                @inbounds v=U[i,j-2,k,n]; val_L+=star_L[j,k,2]*v; val_R+=star_R[j,k,2]*v
+                @inbounds v=U[i,j-1,k,n]; val_L+=star_L[j,k,3]*v; val_R+=star_R[j,k,3]*v
+                @inbounds v=U[i,j  ,k,n]; val_L+=star_L[j,k,4]*v; val_R+=star_R[j,k,4]*v
+                @inbounds v=U[i,j+1,k,n]; val_L+=star_L[j,k,5]*v; val_R+=star_R[j,k,5]*v
+                @inbounds v=U[i,j+2,k,n]; val_L+=star_L[j,k,6]*v; val_R+=star_R[j,k,6]*v
+                @inbounds v=U[i,j+3,k,n]; val_L+=star_L[j,k,7]*v; val_R+=star_R[j,k,7]*v
+                @inbounds v=U[i,j+4,k,n]; val_L+=star_L[j,k,8]*v; val_R+=star_R[j,k,8]*v
+                
+                # Transverse ξ @ j0
+                @inbounds v=U[i-3,j,k,n]; val_L+=star_L[j,k,9]*v; val_R+=star_R[j,k,9]*v
+                @inbounds v=U[i-2,j,k,n]; val_L+=star_L[j,k,10]*v; val_R+=star_R[j,k,10]*v
+                @inbounds v=U[i-1,j,k,n]; val_L+=star_L[j,k,11]*v; val_R+=star_R[j,k,11]*v
+                @inbounds v=U[i+1,j,k,n]; val_L+=star_L[j,k,12]*v; val_R+=star_R[j,k,12]*v
+                @inbounds v=U[i+2,j,k,n]; val_L+=star_L[j,k,13]*v; val_R+=star_R[j,k,13]*v
+                @inbounds v=U[i+3,j,k,n]; val_L+=star_L[j,k,14]*v; val_R+=star_R[j,k,14]*v
+                
+                # Transverse ζ @ j0
+                @inbounds v=U[i,j,k-3,n]; val_L+=star_L[j,k,15]*v; val_R+=star_R[j,k,15]*v
+                @inbounds v=U[i,j,k-2,n]; val_L+=star_L[j,k,16]*v; val_R+=star_R[j,k,16]*v
+                @inbounds v=U[i,j,k-1,n]; val_L+=star_L[j,k,17]*v; val_R+=star_R[j,k,17]*v
+                @inbounds v=U[i,j,k+1,n]; val_L+=star_L[j,k,18]*v; val_R+=star_R[j,k,18]*v
+                @inbounds v=U[i,j,k+2,n]; val_L+=star_L[j,k,19]*v; val_R+=star_R[j,k,19]*v
+                @inbounds v=U[i,j,k+3,n]; val_L+=star_L[j,k,20]*v; val_R+=star_R[j,k,20]*v
+                
+                # Transverse ξ @ j0+1
+                @inbounds v=U[i-3,j+1,k,n]; val_L+=star_L[j,k,21]*v; val_R+=star_R[j,k,21]*v
+                @inbounds v=U[i-2,j+1,k,n]; val_L+=star_L[j,k,22]*v; val_R+=star_R[j,k,22]*v
+                @inbounds v=U[i-1,j+1,k,n]; val_L+=star_L[j,k,23]*v; val_R+=star_R[j,k,23]*v
+                @inbounds v=U[i+1,j+1,k,n]; val_L+=star_L[j,k,24]*v; val_R+=star_R[j,k,24]*v
+                @inbounds v=U[i+2,j+1,k,n]; val_L+=star_L[j,k,25]*v; val_R+=star_R[j,k,25]*v
+                @inbounds v=U[i+3,j+1,k,n]; val_L+=star_L[j,k,26]*v; val_R+=star_R[j,k,26]*v
+                
+                # Transverse ζ @ j0+1
+                @inbounds v=U[i,j+1,k-3,n]; val_L+=star_L[j,k,27]*v; val_R+=star_R[j,k,27]*v
+                @inbounds v=U[i,j+1,k-2,n]; val_L+=star_L[j,k,28]*v; val_R+=star_R[j,k,28]*v
+                @inbounds v=U[i,j+1,k-1,n]; val_L+=star_L[j,k,29]*v; val_R+=star_R[j,k,29]*v
+                @inbounds v=U[i,j+1,k+1,n]; val_L+=star_L[j,k,30]*v; val_R+=star_R[j,k,30]*v
+                @inbounds v=U[i,j+1,k+2,n]; val_L+=star_L[j,k,31]*v; val_R+=star_R[j,k,31]*v
+                @inbounds v=U[i,j+1,k+3,n]; val_L+=star_L[j,k,32]*v; val_R+=star_R[j,k,32]*v
+                
+                # Diagonal ξ-ζ corners @j0
+                @inbounds v=U[i-1,j,k-1,n]; val_L+=star_L[j,k,33]*v; val_R+=star_R[j,k,33]*v
+                @inbounds v=U[i-1,j,k+1,n]; val_L+=star_L[j,k,34]*v; val_R+=star_R[j,k,34]*v
+                @inbounds v=U[i+1,j,k-1,n]; val_L+=star_L[j,k,35]*v; val_R+=star_R[j,k,35]*v
+                @inbounds v=U[i+1,j,k+1,n]; val_L+=star_L[j,k,36]*v; val_R+=star_R[j,k,36]*v
+                
+                # Diagonal ξ-ζ corners @j+1
+                @inbounds v=U[i-1,j+1,k-1,n]; val_L+=star_L[j,k,37]*v; val_R+=star_R[j,k,37]*v
+                @inbounds v=U[i-1,j+1,k+1,n]; val_L+=star_L[j,k,38]*v; val_R+=star_R[j,k,38]*v
+                @inbounds v=U[i+1,j+1,k-1,n]; val_L+=star_L[j,k,39]*v; val_R+=star_R[j,k,39]*v
+                @inbounds v=U[i+1,j+1,k+1,n]; val_L+=star_L[j,k,40]*v; val_R+=star_R[j,k,40]*v
+                
+                # Venkatakrishnan smooth limiter (Scheme D)
+                @inbounds v_min = min(U[i,j-1,k,n], U[i,j,k,n], U[i,j+1,k,n], U[i,j+2,k,n])
+                @inbounds v_max = max(U[i,j-1,k,n], U[i,j,k,n], U[i,j+1,k,n], U[i,j+2,k,n])
+                eps2 = (FT(0.01) * (v_max - v_min))^2 + FT(1e-30)
+                @inbounds fc = U[i,j,k,n]; dL = val_L - fc
+                if dL > FT(1e-30)
+                    dm = v_max - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                elseif dL < FT(-1e-30)
+                    dm = v_min - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UL_40 = fc + phi_v * dL
+                @inbounds fcR = U[i,j+1,k,n]; dR = val_R - fcR
+                if dR > FT(1e-30)
+                    dm = v_max - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                elseif dR < FT(-1e-30)
+                    dm = v_min - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UR_40 = fcR + phi_v * dR
+                
+                UL_final[n] = (one(FT) - blend_w) * UL_final[n] + blend_w * UL_40
+                UR_final[n] = (one(FT) - blend_w) * UR_final[n] + blend_w * UR_40
             end
         end
+  # use_star branch
 
 
     # ==============================
@@ -499,7 +560,7 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
                 q1=-FT(3.0)*V1+FT(13.0)*V2-FT(23.0)*V3+FT(25.0e0)*V4; q2=V2-FT(5.0e0)*V3+FT(13.0)*V4+FT(3.0)*V5
                 q3=-V3+FT(7.0e0)*V4+FT(7.0e0)*V5-V6; q4=FT(3.0)*V4+FT(13.0)*V5-FT(5.0e0)*V6+V7
                 Is1=V1*(FT(547.0e0)*V1-FT(3882.0)*V2+FT(4642.0)*V3-FT(1854.0)*V4)+V2*(FT(7043.0)*V2-FT(17246.0e0)*V3+FT(7042.0)*V4)+V3*(FT(11003.0)*V3-FT(9402.0)*V4)+V4*(FT(2107.0e0)*V4)
-                Is2=V2*(FT(267.0e0)*V2-FT(1642.0)*V3+FT(1602.0)*V4-FT(494.0)*V5)+V3*(FT(2843.0)*V3-FT(5966.0e0)*V4+FT(1922.0)*V5)+V4*(FT(3443.0)*V4-FT(2522.0)*V5+V5*(FT(547.0e0)*V5))
+                Is2=V2*(FT(267.0e0)*V2-FT(1642.0)*V3+FT(1602.0)*V4-FT(494.0)*V5)+V3*(FT(2843.0)*V3-FT(5966.0e0)*V4+FT(1922.0)*V5)+V4*(FT(3443.0)*V4-FT(2522.0)*V5)+V5*(FT(547.0e0)*V5)
                 Is3=V3*(FT(547.0e0)*V3-FT(2522.0)*V4+FT(1922.0)*V5-FT(494.0)*V6)+V4*(FT(3443.0)*V4-FT(5966.0e0)*V5+FT(1602.0)*V6)+V5*(FT(2843.0)*V5-FT(1642.0)*V6)+V6*(FT(267.0e0)*V6)
                 Is4=V4*(FT(2107.0e0)*V4-FT(9402.0)*V5+FT(7042.0)*V6-FT(1854.0)*V7)+V5*(FT(11003.0)*V5-FT(17246.0e0)*V6+FT(4642.0)*V7)+V6*(FT(7043.0)*V6-FT(3882.0)*V7)+V7*(FT(547.0e0)*V7)
                 td1=WENOϵ1+Is1*ss; td2=WENOϵ1+Is2*ss; td3=WENOϵ1+Is3*ss; td4=WENOϵ1+Is4*ss
@@ -569,7 +630,8 @@ end
 function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp,
                              stencil_arr, Δstencil_arr, lin_phi_arr,
                              stencil_R_arr, Δstencil_R_arr,
-                             ch_glm::FT, mode::Int32)
+                             ch_glm::FT, mode::Int32,
+                             star_active, star_L, star_R)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -588,6 +650,11 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
     # 3. 激波传感器 (K 方向)
     @inbounds ϕx = max(ϕ[i, j, k-2], ϕ[i, j, k-1], ϕ[i, j, k], ϕ[i, j, k+1], ϕ[i, j, k+2], ϕ[i, j, k+3])
 
+    # AC: always use linear reconstruction (branch A)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕx = zero(FT)
+    end
+
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -597,37 +664,115 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
     # ==============================
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
     if ϕx < hybrid_ϕ1
-        # ═══ Original 1D 7-point reconstruction ═══
-        α_adapt = min(ϕx / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
-        @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
-        @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
-        @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
-        @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds v1 = U[i,j,k-3,n]; v2 = U[i,j,k-2,n]; v3 = U[i,j,k-1,n]
-            @inbounds v4 = U[i,j,k  ,n]; v5 = U[i,j,k+1,n]; v6 = U[i,j,k+2,n]; v7 = U[i,j,k+3,n]
-            UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
-        end
-        @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
-        @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
-        @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
-        @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds r1 = U[i,j,k+4,n]; r2 = U[i,j,k+3,n]; r3 = U[i,j,k+2,n]
-            @inbounds r4 = U[i,j,k+1,n]; r5 = U[i,j,k  ,n]; r6 = U[i,j,k-1,n]; r7 = U[i,j,k-2,n]
-            UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
-        end
-
-        # Failsafe check for Branch A
-        @inbounds ρL_fs = UL_final[1]; @inbounds ρR_fs = UR_final[1]
-        @inbounds eiL_fs = UL_final[5] - FT(0.5)*(UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2)/ρL_fs
-        @inbounds eiR_fs = UR_final[5] - FT(0.5)*(UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2)/ρR_fs
-        if ρL_fs < FT(1.0e-10) || eiL_fs < FT(1.0e-10) || ρR_fs < FT(1.0e-10) || eiR_fs < FT(1.0e-10) || !isfinite(ρL_fs) || !isfinite(ρR_fs) || !isfinite(eiL_fs) || !isfinite(eiR_fs)
+        # Check for bend-adaptive star-stencil
+        @inbounds blend_w = star_active !== nothing ? star_active[j, k] : zero(FT)
+                    # ═══ Original 1D 7-point reconstruction ═══
+            α_adapt = min(ϕx / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
+            @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
+            @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
+            @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
+            @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
             for n = 1:Ncons
-                @inbounds UL_final[n] = U[i, j, k, n]
-                @inbounds UR_final[n] = U[i, j, k+1, n]
+                @inbounds v1 = U[i,j,k-3,n]; v2 = U[i,j,k-2,n]; v3 = U[i,j,k-1,n]
+                @inbounds v4 = U[i,j,k  ,n]; v5 = U[i,j,k+1,n]; v6 = U[i,j,k+2,n]; v7 = U[i,j,k+3,n]
+                UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
+            end
+            @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
+            @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
+            @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
+            @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds r1 = U[i,j,k+4,n]; r2 = U[i,j,k+3,n]; r3 = U[i,j,k+2,n]
+                @inbounds r4 = U[i,j,k+1,n]; r5 = U[i,j,k  ,n]; r6 = U[i,j,k-1,n]; r7 = U[i,j,k-2,n]
+                UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
+            end
+        if blend_w > 0
+            # ═══ 40-point Star-Stencil 3D Reconstruction (ζ-direction) ═══
+            for n = 1:Ncons
+                val_L = zero(FT); val_R = zero(FT)
+                # Main line (ζ): 8 points
+                @inbounds v=U[i,j,k-3,n]; val_L+=star_L[j,k,1]*v; val_R+=star_R[j,k,1]*v
+                @inbounds v=U[i,j,k-2,n]; val_L+=star_L[j,k,2]*v; val_R+=star_R[j,k,2]*v
+                @inbounds v=U[i,j,k-1,n]; val_L+=star_L[j,k,3]*v; val_R+=star_R[j,k,3]*v
+                @inbounds v=U[i,j,k  ,n]; val_L+=star_L[j,k,4]*v; val_R+=star_R[j,k,4]*v
+                @inbounds v=U[i,j,k+1,n]; val_L+=star_L[j,k,5]*v; val_R+=star_R[j,k,5]*v
+                @inbounds v=U[i,j,k+2,n]; val_L+=star_L[j,k,6]*v; val_R+=star_R[j,k,6]*v
+                @inbounds v=U[i,j,k+3,n]; val_L+=star_L[j,k,7]*v; val_R+=star_R[j,k,7]*v
+                @inbounds v=U[i,j,k+4,n]; val_L+=star_L[j,k,8]*v; val_R+=star_R[j,k,8]*v
+                
+                # Transverse ξ @ k0
+                @inbounds v=U[i-3,j,k,n]; val_L+=star_L[j,k,9]*v; val_R+=star_R[j,k,9]*v
+                @inbounds v=U[i-2,j,k,n]; val_L+=star_L[j,k,10]*v; val_R+=star_R[j,k,10]*v
+                @inbounds v=U[i-1,j,k,n]; val_L+=star_L[j,k,11]*v; val_R+=star_R[j,k,11]*v
+                @inbounds v=U[i+1,j,k,n]; val_L+=star_L[j,k,12]*v; val_R+=star_R[j,k,12]*v
+                @inbounds v=U[i+2,j,k,n]; val_L+=star_L[j,k,13]*v; val_R+=star_R[j,k,13]*v
+                @inbounds v=U[i+3,j,k,n]; val_L+=star_L[j,k,14]*v; val_R+=star_R[j,k,14]*v
+                
+                # Transverse η @ k0
+                @inbounds v=U[i,j-3,k,n]; val_L+=star_L[j,k,15]*v; val_R+=star_R[j,k,15]*v
+                @inbounds v=U[i,j-2,k,n]; val_L+=star_L[j,k,16]*v; val_R+=star_R[j,k,16]*v
+                @inbounds v=U[i,j-1,k,n]; val_L+=star_L[j,k,17]*v; val_R+=star_R[j,k,17]*v
+                @inbounds v=U[i,j+1,k,n]; val_L+=star_L[j,k,18]*v; val_R+=star_R[j,k,18]*v
+                @inbounds v=U[i,j+2,k,n]; val_L+=star_L[j,k,19]*v; val_R+=star_R[j,k,19]*v
+                @inbounds v=U[i,j+3,k,n]; val_L+=star_L[j,k,20]*v; val_R+=star_R[j,k,20]*v
+                
+                # Transverse ξ @ k0+1
+                @inbounds v=U[i-3,j,k+1,n]; val_L+=star_L[j,k,21]*v; val_R+=star_R[j,k,21]*v
+                @inbounds v=U[i-2,j,k+1,n]; val_L+=star_L[j,k,22]*v; val_R+=star_R[j,k,22]*v
+                @inbounds v=U[i-1,j,k+1,n]; val_L+=star_L[j,k,23]*v; val_R+=star_R[j,k,23]*v
+                @inbounds v=U[i+1,j,k+1,n]; val_L+=star_L[j,k,24]*v; val_R+=star_R[j,k,24]*v
+                @inbounds v=U[i+2,j,k+1,n]; val_L+=star_L[j,k,25]*v; val_R+=star_R[j,k,25]*v
+                @inbounds v=U[i+3,j,k+1,n]; val_L+=star_L[j,k,26]*v; val_R+=star_R[j,k,26]*v
+                
+                # Transverse η @ k0+1
+                @inbounds v=U[i,j-3,k+1,n]; val_L+=star_L[j,k,27]*v; val_R+=star_R[j,k,27]*v
+                @inbounds v=U[i,j-2,k+1,n]; val_L+=star_L[j,k,28]*v; val_R+=star_R[j,k,28]*v
+                @inbounds v=U[i,j-1,k+1,n]; val_L+=star_L[j,k,29]*v; val_R+=star_R[j,k,29]*v
+                @inbounds v=U[i,j+1,k+1,n]; val_L+=star_L[j,k,30]*v; val_R+=star_R[j,k,30]*v
+                @inbounds v=U[i,j+2,k+1,n]; val_L+=star_L[j,k,31]*v; val_R+=star_R[j,k,31]*v
+                @inbounds v=U[i,j+3,k+1,n]; val_L+=star_L[j,k,32]*v; val_R+=star_R[j,k,32]*v
+                
+                # Diagonal ξ-η corners @k0
+                @inbounds v=U[i-1,j-1,k,n]; val_L+=star_L[j,k,33]*v; val_R+=star_R[j,k,33]*v
+                @inbounds v=U[i-1,j+1,k,n]; val_L+=star_L[j,k,34]*v; val_R+=star_R[j,k,34]*v
+                @inbounds v=U[i+1,j-1,k,n]; val_L+=star_L[j,k,35]*v; val_R+=star_R[j,k,35]*v
+                @inbounds v=U[i+1,j+1,k,n]; val_L+=star_L[j,k,36]*v; val_R+=star_R[j,k,36]*v
+                
+                # Diagonal ξ-η corners @k+1
+                @inbounds v=U[i-1,j-1,k+1,n]; val_L+=star_L[j,k,37]*v; val_R+=star_R[j,k,37]*v
+                @inbounds v=U[i-1,j+1,k+1,n]; val_L+=star_L[j,k,38]*v; val_R+=star_R[j,k,38]*v
+                @inbounds v=U[i+1,j-1,k+1,n]; val_L+=star_L[j,k,39]*v; val_R+=star_R[j,k,39]*v
+                @inbounds v=U[i+1,j+1,k+1,n]; val_L+=star_L[j,k,40]*v; val_R+=star_R[j,k,40]*v
+                
+                # Venkatakrishnan smooth limiter (Scheme D)
+                @inbounds v_min = min(U[i,j,k-1,n], U[i,j,k,n], U[i,j,k+1,n], U[i,j,k+2,n])
+                @inbounds v_max = max(U[i,j,k-1,n], U[i,j,k,n], U[i,j,k+1,n], U[i,j,k+2,n])
+                eps2 = (FT(0.01) * (v_max - v_min))^2 + FT(1e-30)
+                @inbounds fc = U[i,j,k,n]; dL = val_L - fc
+                if dL > FT(1e-30)
+                    dm = v_max - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                elseif dL < FT(-1e-30)
+                    dm = v_min - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UL_40 = fc + phi_v * dL
+                @inbounds fcR = U[i,j,k+1,n]; dR = val_R - fcR
+                if dR > FT(1e-30)
+                    dm = v_max - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                elseif dR < FT(-1e-30)
+                    dm = v_min - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UR_40 = fcR + phi_v * dR
+                
+                UL_final[n] = (one(FT) - blend_w) * UL_final[n] + blend_w * UL_40
+                UR_final[n] = (one(FT) - blend_w) * UR_final[n] + blend_w * UR_40
             end
         end
+  # use_star branch
+
 
     # ==============================
     # 分支 B: 间断区(特征分解模式)
@@ -811,6 +956,7 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
     @inbounds for n = 1:Ncons
         Fz[i-NG, j-NG, k-NG+1, n] = flux_temp[n] * Area
     end
+    return
 end
 
 function Conser_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp,
@@ -835,6 +981,11 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, n
 
     # 3. 激波传感器
     @inbounds ϕx = max(ϕ[i-2, j, k], ϕ[i-1, j, k], ϕ[i, j, k], ϕ[i+1, j, k], ϕ[i+2, j, k], ϕ[i+3, j, k])
+
+    # AC: always use linear reconstruction (branch A)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕx = zero(FT)
+    end
 
     # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
@@ -1043,12 +1194,13 @@ end
 function Conser_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp,
                               stencil_arr, Δstencil_arr, lin_phi_arr,
                               stencil_R_arr, Δstencil_R_arr,
-                              ch_glm::FT, mode::Int32)
+                              ch_glm::FT, mode::Int32,
+                              star_active, star_L, star_R)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
     
-    # 1. 边界检查
+    # 1. 边界检???
     if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG || k < NG+1
         return
     end
@@ -1059,48 +1211,143 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, n
     # 2. Geometry
     @inbounds nx=nxj[i,j+1,k]; ny=nyj[i,j+1,k]; nz=nzj[i,j+1,k]; Area=Areaj[i,j+1,k]
 
-    # 3. 激波传感器
+    # 3. 激波传感器 (???j 方向)
     @inbounds ϕy = max(ϕ[i, j-2, k], ϕ[i, j-1, k], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
 
+    # AC: always use linear reconstruction (branch A)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕy = zero(FT)
+    end
+
+    # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
 
     # ==============================
-    # Branch A: Smooth region
+    # ...
     # ==============================
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
     if ϕy < hybrid_ϕ1
-        # ═══ Original 1D 7-point reconstruction ═══
-        α_adapt = min(ϕy / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
-        @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
-        @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
-        @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
-        @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds v1 = U[i,j-3,k,n]; v2 = U[i,j-2,k,n]; v3 = U[i,j-1,k,n]
-            @inbounds v4 = U[i,j  ,k,n]; v5 = U[i,j+1,k,n]; v6 = U[i,j+2,k,n]; v7 = U[i,j+3,k,n]
-            UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
-        end
-        @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
-        @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
-        @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
-        @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds r1 = U[i,j+4,k,n]; r2 = U[i,j+3,k,n]; r3 = U[i,j+2,k,n]
-            @inbounds r4 = U[i,j+1,k,n]; r5 = U[i,j  ,k,n]; r6 = U[i,j-1,k,n]; r7 = U[i,j-2,k,n]
-            UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
-        end
+        # Check for bend-adaptive star-stencil
+        @inbounds blend_w = star_active !== nothing ? star_active[j, k] : zero(FT)
+        if use_star == Int32(1)
+            # ═══ 40-point Star-Stencil 3D Reconstruction (η-direction) ═══
+            for n = 1:Ncons
+                val_L = zero(FT); val_R = zero(FT)
+                # Main line (η): 8 points
+                @inbounds v=U[i,j-3,k,n]; val_L+=star_L[j,k,1]*v; val_R+=star_R[j,k,1]*v
+                @inbounds v=U[i,j-2,k,n]; val_L+=star_L[j,k,2]*v; val_R+=star_R[j,k,2]*v
+                @inbounds v=U[i,j-1,k,n]; val_L+=star_L[j,k,3]*v; val_R+=star_R[j,k,3]*v
+                @inbounds v=U[i,j  ,k,n]; val_L+=star_L[j,k,4]*v; val_R+=star_R[j,k,4]*v
+                @inbounds v=U[i,j+1,k,n]; val_L+=star_L[j,k,5]*v; val_R+=star_R[j,k,5]*v
+                @inbounds v=U[i,j+2,k,n]; val_L+=star_L[j,k,6]*v; val_R+=star_R[j,k,6]*v
+                @inbounds v=U[i,j+3,k,n]; val_L+=star_L[j,k,7]*v; val_R+=star_R[j,k,7]*v
+                @inbounds v=U[i,j+4,k,n]; val_L+=star_L[j,k,8]*v; val_R+=star_R[j,k,8]*v
+                
+                # Transverse ξ @ j0
+                @inbounds v=U[i-3,j,k,n]; val_L+=star_L[j,k,9]*v; val_R+=star_R[j,k,9]*v
+                @inbounds v=U[i-2,j,k,n]; val_L+=star_L[j,k,10]*v; val_R+=star_R[j,k,10]*v
+                @inbounds v=U[i-1,j,k,n]; val_L+=star_L[j,k,11]*v; val_R+=star_R[j,k,11]*v
+                @inbounds v=U[i+1,j,k,n]; val_L+=star_L[j,k,12]*v; val_R+=star_R[j,k,12]*v
+                @inbounds v=U[i+2,j,k,n]; val_L+=star_L[j,k,13]*v; val_R+=star_R[j,k,13]*v
+                @inbounds v=U[i+3,j,k,n]; val_L+=star_L[j,k,14]*v; val_R+=star_R[j,k,14]*v
+                
+                # Transverse ζ @ j0
+                @inbounds v=U[i,j,k-3,n]; val_L+=star_L[j,k,15]*v; val_R+=star_R[j,k,15]*v
+                @inbounds v=U[i,j,k-2,n]; val_L+=star_L[j,k,16]*v; val_R+=star_R[j,k,16]*v
+                @inbounds v=U[i,j,k-1,n]; val_L+=star_L[j,k,17]*v; val_R+=star_R[j,k,17]*v
+                @inbounds v=U[i,j,k+1,n]; val_L+=star_L[j,k,18]*v; val_R+=star_R[j,k,18]*v
+                @inbounds v=U[i,j,k+2,n]; val_L+=star_L[j,k,19]*v; val_R+=star_R[j,k,19]*v
+                @inbounds v=U[i,j,k+3,n]; val_L+=star_L[j,k,20]*v; val_R+=star_R[j,k,20]*v
+                
+                # Transverse ξ @ j0+1
+                @inbounds v=U[i-3,j+1,k,n]; val_L+=star_L[j,k,21]*v; val_R+=star_R[j,k,21]*v
+                @inbounds v=U[i-2,j+1,k,n]; val_L+=star_L[j,k,22]*v; val_R+=star_R[j,k,22]*v
+                @inbounds v=U[i-1,j+1,k,n]; val_L+=star_L[j,k,23]*v; val_R+=star_R[j,k,23]*v
+                @inbounds v=U[i+1,j+1,k,n]; val_L+=star_L[j,k,24]*v; val_R+=star_R[j,k,24]*v
+                @inbounds v=U[i+2,j+1,k,n]; val_L+=star_L[j,k,25]*v; val_R+=star_R[j,k,25]*v
+                @inbounds v=U[i+3,j+1,k,n]; val_L+=star_L[j,k,26]*v; val_R+=star_R[j,k,26]*v
+                
+                # Transverse ζ @ j0+1
+                @inbounds v=U[i,j+1,k-3,n]; val_L+=star_L[j,k,27]*v; val_R+=star_R[j,k,27]*v
+                @inbounds v=U[i,j+1,k-2,n]; val_L+=star_L[j,k,28]*v; val_R+=star_R[j,k,28]*v
+                @inbounds v=U[i,j+1,k-1,n]; val_L+=star_L[j,k,29]*v; val_R+=star_R[j,k,29]*v
+                @inbounds v=U[i,j+1,k+1,n]; val_L+=star_L[j,k,30]*v; val_R+=star_R[j,k,30]*v
+                @inbounds v=U[i,j+1,k+2,n]; val_L+=star_L[j,k,31]*v; val_R+=star_R[j,k,31]*v
+                @inbounds v=U[i,j+1,k+3,n]; val_L+=star_L[j,k,32]*v; val_R+=star_R[j,k,32]*v
+                
+                # Diagonal ξ-ζ corners @j0
+                @inbounds v=U[i-1,j,k-1,n]; val_L+=star_L[j,k,33]*v; val_R+=star_R[j,k,33]*v
+                @inbounds v=U[i-1,j,k+1,n]; val_L+=star_L[j,k,34]*v; val_R+=star_R[j,k,34]*v
+                @inbounds v=U[i+1,j,k-1,n]; val_L+=star_L[j,k,35]*v; val_R+=star_R[j,k,35]*v
+                @inbounds v=U[i+1,j,k+1,n]; val_L+=star_L[j,k,36]*v; val_R+=star_R[j,k,36]*v
+                
+                # Diagonal ξ-ζ corners @j+1
+                @inbounds v=U[i-1,j+1,k-1,n]; val_L+=star_L[j,k,37]*v; val_R+=star_R[j,k,37]*v
+                @inbounds v=U[i-1,j+1,k+1,n]; val_L+=star_L[j,k,38]*v; val_R+=star_R[j,k,38]*v
+                @inbounds v=U[i+1,j+1,k-1,n]; val_L+=star_L[j,k,39]*v; val_R+=star_R[j,k,39]*v
+                @inbounds v=U[i+1,j+1,k+1,n]; val_L+=star_L[j,k,40]*v; val_R+=star_R[j,k,40]*v
+                
+                # Venkatakrishnan smooth limiter (Scheme D)
+                @inbounds v_min = min(U[i,j-1,k,n], U[i,j,k,n], U[i,j+1,k,n], U[i,j+2,k,n])
+                @inbounds v_max = max(U[i,j-1,k,n], U[i,j,k,n], U[i,j+1,k,n], U[i,j+2,k,n])
+                eps2 = (FT(0.01) * (v_max - v_min))^2 + FT(1e-30)
+                @inbounds fc = U[i,j,k,n]; dL = val_L - fc
+                if dL > FT(1e-30)
+                    dm = v_max - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                elseif dL < FT(-1e-30)
+                    dm = v_min - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UL_final[n] = fc + phi_v * dL
+                @inbounds fcR = U[i,j+1,k,n]; dR = val_R - fcR
+                if dR > FT(1e-30)
+                    dm = v_max - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                elseif dR < FT(-1e-30)
+                    dm = v_min - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UR_final[n] = fcR + phi_v * dR
+            end
+        else
+            # ═══ Original 1D 7-point reconstruction ═══
+            α_adapt = min(ϕy / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
+            # Left-state weights
+            @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
+            @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
+            @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
+            @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds v1 = U[i,j-3,k,n]; v2 = U[i,j-2,k,n]; v3 = U[i,j-1,k,n]
+                @inbounds v4 = U[i,j  ,k,n]; v5 = U[i,j+1,k,n]; v6 = U[i,j+2,k,n]; v7 = U[i,j+3,k,n]
+                UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
+            end
+            # Right-state weights (temporal register reuse)
+            @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
+            @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
+            @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
+            @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds r1 = U[i,j+4,k,n]; r2 = U[i,j+3,k,n]; r3 = U[i,j+2,k,n]
+                @inbounds r4 = U[i,j+1,k,n]; r5 = U[i,j  ,k,n]; r6 = U[i,j-1,k,n]; r7 = U[i,j-2,k,n]
+                UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
+            end
+        end  # use_star branch
+
 
     # ==============================
-    # Branch B: Discontinuous region
+    # ...
     # ==============================
     else 
         WENOϵ1 = FT(1.0e-10); WENOϵ2 = FT(1.0e-8)
         tmp1 = one(FT)/FT(12.0); tmp2 = one(FT)/FT(6.0e0)
-        # 平滑因子 ss
+        # 平滑因子 ss ???j 方向计算
         @inbounds ss = FT(2.0)/(S[i, j+1, k] + S[i, j, k])
 
         for n = 1:Ncons
+            # ???j 方向读取模板
             @inbounds V1L = U[i,j-3,k,n]
             @inbounds V2L = U[i,j-2,k,n]
             @inbounds V3L = U[i,j-1,k,n]
@@ -1119,6 +1366,7 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, n
 
             valL = zero(FT); valR = zero(FT)
 
+            # WENO Reconstruction 逻辑???i 方向完全一致，仅输入变量不???
             if ϕy < hybrid_ϕ2 # WENO7
                 q1L = -FT(3.0)*V1L + FT(13.0)*V2L - FT(23.0)*V3L + FT(25.0e0)*V4L; q1R = -FT(3.0)*V1R + FT(13.0)*V2R - FT(23.0)*V3R + FT(25.0e0)*V4R
                 q2L =  one(FT)*V2L -  FT(5.0e0)*V3L + FT(13.0)*V4L +  FT(3.0)*V5L; q2R =  one(FT)*V2R -  FT(5.0e0)*V3R + FT(13.0)*V4R +  FT(3.0)*V5R
@@ -1250,12 +1498,13 @@ end
 function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp,
                               stencil_arr, Δstencil_arr, lin_phi_arr,
                               stencil_R_arr, Δstencil_R_arr,
-                              ch_glm::FT, mode::Int32)
+                              ch_glm::FT, mode::Int32,
+                              star_active, star_L, star_R)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
     
-    # 1. 边界检查
+    # 1. 边界检???
     if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG
         return
     end
@@ -1266,47 +1515,143 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
     # 2. Geometry
     @inbounds nx=nxk[i,j,k+1]; ny=nyk[i,j,k+1]; nz=nzk[i,j,k+1]; Area=Areak[i,j,k+1]
 
-    # 3. 激波传感器
-    @inbounds ϕz = max(ϕ[i, j, k-2], ϕ[i, j, k-1], ϕ[i, j, k], ϕ[i, j+1, k], ϕ[i, j+2, k], ϕ[i, j+3, k])
+    # 3. 激波传感器 (???k 方向)
+    @inbounds ϕz = max(ϕ[i, j, k-2], ϕ[i, j, k-1], ϕ[i, j, k], ϕ[i, j, k+1], ϕ[i, j, k+2], ϕ[i, j, k+3])
 
+    # AC: always use linear reconstruction (branch A)
+    if equation_type == :incompressible_AC || equation_type == :incompressible_PISO
+        ϕz = zero(FT)
+    end
+
+    # ...
     UL_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
     UR_final = MVector{Ncons, FT}(ntuple(_ -> zero(FT), Val(Ncons)))
 
     # ==============================
-    # Branch A: Smooth region
+    # ...
     # ==============================
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
     if ϕz < hybrid_ϕ1
-        α_adapt = min(ϕz / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
-        @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
-        @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
-        @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
-        @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds v1 = U[i,j,k-3,n]; v2 = U[i,j,k-2,n]; v3 = U[i,j,k-1,n]
-            @inbounds v4 = U[i,j,k  ,n]; v5 = U[i,j,k+1,n]; v6 = U[i,j,k+2,n]; v7 = U[i,j,k+3,n]
-            UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
-        end
-        @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
-        @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
-        @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
-        @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
-        for n = 1:Ncons
-            @inbounds r1 = U[i,j,k+4,n]; r2 = U[i,j,k+3,n]; r3 = U[i,j,k+2,n]
-            @inbounds r4 = U[i,j,k+1,n]; r5 = U[i,j,k  ,n]; r6 = U[i,j,k-1,n]; r7 = U[i,j,k-2,n]
-            UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
-        end
+        # Check for bend-adaptive star-stencil
+        @inbounds blend_w = star_active !== nothing ? star_active[j, k] : zero(FT)
+        if use_star == Int32(1)
+            # ═══ 40-point Star-Stencil 3D Reconstruction (ζ-direction) ═══
+            for n = 1:Ncons
+                val_L = zero(FT); val_R = zero(FT)
+                # Main line (ζ): 8 points
+                @inbounds v=U[i,j,k-3,n]; val_L+=star_L[j,k,1]*v; val_R+=star_R[j,k,1]*v
+                @inbounds v=U[i,j,k-2,n]; val_L+=star_L[j,k,2]*v; val_R+=star_R[j,k,2]*v
+                @inbounds v=U[i,j,k-1,n]; val_L+=star_L[j,k,3]*v; val_R+=star_R[j,k,3]*v
+                @inbounds v=U[i,j,k  ,n]; val_L+=star_L[j,k,4]*v; val_R+=star_R[j,k,4]*v
+                @inbounds v=U[i,j,k+1,n]; val_L+=star_L[j,k,5]*v; val_R+=star_R[j,k,5]*v
+                @inbounds v=U[i,j,k+2,n]; val_L+=star_L[j,k,6]*v; val_R+=star_R[j,k,6]*v
+                @inbounds v=U[i,j,k+3,n]; val_L+=star_L[j,k,7]*v; val_R+=star_R[j,k,7]*v
+                @inbounds v=U[i,j,k+4,n]; val_L+=star_L[j,k,8]*v; val_R+=star_R[j,k,8]*v
+                
+                # Transverse ξ @ k0
+                @inbounds v=U[i-3,j,k,n]; val_L+=star_L[j,k,9]*v; val_R+=star_R[j,k,9]*v
+                @inbounds v=U[i-2,j,k,n]; val_L+=star_L[j,k,10]*v; val_R+=star_R[j,k,10]*v
+                @inbounds v=U[i-1,j,k,n]; val_L+=star_L[j,k,11]*v; val_R+=star_R[j,k,11]*v
+                @inbounds v=U[i+1,j,k,n]; val_L+=star_L[j,k,12]*v; val_R+=star_R[j,k,12]*v
+                @inbounds v=U[i+2,j,k,n]; val_L+=star_L[j,k,13]*v; val_R+=star_R[j,k,13]*v
+                @inbounds v=U[i+3,j,k,n]; val_L+=star_L[j,k,14]*v; val_R+=star_R[j,k,14]*v
+                
+                # Transverse η @ k0
+                @inbounds v=U[i,j-3,k,n]; val_L+=star_L[j,k,15]*v; val_R+=star_R[j,k,15]*v
+                @inbounds v=U[i,j-2,k,n]; val_L+=star_L[j,k,16]*v; val_R+=star_R[j,k,16]*v
+                @inbounds v=U[i,j-1,k,n]; val_L+=star_L[j,k,17]*v; val_R+=star_R[j,k,17]*v
+                @inbounds v=U[i,j+1,k,n]; val_L+=star_L[j,k,18]*v; val_R+=star_R[j,k,18]*v
+                @inbounds v=U[i,j+2,k,n]; val_L+=star_L[j,k,19]*v; val_R+=star_R[j,k,19]*v
+                @inbounds v=U[i,j+3,k,n]; val_L+=star_L[j,k,20]*v; val_R+=star_R[j,k,20]*v
+                
+                # Transverse ξ @ k0+1
+                @inbounds v=U[i-3,j,k+1,n]; val_L+=star_L[j,k,21]*v; val_R+=star_R[j,k,21]*v
+                @inbounds v=U[i-2,j,k+1,n]; val_L+=star_L[j,k,22]*v; val_R+=star_R[j,k,22]*v
+                @inbounds v=U[i-1,j,k+1,n]; val_L+=star_L[j,k,23]*v; val_R+=star_R[j,k,23]*v
+                @inbounds v=U[i+1,j,k+1,n]; val_L+=star_L[j,k,24]*v; val_R+=star_R[j,k,24]*v
+                @inbounds v=U[i+2,j,k+1,n]; val_L+=star_L[j,k,25]*v; val_R+=star_R[j,k,25]*v
+                @inbounds v=U[i+3,j,k+1,n]; val_L+=star_L[j,k,26]*v; val_R+=star_R[j,k,26]*v
+                
+                # Transverse η @ k0+1
+                @inbounds v=U[i,j-3,k+1,n]; val_L+=star_L[j,k,27]*v; val_R+=star_R[j,k,27]*v
+                @inbounds v=U[i,j-2,k+1,n]; val_L+=star_L[j,k,28]*v; val_R+=star_R[j,k,28]*v
+                @inbounds v=U[i,j-1,k+1,n]; val_L+=star_L[j,k,29]*v; val_R+=star_R[j,k,29]*v
+                @inbounds v=U[i,j+1,k+1,n]; val_L+=star_L[j,k,30]*v; val_R+=star_R[j,k,30]*v
+                @inbounds v=U[i,j+2,k+1,n]; val_L+=star_L[j,k,31]*v; val_R+=star_R[j,k,31]*v
+                @inbounds v=U[i,j+3,k+1,n]; val_L+=star_L[j,k,32]*v; val_R+=star_R[j,k,32]*v
+                
+                # Diagonal ξ-η corners @k0
+                @inbounds v=U[i-1,j-1,k,n]; val_L+=star_L[j,k,33]*v; val_R+=star_R[j,k,33]*v
+                @inbounds v=U[i-1,j+1,k,n]; val_L+=star_L[j,k,34]*v; val_R+=star_R[j,k,34]*v
+                @inbounds v=U[i+1,j-1,k,n]; val_L+=star_L[j,k,35]*v; val_R+=star_R[j,k,35]*v
+                @inbounds v=U[i+1,j+1,k,n]; val_L+=star_L[j,k,36]*v; val_R+=star_R[j,k,36]*v
+                
+                # Diagonal ξ-η corners @k+1
+                @inbounds v=U[i-1,j-1,k+1,n]; val_L+=star_L[j,k,37]*v; val_R+=star_R[j,k,37]*v
+                @inbounds v=U[i-1,j+1,k+1,n]; val_L+=star_L[j,k,38]*v; val_R+=star_R[j,k,38]*v
+                @inbounds v=U[i+1,j-1,k+1,n]; val_L+=star_L[j,k,39]*v; val_R+=star_R[j,k,39]*v
+                @inbounds v=U[i+1,j+1,k+1,n]; val_L+=star_L[j,k,40]*v; val_R+=star_R[j,k,40]*v
+                
+                # Venkatakrishnan smooth limiter (Scheme D)
+                @inbounds v_min = min(U[i,j,k-1,n], U[i,j,k,n], U[i,j,k+1,n], U[i,j,k+2,n])
+                @inbounds v_max = max(U[i,j,k-1,n], U[i,j,k,n], U[i,j,k+1,n], U[i,j,k+2,n])
+                eps2 = (FT(0.01) * (v_max - v_min))^2 + FT(1e-30)
+                @inbounds fc = U[i,j,k,n]; dL = val_L - fc
+                if dL > FT(1e-30)
+                    dm = v_max - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                elseif dL < FT(-1e-30)
+                    dm = v_min - fc
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dL*dm) / (dm*dm + FT(2)*dL*dL + dm*dL + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UL_final[n] = fc + phi_v * dL
+                @inbounds fcR = U[i,j,k+1,n]; dR = val_R - fcR
+                if dR > FT(1e-30)
+                    dm = v_max - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                elseif dR < FT(-1e-30)
+                    dm = v_min - fcR
+                    phi_v = min(((dm*dm+eps2) + FT(2)*dR*dm) / (dm*dm + FT(2)*dR*dR + dm*dR + eps2), one(FT))
+                else; phi_v = one(FT); end
+                UR_final[n] = fcR + phi_v * dR
+            end
+        else
+            # ═══ Original 1D 7-point reconstruction ═══
+            α_adapt = min(ϕz / hybrid_ϕ1, one(FT)) * (one(FT) - local_lin_ϕ)
+            # Left-state weights
+            @inbounds L1 = stencil_arr[j,k,1] + α_adapt * Δstencil_arr[j,k,1]; @inbounds L2 = stencil_arr[j,k,2] + α_adapt * Δstencil_arr[j,k,2]
+            @inbounds L3 = stencil_arr[j,k,3] + α_adapt * Δstencil_arr[j,k,3]; @inbounds L4 = stencil_arr[j,k,4] + α_adapt * Δstencil_arr[j,k,4]
+            @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
+            @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds v1 = U[i,j,k-3,n]; v2 = U[i,j,k-2,n]; v3 = U[i,j,k-1,n]
+                @inbounds v4 = U[i,j,k  ,n]; v5 = U[i,j,k+1,n]; v6 = U[i,j,k+2,n]; v7 = U[i,j,k+3,n]
+                UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
+            end
+            # Right-state weights (temporal register reuse)
+            @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
+            @inbounds L3 = stencil_R_arr[j,k,3] + α_adapt * Δstencil_R_arr[j,k,3]; @inbounds L4 = stencil_R_arr[j,k,4] + α_adapt * Δstencil_R_arr[j,k,4]
+            @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
+            @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
+            for n = 1:Ncons
+                @inbounds r1 = U[i,j,k+4,n]; r2 = U[i,j,k+3,n]; r3 = U[i,j,k+2,n]
+                @inbounds r4 = U[i,j,k+1,n]; r5 = U[i,j,k  ,n]; r6 = U[i,j,k-1,n]; r7 = U[i,j,k-2,n]
+                UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
+            end
+        end  # use_star branch
+
 
     # ==============================
-    # Branch B: Discontinuous region
+    # ...
     # ==============================
     else 
         WENOϵ1 = FT(1.0e-10); WENOϵ2 = FT(1.0e-8)
         tmp1 = one(FT)/FT(12.0); tmp2 = one(FT)/FT(6.0e0)
-        # 平滑因子 ss
+        # 平滑因子 ss ???k 方向计算
         @inbounds ss = FT(2.0)/(S[i, j, k+1] + S[i, j, k])
 
         for n = 1:Ncons
+            # ???k 方向读取模板
             @inbounds V1L = U[i,j,k-3,n]
             @inbounds V2L = U[i,j,k-2,n]
             @inbounds V3L = U[i,j,k-1,n]
@@ -1363,12 +1708,10 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
                 valR = invsumR*(α1R*q1R+α2R*q2R+α3R*q3R+α4R*q4R) * tmp1
 
             elseif ϕz < hybrid_ϕ3 # WENO5
-                t1 = V2L - FT(2.0)*V3L + V4L; t2 = V2L - FT(4.0)*V3L + FT(3.0)*V4L
-                s1L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
-                t1 = V3L - FT(2.0)*V4L + V5L; t2 = V3L - V5L
-                s2L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
-                t1 = V4L - FT(2.0)*V5L + V6L; t2 = FT(3.0)*V4L - FT(4.0)*V5L + V6L
-                s3L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                # Left Side
+                t1 = V2L - FT(2.0)*V3L + V4L; t2 = V2L - FT(4.0)*V3L + FT(3.0)*V4L; s1L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                t1 = V3L - FT(2.0)*V4L + V5L; t2 = V3L - V5L; s2L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                t1 = V4L - FT(2.0)*V5L + V6L; t2 = FT(3.0)*V4L - FT(4.0)*V5L + V6L; s3L = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
 
                 t_d1L = WENOϵ2 + s1L*ss; t_d2L = WENOϵ2 + s2L*ss; t_d3L = WENOϵ2 + s3L*ss
                 @static if weno_z
@@ -1383,18 +1726,15 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
                 end
                 invsumL = one(FT)/(α1L+α2L+α3L)
 
-                v1 = FT(2.0)*V2L - FT(7.0e0)*V3L + FT(11.0)*V4L
-                v2 = -one(FT)*V3L + FT(5.0e0)*V4L + FT(2.0)*V5L
-                v3 = FT(2.0)*V4L + FT(5.0e0)*V5L - one(FT)*V6L
-                
-                valL = invsumL * (α1L*v1 + α2L*v2 + α3L*v3) * tmp2
+                v1L = FT(2.0)*V2L - FT(7.0e0)*V3L + FT(11.0)*V4L
+                v2L = -one(FT)*V3L + FT(5.0e0)*V4L + FT(2.0)*V5L
+                v3L = FT(2.0)*V4L + FT(5.0e0)*V5L - one(FT)*V6L
+                valL = invsumL * (α1L*v1L + α2L*v2L + α3L*v3L) * tmp2
 
-                t1 = V2R - FT(2.0)*V3R + V4R; t2 = V2R - FT(4.0)*V3R + FT(3.0)*V4R
-                s1R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
-                t1 = V3R - FT(2.0)*V4R + V5R; t2 = V3R - V5R
-                s2R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
-                t1 = V4R - FT(2.0)*V5R + V6R; t2 = FT(3.0)*V4R - FT(4.0)*V5R + V6R
-                s3R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                # Right Side
+                t1 = V2R - FT(2.0)*V3R + V4R; t2 = V2R - FT(4.0)*V3R + FT(3.0)*V4R; s1R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                t1 = V3R - FT(2.0)*V4R + V5R; t2 = V3R - V5R; s2R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
+                t1 = V4R - FT(2.0)*V5R + V6R; t2 = FT(3.0)*V4R - FT(4.0)*V5R + V6R; s3R = FT(13.0) * t1*t1 + FT(3.0) * t2*t2
 
                 t_d1R = WENOϵ2 + s1R*ss; t_d2R = WENOϵ2 + s2R*ss; t_d3R = WENOϵ2 + s3R*ss
                 @static if weno_z
@@ -1409,11 +1749,10 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
                 end
                 invsumR = one(FT)/(α1R+α2R+α3R)
 
-                v1 = FT(2.0)*V2R - FT(7.0e0)*V3R + FT(11.0)*V4R
-                v2 = -one(FT)*V3R + FT(5.0e0)*V4R + FT(2.0)*V5R
-                v3 = FT(2.0)*V4R + FT(5.0e0)*V5R - one(FT)*V6R
-                
-                valR = invsumR * (α1R*v1 + α2R*v2 + α3R*v3) * tmp2
+                v1R = FT(2.0)*V2R - FT(7.0e0)*V3R + FT(11.0)*V4R
+                v2R = -one(FT)*V3R + FT(5.0e0)*V4R + FT(2.0)*V5R
+                v3R = FT(2.0)*V4R + FT(5.0e0)*V5R - one(FT)*V6R
+                valR = invsumR * (α1R*v1R + α2R*v2R + α3R*v3R) * tmp2
 
             else # Minmod
                 valL = V4L + FT(0.5)*minmod(V4L - V3L, V5L - V4L)

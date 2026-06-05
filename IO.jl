@@ -153,7 +153,7 @@ function averageFile(tt, blocks, world_rank, Block_Nprocs, block_comms)
             if hasfield(typeof(b), :Q_avg) && b.Q_avg !== nothing
                 Q_h = Array(b.Q_avg)
                 # Apply inverse density weighting right before writing output if Favre averaged
-                if isdefined(Main, :avg_density_weighted) && Main.avg_density_weighted
+                if isdefined(Main, :avg_density_weighted) && avg_density_weighted
                     for n in 2:4
                         @views Q_h[:,:,:,n] ./= Q_h[:,:,:,1]
                     end

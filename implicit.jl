@@ -45,7 +45,7 @@ function compute_spectral_radius_i!(σ_i, Q, Areai, nxi, nyi, nzi, nxp, nyp, nzp
         # Contravariant velocity
         V_n = u_f * fnx + v_f * fny + w_f * fnz
 
-        # Sound speed: β_AC for AC, √(γRgT) for compressible
+        # Sound speed: √(γRgT) for compressible
         TL = Q[ig, jg, kg, 6]; TR = Q[ig+1, jg, kg, 6]
         T_f = FT(0.5) * (TL + TR)
         c = sqrt(γ * Rg * max(T_f, FT(1.0e-10)))
@@ -510,17 +510,16 @@ function implicit_step!(block::Block, dt_val::FT,
 
     # 3b. Volume forces (reuse existing logic)
     if flow_forcing
-            ramp_val = tanh(FT(activeTime) / FT(0.05))
-            @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
-                shared_dU_forced, block.Q, block.x, block.y, block.z,
-                nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, ramp_val)
-            if forcing_mode == 1
-                Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
-            elseif forcing_mode == 2
-                Apply_const_massflux_force!(shared_dU_forced, block.Q, cmf_f1_val, nxp, nyp, nzp)
-            end
-            Apply_trip_force!(shared_dU_forced, block.Q, block.x, block.y, block.z,
-                              nxp, nyp, nzp, activeTime)
+        @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
+            shared_dU_forced, block.Q, block.x, block.y, block.z,
+            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
+        if forcing_mode == 1
+            Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
+        elseif forcing_mode == 2
+            Apply_const_massflux_force!(shared_dU_forced, block.Q, cmf_f1_val, nxp, nyp, nzp)
+        end
+        Apply_trip_force!(shared_dU_forced, block.Q, block.x, block.y, block.z,
+                          nxp, nyp, nzp, activeTime)
     end
     if test_case == "HIT"
         Apply_HIT_forcing!(shared_dU_forced, block.Q, hit_forcing_A,
@@ -688,8 +687,6 @@ function compute_lusgs_diagonal_bdf2!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
 
 
         # BDF2 diagonal: D = 1.5V/dt + w_LU·Σσ (consistent with add_bdf2_source!)
-        # For AC: keeping temporal term ensures diagonal-source consistency
-        # (mismatch causes instability in either direction)
         w_LU = isdefined(@__MODULE__, :implicit_w_LU) ? implicit_w_LU : FT(1.5e0)
         D = FT(1.5e0) * cell_vol / dt + w_LU * σ_sum  # [m³/s]
         D_inv[ig, jg, kg] = one(FT) / (D + FT(1.0e-30))
@@ -738,7 +735,8 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
                          threads_recon_i, threads_recon_j, threads_recon_k,
                          threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
                          forcex, flowx, cmf_f1_val, ac_f1_val,
-                         hit_u_mean, hit_v_mean, hit_w_mean, activeTime)
+                         hit_u_mean, hit_v_mean, hit_w_mean, activeTime;
+                         sync_ghost_fn=nothing)  # ghost exchange callback for GMRES matvec
     nxp = block.Nx; nyp = block.Ny; nzp = block.Nz
     Nx_tot = nxp + 2 * NG; Ny_tot = nyp + 2 * NG; Nz_tot = nzp + 2 * NG
 
@@ -755,10 +753,9 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
 
     # Volume forces
     if flow_forcing
-        ramp_val = tanh(FT(activeTime) / FT(0.05))
         @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
             shared_dU_forced, block.Q, block.x, block.y, block.z,
-            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, ramp_val)
+            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
         if forcing_mode == 1
             Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
         elseif forcing_mode == 2
@@ -780,6 +777,12 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
 
 
 
+    # Save spatial RHS (before BDF2 source) for GMRES matvec if using GMRES
+    _use_gmres_solver = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
+    if _use_gmres_solver && block.R_base !== nothing
+        copyto!(block.R_base, block.dU_rhs)
+    end
+
     # Add BDF2 temporal source terms to dU_rhs
     @gpu_launch threads=nthreads blocks=nb_real add_bdf2_source!(
         block.dU_rhs, block.U, block.Un, block.U_nm1, block.Vol, dt_val, nxp, nyp, nzp)
@@ -787,9 +790,25 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
     # ── Solve linear system ──
     fill!(block.ΔU, zero(FT))
 
-    # LU-SGS sweep (existing path)
-    lusgs_debug_jacobi = isdefined(@__MODULE__, :implicit_lusgs_debug_jacobi) ? implicit_lusgs_debug_jacobi : false
-    if lusgs_debug_jacobi
+    if _use_gmres_solver && block.V_krylov !== nothing
+        # GMRES(m) with Block-Jacobi preconditioning
+        _gm = isdefined(@__MODULE__, :gmres_m) ? gmres_m : 10
+        _gr = isdefined(@__MODULE__, :gmres_max_restarts) ? gmres_max_restarts : 2
+        gmres_solve!(block, dt_val, FT(1.5e0),  # alpha_bdf = 1.5 for BDF2
+                     _gm, _gr, Float64(dual_time_tol),
+                     block.V_krylov, block.R_base,
+                     shared_Fx, shared_Fy, shared_Fz,
+                     shared_Fvx, shared_Fvy, shared_Fvz,
+                     shared_dU_forced, world_rank, tt,
+                     threads_recon_i, threads_recon_j, threads_recon_k,
+                     threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
+                     forcex, flowx, cmf_f1_val, ac_f1_val,
+                     hit_u_mean, hit_v_mean, hit_w_mean, activeTime,
+                     sync_ghost_fn !== nothing ? sync_ghost_fn : () -> nothing)
+    else
+        # LU-SGS sweep (existing path)
+        lusgs_debug_jacobi = isdefined(@__MODULE__, :implicit_lusgs_debug_jacobi) ? implicit_lusgs_debug_jacobi : false
+        if lusgs_debug_jacobi
             @gpu_launch threads=nthreads blocks=nb_real jacobi_update!(
                 block.ΔU, block.dU_rhs, block.D_inv, nxp, nyp, nzp)
         else
@@ -819,6 +838,7 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
                 end
             end
         end
+    end
 
     # Update: U^{n+1,m+1} = U^{n+1,m} + δU
     @gpu_launch threads=threads_light blocks=nb_light implicit_update!(
