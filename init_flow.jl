@@ -341,17 +341,18 @@ function init_tg5_debug(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
     zc = FT(0.5) * (z[i, j, k] + z[i, j, k+1])
     xc = FT(0.5) * (x[i, j, k] + x[i+1, j, k])
     
-    # 3D Gaussian Acoustic Pulse — centered at (2.5, 0, 0) with streamwise drift
-    p0 = FT(10.0); rho0 = one(FT)
-    u = FT(0.5); v = zero(FT); w = zero(FT)
-    r2 = (xc - FT(2.5))^2 + yc^2 + zc^2
-    pulse = FT(0.1) * exp(-FT(30.0) * r2)
+    # Gaussian Acoustic Pulse Initialization
+    V0 = one(FT); p0 = FT(10.0); rho0 = one(FT)
+    u = FT(0.1); v = FT(0.1); w = zero(FT)
+    r2 = (xc - FT(1.5))^2 + (yc - FT(1.5))^2 + (zc - FT(1.5))^2
+    pulse = FT(0.1) * exp(-FT(10.0) * r2)
     p = p0 + pulse
     rho = rho0 + pulse
     
     @inbounds Q[i, j, k, 1] = rho; Q[i, j, k, 2] = u; Q[i, j, k, 3] = v; Q[i, j, k, 4] = w; Q[i, j, k, 5] = p; Q[i, j, k, 6] = p/(rho*Rg)
     return
 end
+
 
 
 # ═══════════════════════════════════════════════════════════════════════

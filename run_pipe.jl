@@ -11,10 +11,6 @@ const debug_sync::Bool = true
 const profiling::Bool = false
 const gpu_aware_mpi::Bool = false
 
-# ─── CEBL Settings ───
-const cebl_forcing::Bool = false
-const cebl_forcing_type::Symbol = :deschamps
-
 
 const flow_forcing::Bool = true
 const forcing_mode::Int64 = 3  # 1=proportional (original), 2=constant mass flux (Deschamps, no mass source)
@@ -36,11 +32,12 @@ const hit_forcing_A::FT = FT(0.0)
 
 # GPU backend — change to `using AMDGPU` for AMD DCU or `using CUDA` for NVIDIA or comment both and use CPU
 # using CUDA
-# using AMDGPU
+using AMDGPU
 
 # ─── Physics / Equation System ───
 # Set equation_type BEFORE including physics.jl:
 #   :compressible         → 5 conserved vars (ρ, ρu, ρv, ρw, ρE)
+#   :incompressible_AC    → 4 conserved vars (p, u, v, w)
 #   :MHD                  → 9 conserved vars (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ)
 const equation_type = :compressible
 include("physics.jl")
@@ -171,6 +168,7 @@ const sample_index::SVector{3, Int64} = [-1, -1, -1]
 const filtering::Bool = true            # Enable explicit spatial filter for anti-aliasing
 const filtering_nonlinear::Bool = false
 const filtering_interval::Int64 = 10     # Apply every 10 steps (more aggressive damping for L/R asymmetric stencils)
+const intf_filter_interval::Int64 = 1   # Interface 2Δx filter applied every 1 step
 const filtering_rth::FT = FT(1e-5)
 const filtering_s0::FT = FT(0.1e0)    # Filter strength σ: 0.02=conservative start, increase if needed
 

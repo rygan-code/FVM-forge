@@ -8,7 +8,7 @@ function c2Prim(U, Q, nxp, nyp, nzp)
         return
     end
 
-
+    
 
     # MHD mode: U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ) → Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ)
     if equation_type == :MHD
@@ -69,7 +69,7 @@ function c2Prim_global(U, Q, nxp, nyp, nzp)
         return
     end
 
-
+    
 
     # MHD mode
     if equation_type == :MHD
@@ -129,7 +129,7 @@ function prim2c(U, Q, nxp, nyp, nzp)
         return
     end
 
-
+    
 
     # MHD mode: Q = (ρ, u, v, w, p, T, Bx, By, Bz, ψ) → U = (ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ)
     if equation_type == :MHD
@@ -501,7 +501,7 @@ function positivity_clipping(Q, U, nxp, nyp, nzp)
         return
     end
 
-
+    
 
     # MHD mode: clip ρ and p, leave B and ψ unconstrained
     if equation_type == :MHD
@@ -576,7 +576,7 @@ function linComb_clip_prim(U, Un, Q, NV, a::FT, b::FT, nxp, nyp, nzp)
         @inbounds U[i, j, k, n] = Un[i, j, k, n] + a * (U[i, j, k, n] - Un[i, j, k, n])
     end
 
-    # Step 2: Conservative -> Primitive
+    
 
     # MHD mode: linComb + c2Prim + clipping
     if equation_type == :MHD
@@ -651,7 +651,7 @@ function c2Prim_ghost(U, Q, nxp, nyp, nzp)
         return
     end
 
-
+    
 
     # MHD mode
     if equation_type == :MHD

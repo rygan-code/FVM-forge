@@ -387,6 +387,11 @@ function auto_tune_kernel(name::String, kernel_func, args...;
                     optimal = optimal ÷ 2
                     test_3d = find_best_3d_block(optimal, nxp, nyp, nzp)
                 end
+                # Safety: high-reg kernels may have stricter actual limits than queried
+                if regs >= 96 && prod(test_3d) > 256
+                    optimal = 256
+                    test_3d = find_best_3d_block(optimal, nxp, nyp, nzp)
+                end
                 occ = compute_occupancy(regs, prod(test_3d))
                 
                 occ_gain = occ - base_occ

@@ -141,17 +141,157 @@ function apply_interface_taper!(Lin_j, ΔLin_j, phi_j,
     klo_inter = (bc_klo == Int32(0))
     khi_inter = (bc_khi == Int32(0))
 
+    # Order-reduction stencils for layers 0, 1, 2 near interblock faces
+    order_central = (_CD2_C, _CD4_C, _CD6_C)
+    order_delta   = (_Δ_CD2, _Δ_CD4, _Δ_CD6)
+    order_phi     = (0.50,   0.50,   0.40)
+    order_names   = ("2nd",  "4th",  "6th")
+    n_replace = length(order_central)   # 3 layers get full stencil replacement
+    n_boost   = length(_INTERFACE_PHI)  # 8 layers total
+
+    # ─── η direction (dim-1 index) ───
     if jlo_inter || jhi_inter
-        _boost_phi_at_interface!(Lin_j, ΔLin_j, phi_j, nyp, NG_val, jlo_inter, jhi_inter)
+        FTl = eltype(phi_j)
+        N2  = size(phi_j, 2)
+
+        if jlo_inter
+            # Layers 0..2: full stencil replacement
+            for d in 0:(n_replace - 1)
+                idx = NG_val + d
+                if idx < 1 || idx > size(phi_j, 1); continue; end
+                phi_val = FTl(order_phi[d+1])
+                for i2 in 1:N2
+                    for s in 1:7
+                        Lin_j[idx, i2, s]  = FTl(order_central[d+1][s]) + phi_val * FTl(order_delta[d+1][s])
+                        ΔLin_j[idx, i2, s] = FTl(order_delta[d+1][s])
+                    end
+                    phi_j[idx, i2] = phi_val
+                end
+            end
+            # Layers 3..n_boost-1: phi boost only (preserve existing stencil width)
+            for d in n_replace:(n_boost - 1)
+                idx = NG_val + d
+                if idx < 1 || idx > size(phi_j, 1); continue; end
+                boost_val = FTl(_INTERFACE_PHI[d+1])
+                for i2 in 1:N2
+                    if boost_val > phi_j[idx, i2]
+                        Δϕ = boost_val - phi_j[idx, i2]
+                        for s in 1:7
+                            Lin_j[idx, i2, s] += FTl(Δϕ) * ΔLin_j[idx, i2, s]
+                        end
+                        phi_j[idx, i2] = boost_val
+                    end
+                end
+            end
+        end
+
+        if jhi_inter
+            # Layers 0..2: full stencil replacement
+            for d in 0:(n_replace - 1)
+                idx = nyp + NG_val - d
+                if idx < 1 || idx > size(phi_j, 1); continue; end
+                phi_val = FTl(order_phi[d+1])
+                for i2 in 1:N2
+                    for s in 1:7
+                        Lin_j[idx, i2, s]  = FTl(order_central[d+1][s]) + phi_val * FTl(order_delta[d+1][s])
+                        ΔLin_j[idx, i2, s] = FTl(order_delta[d+1][s])
+                    end
+                    phi_j[idx, i2] = phi_val
+                end
+            end
+            # Layers 3..n_boost-1: phi boost only
+            for d in n_replace:(n_boost - 1)
+                idx = nyp + NG_val - d
+                if idx < 1 || idx > size(phi_j, 1); continue; end
+                boost_val = FTl(_INTERFACE_PHI[d+1])
+                for i2 in 1:N2
+                    if boost_val > phi_j[idx, i2]
+                        Δϕ = boost_val - phi_j[idx, i2]
+                        for s in 1:7
+                            Lin_j[idx, i2, s] += FTl(Δϕ) * ΔLin_j[idx, i2, s]
+                        end
+                        phi_j[idx, i2] = boost_val
+                    end
+                end
+            end
+        end
+
         if verbose
-            println("    Block $bid η-interface: lo=$(jlo_inter) hi=$(jhi_inter) (phi boost, order preserved)")
+            println("    Block $bid η-interface: lo=$(jlo_inter) hi=$(jhi_inter) " *
+                    "(layers 0-2: order reduction 2nd→4th→6th, layers 3-7: phi boost)")
         end
     end
 
+    # ─── ζ direction (dim-2 index) ───
     if klo_inter || khi_inter
-        _boost_phi_at_interface_dim2!(Lin_k, ΔLin_k, phi_k, nzp, NG_val, klo_inter, khi_inter, _INTERFACE_PHI_K)
+        FTl = eltype(phi_k)
+        N1  = size(phi_k, 1)
+
+        if klo_inter
+            # Layers 0..2: full stencil replacement
+            for d in 0:(n_replace - 1)
+                idx = NG_val + d
+                if idx < 1 || idx > size(phi_k, 2); continue; end
+                phi_val = FTl(order_phi[d+1])
+                for i1 in 1:N1
+                    for s in 1:7
+                        Lin_k[i1, idx, s]  = FTl(order_central[d+1][s]) + phi_val * FTl(order_delta[d+1][s])
+                        ΔLin_k[i1, idx, s] = FTl(order_delta[d+1][s])
+                    end
+                    phi_k[i1, idx] = phi_val
+                end
+            end
+            # Layers 3..n_boost-1: phi boost only
+            for d in n_replace:(n_boost - 1)
+                idx = NG_val + d
+                if idx < 1 || idx > size(phi_k, 2); continue; end
+                boost_val = FTl(_INTERFACE_PHI_K[d+1])
+                for i1 in 1:N1
+                    if boost_val > phi_k[i1, idx]
+                        Δϕ = boost_val - phi_k[i1, idx]
+                        for s in 1:7
+                            Lin_k[i1, idx, s] += FTl(Δϕ) * ΔLin_k[i1, idx, s]
+                        end
+                        phi_k[i1, idx] = boost_val
+                    end
+                end
+            end
+        end
+
+        if khi_inter
+            # Layers 0..2: full stencil replacement
+            for d in 0:(n_replace - 1)
+                idx = nzp + NG_val - d
+                if idx < 1 || idx > size(phi_k, 2); continue; end
+                phi_val = FTl(order_phi[d+1])
+                for i1 in 1:N1
+                    for s in 1:7
+                        Lin_k[i1, idx, s]  = FTl(order_central[d+1][s]) + phi_val * FTl(order_delta[d+1][s])
+                        ΔLin_k[i1, idx, s] = FTl(order_delta[d+1][s])
+                    end
+                    phi_k[i1, idx] = phi_val
+                end
+            end
+            # Layers 3..n_boost-1: phi boost only
+            for d in n_replace:(n_boost - 1)
+                idx = nzp + NG_val - d
+                if idx < 1 || idx > size(phi_k, 2); continue; end
+                boost_val = FTl(_INTERFACE_PHI_K[d+1])
+                for i1 in 1:N1
+                    if boost_val > phi_k[i1, idx]
+                        Δϕ = boost_val - phi_k[i1, idx]
+                        for s in 1:7
+                            Lin_k[i1, idx, s] += FTl(Δϕ) * ΔLin_k[i1, idx, s]
+                        end
+                        phi_k[i1, idx] = boost_val
+                    end
+                end
+            end
+        end
+
         if verbose
-            println("    Block $bid ζ-interface: lo=$(klo_inter) hi=$(khi_inter) (phi boost, order preserved)")
+            println("    Block $bid ζ-interface: lo=$(klo_inter) hi=$(khi_inter) " *
+                    "(layers 0-2: order reduction 2nd→4th→6th, layers 3-7: phi boost)")
         end
     end
 end
@@ -342,14 +482,12 @@ include("Riemann_Solver.jl")
 include("Reconstruct.jl")
 include("volume_force.jl")
 
+
 include("ghost_coords.jl")
 include("auto_tune.jl")
 include("filter_interface.jl")
 include("diag_checkerboard.jl")
-include("debug/fullfield_diagnostic.jl")
 include("fringe.jl")
-include("geometry_correction.jl")
-include("interface_flux_sync.jl")
 
 # ── GLM cleaning speed for MHD (updated each time step) ──
 # Auto-computed from max fast magnetosonic speed
@@ -543,6 +681,9 @@ mutable struct Block
     σ_k::Union{GPUArray{FT, 3}, Nothing}
     # ─── BDF2 dual-time stepping (nothing when dual_time==false) ───
     U_nm1::Union{GPUArray{FT, 4}, Nothing}   # U^{n-1} for BDF2
+    # ─── GMRES Krylov buffers (nothing when not using GMRES) ───
+    V_krylov::Union{GPUArray{FT, 5}, Nothing}  # (Nx_tot, Ny_tot, Nz_tot, Ncons, m+1)
+    R_base::Union{GPUArray{FT, 4}, Nothing}    # Base RHS for matvec (nxp, nyp, nzp, Ncons)
 
     # ─── Spectral warmup: per-direction-layer stencil coefficients ───
     stencil_i::GPUArray{FT, 2}    # (Nx+2NG, 7)  LEFT state
@@ -568,41 +709,10 @@ mutable struct Block
     # ─── Fringe region (differential rotation, nothing when not active) ───
     fringe_lambda::Union{GPUArray{FT, 3}, Nothing}      # (Nx_tot, Ny_tot, Nz_tot)
     U_target_fringe::Union{GPUArray{FT, 4}, Nothing}    # (Nx_tot, Ny_tot, Nz_tot, Ncons)
-    D_i::GPUArray{FT, 3}
-    D_j::GPUArray{FT, 3}
-    D_k::GPUArray{FT, 3}
-    U_tmp::GPUArray{FT, 4}
-    # ─── Interface flux sync buffers (nothing when face is not interblock) ───
-    # my_face_val_*:   this block's contribution (UL for hi-face, UR for lo-face)
-    # peer_face_val_*: neighbor's contribution (received via MPI)
-    my_face_val_ilo::Union{GPUArray{FT, 3}, Nothing}     # ξ-lo: (Ny, Nz, Ncons)
-    peer_face_val_ilo::Union{GPUArray{FT, 3}, Nothing}
-    my_face_val_ihi::Union{GPUArray{FT, 3}, Nothing}     # ξ-hi: (Ny, Nz, Ncons)
-    peer_face_val_ihi::Union{GPUArray{FT, 3}, Nothing}
-    my_face_val_jlo::Union{GPUArray{FT, 3}, Nothing}     # η-lo: (Nx, Nz, Ncons)
-    peer_face_val_jlo::Union{GPUArray{FT, 3}, Nothing}
-    my_face_val_jhi::Union{GPUArray{FT, 3}, Nothing}     # η-hi: (Nx, Nz, Ncons)
-    peer_face_val_jhi::Union{GPUArray{FT, 3}, Nothing}
-    my_face_val_klo::Union{GPUArray{FT, 3}, Nothing}     # ζ-lo: (Nx, Ny, Ncons)
-    peer_face_val_klo::Union{GPUArray{FT, 3}, Nothing}
-    my_face_val_khi::Union{GPUArray{FT, 3}, Nothing}     # ζ-hi: (Nx, Ny, Ncons)
-    peer_face_val_khi::Union{GPUArray{FT, 3}, Nothing}
-    # Host staging for MPI
-    my_face_h_ilo::Union{Array{FT, 3}, Nothing}
-    peer_face_h_ilo::Union{Array{FT, 3}, Nothing}
-    my_face_h_ihi::Union{Array{FT, 3}, Nothing}
-    peer_face_h_ihi::Union{Array{FT, 3}, Nothing}
-    my_face_h_jlo::Union{Array{FT, 3}, Nothing}
-    peer_face_h_jlo::Union{Array{FT, 3}, Nothing}
-    my_face_h_jhi::Union{Array{FT, 3}, Nothing}
-    peer_face_h_jhi::Union{Array{FT, 3}, Nothing}
-    my_face_h_klo::Union{Array{FT, 3}, Nothing}
-    peer_face_h_klo::Union{Array{FT, 3}, Nothing}
-    my_face_h_khi::Union{Array{FT, 3}, Nothing}
-    peer_face_h_khi::Union{Array{FT, 3}, Nothing}
 end
 
 include("implicit.jl")
+include("gmres.jl")
 
 function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                     face_bc, connectivity)
@@ -696,6 +806,7 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     @check_nan(U, "U after prim2c (initial)", bid, world_rank, 0)
 
 
+
     LTS_dt = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
     # Un used for RK time stepping (Ncons components) AND edge ghost backup (Nprim components)
     # Allocate with Nprim (→Ncons) so it can serve both purposes
@@ -729,11 +840,10 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     
     nb = (cld(Nx_tot, nthreads[1]), cld(Ny_tot, nthreads[2]), cld(Nz_tot, nthreads[3]))
     if isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled
-        x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : zero(FT)
-        x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : FT(1.0e10)
-        @gpu_launch threads=nthreads blocks=nb Assign_rotation_var_threestage(
+        # Non-uniform rotation: Ω(x) linearly varies in physical zone, smooth return in fringe
+        @gpu_launch threads=nthreads blocks=nb Assign_rotation_var_nonuniform(
             Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp,
-            FT(Omega_x_min), FT(Omega_x_max), x_rot_start_val, x_rot_end_val)
+            FT(Omega_x_min), FT(Omega_x_max), FT(L_phys), FT(L_total), FT(fringe_rise_fraction))
     else
         x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : zero(FT)
         x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : FT(1.0e10)
@@ -749,45 +859,38 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
             FT(L_phys), FT(L_total), FT(fringe_lambda_max), FT(fringe_rise_fraction))
         # U_target: load precursor mean profile or initialize to zero
         U_target_cpu = zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
-        if isdefined(@__MODULE__, :precursor_mean_path)
-            path_val = getfield(@__MODULE__, :precursor_mean_path)
-            if isfile(path_val)
-                # Load (Ny_block, Nz_block, Ncons) cross-section and tile along x
-                h5open(path_val, "r") do fid
-                    grp_name = "b$(bid)"
-                    if haskey(fid, grp_name)
-                        U_cross = FT.(read(fid["$(grp_name)/U_mean"]))  # (Ny_block, Nz_block, Ncons)
-                        # Fill interior cells: tile the cross-section along x
-                        for n in 1:Ncons, k in 1:nzp, j in 1:nyp
-                            jg = j + NG; kg = k + NG
-                            # Map local (j,k) to global block (j,k) for precursor lookup
-                            j_glob = j + oy  # oy = offset in block
-                            k_glob = k + oz
-                            if j_glob >= 1 && j_glob <= size(U_cross, 1) &&
-                               k_glob >= 1 && k_glob <= size(U_cross, 2)
-                                val = U_cross[j_glob, k_glob, n]
-                                for i in 1:nxp
-                                    U_target_cpu[i + NG, jg, kg, n] = val
-                                end
+        if isdefined(@__MODULE__, :precursor_mean_path) && isfile(precursor_mean_path)
+            # Load (Ny_block, Nz_block, Ncons) cross-section and tile along x
+            h5open(precursor_mean_path, "r") do fid
+                grp_name = "b$(bid)"
+                if haskey(fid, grp_name)
+                    U_cross = FT.(read(fid["$(grp_name)/U_mean"]))  # (Ny_block, Nz_block, Ncons)
+                    # Fill interior cells: tile the cross-section along x
+                    for n in 1:Ncons, k in 1:nzp, j in 1:nyp
+                        jg = j + NG; kg = k + NG
+                        # Map local (j,k) to global block (j,k) for precursor lookup
+                        j_glob = j + oy  # oy = offset in block
+                        k_glob = k + oz
+                        if j_glob >= 1 && j_glob <= size(U_cross, 1) &&
+                           k_glob >= 1 && k_glob <= size(U_cross, 2)
+                            val = U_cross[j_glob, k_glob, n]
+                            for i in 1:nxp
+                                U_target_cpu[i + NG, jg, kg, n] = val
                             end
                         end
-                        if world_rank == 0
-                            println("  Fringe U_target loaded from: $(path_val)")
-                        end
-                    else
-                        if world_rank == 0
-                            @warn "Block $grp_name not found in $(path_val), U_target = 0"
-                        end
                     end
-                end
-            else
-                if world_rank == 0
-                    @warn "Precursor file specified but not found: $(path_val), U_target = 0"
+                    if world_rank == 0
+                        println("  Fringe U_target loaded from: $(precursor_mean_path)")
+                    end
+                else
+                    if world_rank == 0
+                        @warn "Block $grp_name not found in $(precursor_mean_path), U_target = 0"
+                    end
                 end
             end
         else
             if world_rank == 0
-                @warn "Precursor file not specified or found, U_target = 0"
+                @warn "Precursor file not found: $(precursor_mean_path), U_target = 0"
             end
         end
         U_target_arr = GPUArray(U_target_cpu)
@@ -806,6 +909,16 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
         imp_σ_k    = gpu_zeros(FT, nxp, nyp, nzp+1)
         # BDF2 dual-time stepping: store U^{n-1}
         imp_U_nm1 = dual_time ? gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons) : nothing
+        # GMRES Krylov buffers
+        _use_gmres = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
+        if _use_gmres
+            _gmres_m = isdefined(@__MODULE__, :gmres_m) ? gmres_m : 10
+            imp_V_krylov = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons, _gmres_m + 1)
+            imp_R_base = gpu_zeros(FT, nxp, nyp, nzp, Ncons)
+        else
+            imp_V_krylov = nothing
+            imp_R_base = nothing
+        end
         if rx == 0 && ry == 0 && rz == 0
             imp_mem_mb = (prod((nxp, nyp, nzp, Ncons)) + prod((Nx_tot, Ny_tot, Nz_tot, Ncons)) +
                           prod((Nx_tot, Ny_tot, Nz_tot)) +
@@ -813,12 +926,20 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
             if dual_time
                 imp_mem_mb += prod((Nx_tot, Ny_tot, Nz_tot, Ncons)) * 4 / 1024^2
             end
-            println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB)$(dual_time ? " [BDF2]" : "")")
+            if _use_gmres
+                gmres_mem = prod((Nx_tot, Ny_tot, Nz_tot, Ncons, _gmres_m + 1)) * 4 / 1024^2
+                gmres_mem += prod((nxp, nyp, nzp, Ncons)) * 4 / 1024^2
+                imp_mem_mb += gmres_mem
+                println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB) [BDF2+GMRES($(_gmres_m))]")
+            else
+                println("  > Block $bid: Implicit buffers allocated (~$(round(imp_mem_mb, digits=1)) MB)$(dual_time ? " [BDF2]" : "")")
+            end
         end
     else
         imp_dU_rhs = nothing; imp_ΔU = nothing; imp_D_inv = nothing
         imp_σ_i = nothing; imp_σ_j = nothing; imp_σ_k = nothing
         imp_U_nm1 = nothing
+        imp_V_krylov = nothing; imp_R_base = nothing
     end
 
     # ─── Initialize stencil arrays with compile-time constants (default) ───
@@ -850,19 +971,6 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     stencil_R_j = GPUArray(_Lin_j); Δstencil_R_j = GPUArray(_ΔLin_j)
     stencil_R_k = GPUArray(_Lin_k); Δstencil_R_k = GPUArray(_ΔLin_k)
     filter_σ_init = (FT(filtering_s0), FT(filtering_s0), FT(filtering_s0))
-    # ─── Compute geometric jump correction coefficients ───
-    D_i_h, D_j_h, D_k_h = compute_geometric_jump_coefficients(x_full, y_full, z_full, bid, nxp, nyp, nzp, NG, face_bc, connectivity)
-    max_di = maximum(abs, D_i_h)
-    max_dj = maximum(abs, D_j_h)
-    max_dk = maximum(abs, D_k_h)
-    if max_di > 1e-12 || max_dj > 1e-12 || max_dk > 1e-12
-        println("  > Block $bid: max(D_i)=$(max_di), max(D_j)=$(max_dj), max(D_k)=$(max_dk)")
-    end
-    D_i = GPUArray(FT.(D_i_h))
-    D_j = GPUArray(FT.(D_j_h))
-    D_k = GPUArray(FT.(D_k_h))
-    U_tmp = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
-
     is_inter = (
         get(face_bc, (bid, 1), -1) == 0,
         get(face_bc, (bid, 2), -1) == 0,
@@ -871,44 +979,13 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
         get(face_bc, (bid, 5), -1) == 0,
         get(face_bc, (bid, 6), -1) == 0
     )
-    # ─── Interface flux sync buffers ───
-    _alloc_intf_gpu(cond, dims...) = cond ? gpu_zeros(FT, dims...) : nothing
-    _alloc_intf_h(cond, dims...)   = cond ? zeros(FT, dims...)     : nothing
-    ifs_ilo = is_inter[1]; ifs_ihi = is_inter[2]
-    ifs_jlo = is_inter[3]; ifs_jhi = is_inter[4]
-    ifs_klo = is_inter[5]; ifs_khi = is_inter[6]
-
-    my_fv_ilo   = _alloc_intf_gpu(ifs_ilo, nyp, nzp, Ncons)
-    peer_fv_ilo = _alloc_intf_gpu(ifs_ilo, nyp, nzp, Ncons)
-    my_fv_ihi   = _alloc_intf_gpu(ifs_ihi, nyp, nzp, Ncons)
-    peer_fv_ihi = _alloc_intf_gpu(ifs_ihi, nyp, nzp, Ncons)
-    my_fv_jlo   = _alloc_intf_gpu(ifs_jlo, nxp, nzp, Ncons)
-    peer_fv_jlo = _alloc_intf_gpu(ifs_jlo, nxp, nzp, Ncons)
-    my_fv_jhi   = _alloc_intf_gpu(ifs_jhi, nxp, nzp, Ncons)
-    peer_fv_jhi = _alloc_intf_gpu(ifs_jhi, nxp, nzp, Ncons)
-    my_fv_klo   = _alloc_intf_gpu(ifs_klo, nxp, nyp, Ncons)
-    peer_fv_klo = _alloc_intf_gpu(ifs_klo, nxp, nyp, Ncons)
-    my_fv_khi   = _alloc_intf_gpu(ifs_khi, nxp, nyp, Ncons)
-    peer_fv_khi = _alloc_intf_gpu(ifs_khi, nxp, nyp, Ncons)
-
-    my_fh_ilo   = _alloc_intf_h(ifs_ilo, nyp, nzp, Ncons)
-    peer_fh_ilo = _alloc_intf_h(ifs_ilo, nyp, nzp, Ncons)
-    my_fh_ihi   = _alloc_intf_h(ifs_ihi, nyp, nzp, Ncons)
-    peer_fh_ihi = _alloc_intf_h(ifs_ihi, nyp, nzp, Ncons)
-    my_fh_jlo   = _alloc_intf_h(ifs_jlo, nxp, nzp, Ncons)
-    peer_fh_jlo = _alloc_intf_h(ifs_jlo, nxp, nzp, Ncons)
-    my_fh_jhi   = _alloc_intf_h(ifs_jhi, nxp, nzp, Ncons)
-    peer_fh_jhi = _alloc_intf_h(ifs_jhi, nxp, nzp, Ncons)
-    my_fh_klo   = _alloc_intf_h(ifs_klo, nxp, nyp, Ncons)
-    peer_fh_klo = _alloc_intf_h(ifs_klo, nxp, nyp, Ncons)
-    my_fh_khi   = _alloc_intf_h(ifs_khi, nxp, nyp, Ncons)
-    peer_fh_khi = _alloc_intf_h(ifs_khi, nxp, nyp, Ncons)
 
     return Block(bid, nxp, nyp, nzp, rx, ry, rz, ox, oy, oz, Q, U, ϕ, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, Vol, x, y, z, LTS_dt, Un,
                  sbuf_hx, sbuf_dx, rbuf_hx, rbuf_dx, sbuf_hx2, sbuf_dx2, rbuf_hx2, rbuf_dx2,
                  sbuf_hy, sbuf_dy, rbuf_hy, rbuf_dy, sbuf_hz, sbuf_dz, rbuf_hz, rbuf_dz,
                  Ωx, Ωy, Ωz, nb,
                  imp_dU_rhs, imp_ΔU, imp_D_inv, imp_σ_i, imp_σ_j, imp_σ_k, imp_U_nm1,
+                 imp_V_krylov, imp_R_base,
                  stencil_i, Δstencil_i, lin_phi_i,
                  stencil_j, Δstencil_j, lin_phi_j,
                  stencil_k, Δstencil_k, lin_phi_k,
@@ -920,208 +997,7 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                  is_inter,
                  # Fringe region fields
                  isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled ? fringe_lambda_arr : nothing,
-                 isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled ? U_target_arr : nothing,
-                 D_i, D_j, D_k, U_tmp,
-                 # Interface flux sync buffers
-                 my_fv_ilo, peer_fv_ilo, my_fv_ihi, peer_fv_ihi,
-                 my_fv_jlo, peer_fv_jlo, my_fv_jhi, peer_fv_jhi,
-                 my_fv_klo, peer_fv_klo, my_fv_khi, peer_fv_khi,
-                 my_fh_ilo, peer_fh_ilo, my_fh_ihi, peer_fh_ihi,
-                 my_fh_jlo, peer_fh_jlo, my_fh_jhi, peer_fh_jhi,
-                 my_fh_klo, peer_fh_klo, my_fh_khi, peer_fh_khi)
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# CEBL Auxiliary Block Generation and Initialization
-# ═══════════════════════════════════════════════════════════════════════
-
-function init_cebl_Q_kernel!(Q_cebl, Q_inlet, nx_cebl, ny_inlet, nz_inlet, NG)
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if j > ny_inlet + 2*NG || k > nz_inlet + 2*NG
-        return
-    end
-    i_src = NG + 1
-    for i in 1:(nx_cebl + 2*NG)
-        for n in 1:size(Q_cebl, 4)
-            @inbounds Q_cebl[i, j, k, n] = Q_inlet[i_src, j, k, n]
-        end
-    end
-    return
-end
-
-function create_cebl_block(b_inlet::Block, Nx_cebl::Int, Lx_cebl::FT, cebl_bid::Int, NG::Int, Ncons::Int, Nprim::Int, face_bc, bc_params)
-    Nx_cebl_tot = Nx_cebl + 2*NG + 1
-    Ny_cebl_tot = b_inlet.Ny + 2*NG + 1
-    Nz_cebl_tot = b_inlet.Nz + 2*NG + 1
-    
-    x_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
-    y_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
-    z_h = zeros(Float64, Nx_cebl_tot, Ny_cebl_tot, Nz_cebl_tot)
-    
-    dx = Lx_cebl / Nx_cebl
-    for i in 1:Nx_cebl_tot
-        x_val = (i - NG - 1.0) * dx
-        x_h[i, :, :] .= x_val
-    end
-    
-    y_inlet_slice = Array(b_inlet.y)[NG+1, :, :]
-    z_inlet_slice = Array(b_inlet.z)[NG+1, :, :]
-    for i in 1:Nx_cebl_tot
-        y_h[i, :, :] .= y_inlet_slice
-        z_h[i, :, :] .= z_inlet_slice
-    end
-    
-    FT_coords = (FT.(x_h), FT.(y_h), FT.(z_h))
-    Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, Vol = 
-        compute_fvm_metrics_runtime(FT_coords[1], FT_coords[2], FT_coords[3], Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG)
-        
-    Areai = GPUArray(Ai); nxi_g = GPUArray(nxi); nyi_g = GPUArray(nyi); nzi_g = GPUArray(nzi)
-    Areaj_g = GPUArray(Aj); nxj_g = GPUArray(nxj); nyj_g = GPUArray(nyj); nzj_g = GPUArray(nzj)
-    Areak_g = GPUArray(Ak); nxk_g = GPUArray(nxk); nyk_g = GPUArray(nyk); nzk_g = GPUArray(nzk)
-    Vol_g = GPUArray(Vol)
-    
-    Nx_tot = Nx_cebl + 2*NG
-    Ny_tot = b_inlet.Ny + 2*NG
-    Nz_tot = b_inlet.Nz + 2*NG
-    
-    Q = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Nprim)
-    U = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
-    ϕ = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
-    
-    x = GPUArray(FT_coords[1])
-    y = GPUArray(FT_coords[2])
-    z = GPUArray(FT_coords[3])
-    
-    nb_init = (1, cld(Ny_tot, 16), cld(Nz_tot, 16))
-    @gpu_launch threads=(1, 16, 16) blocks=nb_init init_cebl_Q_kernel!(Q, b_inlet.Q, Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG)
-    
-    nb_c2p = (cld(Nx_tot, nthreads[1]), cld(Ny_tot, nthreads[2]), cld(Nz_tot, nthreads[3]))
-    @gpu_launch threads=nthreads blocks=nb_c2p prim2c(U, Q, Nx_cebl, b_inlet.Ny, b_inlet.Nz)
-    
-    face_bc[(cebl_bid, 3)] = face_bc[(b_inlet.id, 3)]
-    face_bc[(cebl_bid, 4)] = face_bc[(b_inlet.id, 4)]
-    face_bc[(cebl_bid, 5)] = face_bc[(b_inlet.id, 5)]
-    face_bc[(cebl_bid, 6)] = face_bc[(b_inlet.id, 6)]
-    
-    if haskey(bc_params, (b_inlet.id, 3)); bc_params[(cebl_bid, 3)] = bc_params[(b_inlet.id, 3)]; end
-    if haskey(bc_params, (b_inlet.id, 4)); bc_params[(cebl_bid, 4)] = bc_params[(b_inlet.id, 4)]; end
-    if haskey(bc_params, (b_inlet.id, 5)); bc_params[(cebl_bid, 5)] = bc_params[(b_inlet.id, 5)]; end
-    if haskey(bc_params, (b_inlet.id, 6)); bc_params[(cebl_bid, 6)] = bc_params[(b_inlet.id, 6)]; end
-    
-    face_bc[(cebl_bid, 1)] = BC_PERIODIC
-    face_bc[(cebl_bid, 2)] = BC_PERIODIC
-    
-    LTS_dt = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
-    Un = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Nprim)
-    
-    sbuf_hx = zeros(FT, 0, 0, 0, 0); rbuf_hx = zeros(FT, 0, 0, 0, 0)
-    sbuf_dx = GPUArray(sbuf_hx); rbuf_dx = GPUArray(rbuf_hx)
-    sbuf_hx2 = zeros(FT, 0, 0, 0, 0); rbuf_hx2 = zeros(FT, 0, 0, 0, 0)
-    sbuf_dx2 = GPUArray(sbuf_hx2); rbuf_dx2 = GPUArray(rbuf_hx2)
-    sbuf_hy = zeros(FT, 0, 0, 0, 0); rbuf_hy = zeros(FT, 0, 0, 0, 0)
-    sbuf_dy = GPUArray(sbuf_hy); rbuf_dy = GPUArray(rbuf_hy)
-    sbuf_hz = zeros(FT, 0, 0, 0, 0); rbuf_hz = zeros(FT, 0, 0, 0, 0)
-    sbuf_dz = GPUArray(sbuf_hz); rbuf_dz = GPUArray(rbuf_hz)
-    
-    Ωx = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
-    Ωy = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
-    Ωz = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot)
-    
-    Ni = Nx_cebl + 2*NG; Nj = b_inlet.Ny + 2*NG; Nk = b_inlet.Nz + 2*NG
-    _Lin_h = repeat(reshape(FT.(Linear), 1, 7), Ni, 1)
-    _ΔLin_h = repeat(reshape(FT.(ΔLinear), 1, 7), Ni, 1)
-    _phi_h = fill(FT(Linear_ϕ), Ni)
-    stencil_i = GPUArray(_Lin_h); Δstencil_i = GPUArray(_ΔLin_h); lin_phi_i = GPUArray(_phi_h)
-    stencil_R_i = GPUArray(_Lin_h); Δstencil_R_i = GPUArray(_ΔLin_h)
-    
-    _Lin_j = repeat(reshape(FT.(Linear), 1, 1, 7), Nj, Nk, 1)
-    _ΔLin_j = repeat(reshape(FT.(ΔLinear), 1, 1, 7), Nj, Nk, 1)
-    _phi_j = fill(FT(Linear_ϕ), Nj, Nk)
-    _Lin_k = repeat(reshape(FT.(Linear), 1, 1, 7), Nj, Nk, 1)
-    _ΔLin_k = repeat(reshape(FT.(ΔLinear), 1, 1, 7), Nj, Nk, 1)
-    _phi_k = fill(FT(Linear_ϕ), Nj, Nk)
-    
-    apply_interface_taper!(_Lin_j, _ΔLin_j, _phi_j, _Lin_k, _ΔLin_k, _phi_k, face_bc, cebl_bid, b_inlet.Ny, b_inlet.Nz, NG)
-    apply_geometric_smoothness_protection!(_Lin_j, _ΔLin_j, _phi_j, _Lin_k, _ΔLin_k, _phi_k, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, face_bc, cebl_bid, Nx_cebl, b_inlet.Ny, b_inlet.Nz, NG; verbose=false)
-    
-    stencil_j = GPUArray(_Lin_j); Δstencil_j = GPUArray(_ΔLin_j); lin_phi_j = GPUArray(_phi_j)
-    stencil_k = GPUArray(_Lin_k); Δstencil_k = GPUArray(_ΔLin_k); lin_phi_k = GPUArray(_phi_k)
-    stencil_R_j = GPUArray(_Lin_j); Δstencil_R_j = GPUArray(_ΔLin_j)
-    stencil_R_k = GPUArray(_Lin_k); Δstencil_R_k = GPUArray(_ΔLin_k)
-    filter_σ_init = (FT(filtering_s0), FT(filtering_s0), FT(filtering_s0))
-    
-    D_i = gpu_zeros(FT, Ni, Nj, Nk)
-    D_j = gpu_zeros(FT, Ni, Nj, Nk)
-    D_k = gpu_zeros(FT, Ni, Nj, Nk)
-    U_tmp = gpu_zeros(FT, Nx_tot, Ny_tot, Nz_tot, Ncons)
-    
-    is_inter = (
-        false,
-        false,
-        get(face_bc, (cebl_bid, 3), -1) == 0,
-        get(face_bc, (cebl_bid, 4), -1) == 0,
-        get(face_bc, (cebl_bid, 5), -1) == 0,
-        get(face_bc, (cebl_bid, 6), -1) == 0
-    )
-
-    _alloc_intf_gpu(cond, dims...) = cond ? gpu_zeros(FT, dims...) : nothing
-    _alloc_intf_h(cond, dims...)   = cond ? zeros(FT, dims...)     : nothing
-    ifs_ilo = is_inter[1]; ifs_ihi = is_inter[2]
-    ifs_jlo = is_inter[3]; ifs_jhi = is_inter[4]
-    ifs_klo = is_inter[5]; ifs_khi = is_inter[6]
-
-    my_fv_ilo   = _alloc_intf_gpu(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
-    peer_fv_ilo = _alloc_intf_gpu(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
-    my_fv_ihi   = _alloc_intf_gpu(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
-    peer_fv_ihi = _alloc_intf_gpu(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
-
-    my_fv_jlo   = _alloc_intf_gpu(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
-    peer_fv_jlo = _alloc_intf_gpu(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
-    my_fv_jhi   = _alloc_intf_gpu(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
-    peer_fv_jhi = _alloc_intf_gpu(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
-
-    my_fv_klo   = _alloc_intf_gpu(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
-    peer_fv_klo = _alloc_intf_gpu(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
-    my_fv_khi   = _alloc_intf_gpu(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
-    peer_fv_khi = _alloc_intf_gpu(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
-
-    my_fh_ilo   = _alloc_intf_h(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
-    peer_fh_ilo = _alloc_intf_h(ifs_ilo, b_inlet.Ny, b_inlet.Nz, Ncons)
-    my_fh_ihi   = _alloc_intf_h(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
-    peer_fh_ihi = _alloc_intf_h(ifs_ihi, b_inlet.Ny, b_inlet.Nz, Ncons)
-
-    my_fh_jlo   = _alloc_intf_h(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
-    peer_fh_jlo = _alloc_intf_h(ifs_jlo, Nx_cebl, b_inlet.Nz, Ncons)
-    my_fh_jhi   = _alloc_intf_h(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
-    peer_fh_jhi = _alloc_intf_h(ifs_jhi, Nx_cebl, b_inlet.Nz, Ncons)
-
-    my_fh_klo   = _alloc_intf_h(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
-    peer_fh_klo = _alloc_intf_h(ifs_klo, Nx_cebl, b_inlet.Ny, Ncons)
-    my_fh_khi   = _alloc_intf_h(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
-    peer_fh_khi = _alloc_intf_h(ifs_khi, Nx_cebl, b_inlet.Ny, Ncons)
-    
-    return Block(cebl_bid, Nx_cebl, b_inlet.Ny, b_inlet.Nz, 0, b_inlet.ry, b_inlet.rz, 0, b_inlet.oy, b_inlet.oz, Q, U, ϕ, Areai, Areaj_g, Areak_g, nxi_g, nyi_g, nzi_g, nxj_g, nyj_g, nzj_g, nxk_g, nyk_g, nzk_g, Vol_g, x, y, z, LTS_dt, Un,
-                 sbuf_hx, sbuf_dx, rbuf_hx, rbuf_dx, sbuf_hx2, sbuf_dx2, rbuf_hx2, rbuf_dx2,
-                 sbuf_hy, sbuf_dy, rbuf_hy, rbuf_dy, sbuf_hz, sbuf_dz, rbuf_hz, rbuf_dz,
-                 Ωx, Ωy, Ωz, nb_c2p,
-                 nothing, nothing, nothing, nothing, nothing, nothing, nothing,
-                 stencil_i, Δstencil_i, lin_phi_i,
-                 stencil_j, Δstencil_j, lin_phi_j,
-                 stencil_k, Δstencil_k, lin_phi_k,
-                 stencil_R_i, Δstencil_R_i,
-                 stencil_R_j, Δstencil_R_j,
-                 stencil_R_k, Δstencil_R_k,
-                 filter_σ_init,
-                 nothing,
-                 is_inter,
-                 nothing, nothing, D_i, D_j, D_k, U_tmp,
-                 my_fv_ilo, peer_fv_ilo, my_fv_ihi, peer_fv_ihi,
-                 my_fv_jlo, peer_fv_jlo, my_fv_jhi, peer_fv_jhi,
-                 my_fv_klo, peer_fv_klo, my_fv_khi, peer_fv_khi,
-                 my_fh_ilo, peer_fh_ilo, my_fh_ihi, peer_fh_ihi,
-                 my_fh_jlo, peer_fh_jlo, my_fh_jhi, peer_fh_jhi,
-                 my_fh_klo, peer_fh_klo, my_fh_khi, peer_fh_khi)
+                 isdefined(@__MODULE__, :diffrot_enabled) && diffrot_enabled ? U_target_arr : nothing)
 end
 
 function load_multiblock_connectivity(path)
@@ -1206,28 +1082,19 @@ function blockAdvance(block::Block, dt, ϕ, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, world_
     sRi = block.stencil_R_i; ΔsRi = block.Δstencil_R_i
     sRj = block.stencil_R_j; ΔsRj = block.Δstencil_R_j
     sRk = block.stencil_R_k; ΔsRk = block.Δstencil_R_k
-
-    # ── Interface face indices for flux sync ──
-    _intf_ilo = block.is_interblock[1] ? Int32(NG) : Int32(-1)
-    _intf_ihi = block.is_interblock[2] ? Int32(nxp + NG) : Int32(-1)
-    _intf_jlo = block.is_interblock[3] ? Int32(NG) : Int32(-1)
-    _intf_jhi = block.is_interblock[4] ? Int32(nyp + NG) : Int32(-1)
-    _intf_klo = block.is_interblock[5] ? Int32(NG) : Int32(-1)
-    _intf_khi = block.is_interblock[6] ? Int32(nzp + NG) : Int32(-1)
-
     if eigen_reconstruction
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0), _intf_ilo, _intf_ihi, block.my_face_val_ihi, block.my_face_val_ilo)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0))
         @check_nan(Fx, "Fx after Eigen_reconstruct_i", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Eigen_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0), _intf_jlo, _intf_jhi, block.my_face_val_jhi, block.my_face_val_jlo)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Eigen_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0))
         @check_nan(Fy, "Fy after Eigen_reconstruct_j", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Eigen_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0), _intf_klo, _intf_khi, block.my_face_val_khi, block.my_face_val_klo)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Eigen_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0))
         @check_nan(Fz, "Fz after Eigen_reconstruct_k", block.id, world_rank, tt)
     else
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0), _intf_ilo, _intf_ihi, block.my_face_val_ihi, block.my_face_val_ilo)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0))
         @check_nan(Fx, "Fx after Conser_reconstruct_i", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0), _intf_jlo, _intf_jhi, block.my_face_val_jhi, block.my_face_val_jlo)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0))
         @check_nan(Fy, "Fy after Conser_reconstruct_j", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0), _intf_klo, _intf_khi, block.my_face_val_khi, block.my_face_val_klo)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0))
         @check_nan(Fz, "Fz after Conser_reconstruct_k", block.id, world_rank, tt)
     end
 
@@ -1306,23 +1173,14 @@ function blockAdvance_boundary(block::Block, dt, ϕ, Fx, Fy, Fz, Fv_x, Fv_y, Fv_
     sRi = block.stencil_R_i; ΔsRi = block.Δstencil_R_i
     sRj = block.stencil_R_j; ΔsRj = block.Δstencil_R_j
     sRk = block.stencil_R_k; ΔsRk = block.Δstencil_R_k
-
-    # ── Interface face indices for flux sync ──
-    _intf_ilo = block.is_interblock[1] ? Int32(NG) : Int32(-1)
-    _intf_ihi = block.is_interblock[2] ? Int32(nxp + NG) : Int32(-1)
-    _intf_jlo = block.is_interblock[3] ? Int32(NG) : Int32(-1)
-    _intf_jhi = block.is_interblock[4] ? Int32(nyp + NG) : Int32(-1)
-    _intf_klo = block.is_interblock[5] ? Int32(NG) : Int32(-1)
-    _intf_khi = block.is_interblock[6] ? Int32(nzp + NG) : Int32(-1)
-
     if eigen_reconstruction
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2), _intf_ilo, _intf_ihi, block.my_face_val_ihi, block.my_face_val_ilo)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Eigen_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2), _intf_jlo, _intf_jhi, block.my_face_val_jhi, block.my_face_val_jlo)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Eigen_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2), _intf_klo, _intf_khi, block.my_face_val_khi, block.my_face_val_klo)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2))
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Eigen_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2))
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Eigen_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2))
     else
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2), _intf_ilo, _intf_ihi, block.my_face_val_ihi, block.my_face_val_ilo)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2), _intf_jlo, _intf_jhi, block.my_face_val_jhi, block.my_face_val_jlo)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2), _intf_klo, _intf_khi, block.my_face_val_khi, block.my_face_val_klo)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2))
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2))
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2))
     end
     # Note: viscous_flux runs on ALL cells here (no mode param) since interior
     # viscous was already computed on compute_stream and is now complete
@@ -1341,68 +1199,14 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     conn_path = isdefined(Main, :connectivity_file) ? connectivity_file : joinpath(_mesh_base_conn, "block_connectivity.h5")
     Nblocks, connectivity, face_bc, bc_params, Nx_b, Ny_b, Nz_b = load_multiblock_connectivity(conn_path)
     
-    # Programmatic override to test CEBL forcing on periodic mesh
-    if isdefined(Main, :cebl_forcing) && Main.cebl_forcing
-        # Compute dynamic reference pressure p_ref to avoid pressure mismatch
-        local p_ref = FT(106.2) # default fallback
-        local ρ_ref_val = isdefined(Main, :ρ_ref) ? FT(Main.ρ_ref) : FT(1.176)
-        if isdefined(Main, :Re_target) && isdefined(Main, :Ma_target) && isdefined(Main, :Tw)
-            try
-                c_wall = sqrt(Main.γ * Main.Rg * Main.Tw)
-                u_bulk = Main.Ma_target * c_wall
-                μw = Main.C_s * Main.Tw * sqrt(Main.Tw) / (Main.Tw + Main.T_s)
-                ρ_ref_val = Main.Re_target * μw / (u_bulk * 2 * Main.R0)
-                β = 0.5 * Main.Pr * (Main.γ - 1.0) * (Main.Ma_target^2)
-                if β > 1e-6
-                    A = sqrt(1.0 + β)
-                    sqrt_β = sqrt(β)
-                    integral_factor = (1.0 / (2.0 * A * sqrt_β)) * log((A + sqrt_β) / (A - sqrt_β))
-                    p_ref = ρ_ref_val * Main.Rg * Main.Tw / integral_factor
-                else
-                    p_ref = ρ_ref_val * Main.Rg * Main.Tw
-                end
-            catch e
-                println("Warning: failed to compute dynamic p_ref: ", e)
+    # Override physical walls to slip wall for inviscid validation test cases on pipe meshes
+    if isdefined(Main, :test_case) && (Main.test_case == "BrioWu" || Main.test_case == "OrszagTang" || Main.test_case == "TG5_debug")
+        for (k, v) in face_bc
+            if v == Int32(BC_ISOTHERMAL_WALL) || v == Int32(BC_ADIABATIC_WALL)
+                face_bc[k] = Int32(BC_SLIP_WALL)
             end
-        end
-
-        local Omega_val = FT(0.0)
-        if isdefined(Main, :Omega_x)
-            Omega_val = FT(Main.Omega_x)
-        elseif isdefined(Main, :Ro_target) && isdefined(Main, :Ma_target) && isdefined(Main, :Tw) && isdefined(Main, :R0)
-            try
-                c_wall = sqrt(Main.γ * Main.Rg * Main.Tw)
-                U_bulk = Main.Ma_target * c_wall
-                Omega_val = Main.Ro_target * U_bulk / Main.R0
-            catch e
-            end
-        end
-        local R0_val = isdefined(Main, :R0) ? FT(Main.R0) : FT(0.5)
-
-        if world_rank == 0
-            println(">>> NSCBC Outflow parameter override values:")
-            println("    p_ref = ", p_ref)
-            println("    ρ_ref_val = ", ρ_ref_val)
-            println("    Omega_val = ", Omega_val)
-            println("    R0_val = ", R0_val)
-            flush(stdout)
-        end
-
-        for bid in 0:Nblocks-1
-            face_bc[(bid, 1)] = BC_CEBL_INFLOW
-            face_bc[(bid, 2)] = BC_NSCBC_OUTFLOW
-            params_tuple = get(bc_params, (bid, 2), ntuple(i -> zero(FT), N_BC_PARAMS))
-            params_list = collect(params_tuple)
-            params_list[BCP_P_TARGET] = FT(p_ref)
-            params_list[BCP_SIGMA] = FT(0.25)
-            params_list[BCP_LREF] = isdefined(Main, :L_total) ? FT(Main.L_total) : FT(15.0)
-            params_list[BCP_OMEGA] = FT(Omega_val)
-            params_list[BCP_RHO_BULK] = FT(ρ_ref_val)
-            params_list[BCP_R0] = FT(R0_val)
-            bc_params[(bid, 2)] = Tuple(params_list)
         end
     end
-
     
     # Print BC configuration
     if world_rank == 0
@@ -1439,7 +1243,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     blocks = Dict{Int, Block}()
     block_comms = Dict{Int, MPI.Comm}()  # per-block communicator
     rankx = 0; ranky = 0; rankz = 0
-    Iperiodic_main_val = isdefined(Main, :Iperiodic_main) ? Main.Iperiodic_main : (isdefined(Main, :Iperiodic) ? Main.Iperiodic : (false, false, false))
 
     if multi_block_mode
         # ── Multi-block-per-rank: each block is whole (1,1,1) ──
@@ -1451,7 +1254,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 Nprocs_block = Block_Nprocs[bid + 1]  # always (1,1,1)
                 blocks[bid] = load_block(bid, 0, 0, 0, NG, Ncons, Nprim, Nprocs_block, world_rank, face_bc, connectivity)
                 # No sub-domain splitting →use COMM_SELF for intra-block exchange
-                block_comms[bid] = MPI.Cart_create(MPI.COMM_SELF, [1,1,1]; periodic=collect(Iperiodic_main_val))
+                block_comms[bid] = MPI.Cart_create(MPI.COMM_SELF, [1,1,1]; periodic=collect(Iperiodic))
             end
         end
         # Set rank_offsets so copy_ghost_face! maps block →owning rank correctly
@@ -1482,81 +1285,9 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         blocks[my_block_id] = load_block(my_block_id, rankx, ranky, rankz, NG, Ncons, Nprim, Nprocs_my_block, world_rank, face_bc, connectivity)
 
         block_comm = MPI.Comm_split(MPI.COMM_WORLD, my_block_id, local_rank)
-        block_comms[my_block_id] = MPI.Cart_create(block_comm, collect(Nprocs_my_block); periodic=collect(Iperiodic_main_val))
+        block_comms[my_block_id] = MPI.Cart_create(block_comm, collect(Nprocs_my_block); periodic=collect(Iperiodic))
 
         _rank_offsets_setup = copy(rank_offsets)
-    end
-
-    # ─── Instantiate CEBL Forcing State ───
-    cebl_enabled = isdefined(Main, :cebl_forcing) ? cebl_forcing : false
-    cebl_forcing_type = isdefined(Main, :cebl_forcing_type) ? Main.cebl_forcing_type : :ctbl
-    cebl_state = create_dummy_cebl_state(FT)
-    cebl_blocks = Dict{Int, Block}()
-    cebl_states = Dict{Int, CEBLForcingState}()
-    
-    cebl_connectivity = Dict{Tuple{Int, Int}, Connectivity}()
-    # Arrays for cebl ghost pool initialization
-    cebl_Block_Nprocs = Vector{SVector{3, Int64}}(undef, Nblocks + 101)
-    cebl_rank_offsets = Vector{Int}(undef, Nblocks + 101)
-    cebl_Nx_b = Vector{Int64}(undef, Nblocks + 101)
-    cebl_Ny_b = Vector{Int64}(undef, Nblocks + 101)
-    cebl_Nz_b = Vector{Int64}(undef, Nblocks + 101)
-    
-    if cebl_enabled
-        cebl_Nx_val = isdefined(Main, :cebl_Nx) ? cebl_Nx : 256
-        cebl_Lx_val = isdefined(Main, :cebl_Lx) ? FT(cebl_Lx) : FT(1.0)
-        
-        # 1. Create local CEBL blocks & CEBL states
-        for (bid, b) in blocks
-            if get(face_bc, (bid, 1), -1) == BC_CEBL_INFLOW && b.rx == 0
-                cebl_bid = bid + 100
-                if cebl_forcing_type == :deschamps
-                    c_state = create_dummy_cebl_state(FT)
-                    c_state.enabled = true
-                else
-                    source_file = isdefined(Main, :cebl_source_file) ? cebl_source_file : "cebl_source_profiles.h5"
-                    c_state = init_cebl_state(source_file)
-                end
-                
-                c_block = create_cebl_block(b, cebl_Nx_val, cebl_Lx_val, cebl_bid, NG, Ncons, Nprim, face_bc, bc_params)
-                c_state.Q_cebl = c_block.Q
-                
-                cebl_blocks[cebl_bid] = c_block
-                cebl_states[bid] = c_state
-            end
-        end
-        
-        # 2. Build cebl_connectivity by shifting main connectivity by 100
-        # Only copy connections in the transverse directions (faces 3, 4, 5, 6)
-        for (conn_key, conn) in connectivity
-            dst_b, dst_f = conn_key
-            if dst_f in (3, 4, 5, 6)
-                src_b, src_f = conn.src_b, conn.src_f
-                cebl_connectivity[(dst_b + 100, dst_f)] = Connectivity(src_b + 100, src_f, conn.reverse_tan, conn.flip_normal)
-            end
-        end
-        
-        # 3. Setup Block_Nprocs, rank_offsets, and dimensions for CEBL blocks
-        for bid in 0:Nblocks-1
-            cebl_bid = bid + 100
-            cebl_idx = cebl_bid + 1
-            px, py, pz = Block_Nprocs[bid + 1]
-            cebl_Block_Nprocs[cebl_idx] = SVector(1, py, pz)
-            cebl_rank_offsets[cebl_idx] = Block_to_rank[bid + 1]
-            
-            cebl_Nx_b[cebl_idx] = cebl_Nx_val
-            cebl_Ny_b[cebl_idx] = Ny_b[bid + 1]
-            cebl_Nz_b[cebl_idx] = Nz_b[bid + 1]
-        end
-        
-        # 4. Initialize buffer pool for CEBL blocks
-        if world_rank == 0
-            println(">>> Initializing CEBL transverse ghost cell exchange pool...")
-        end
-        cebl_ghost_pool = init_ghost_buffer_pool(
-            cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets,
-            cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, Ncons
-        )
     end
 
     # Global dimensions for flux buffers (max across all local blocks)
@@ -1571,29 +1302,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     shared_Fvy = gpu_zeros(FT, max_nxp, max_nyp+1, max_nzp, Ncons)
     shared_Fvz = gpu_zeros(FT, max_nxp, max_nyp, max_nzp+1, Ncons)
     shared_dU_forced = gpu_zeros(FT, max_nxp, max_nyp, max_nzp, Ncons)
-
-    # Separate flux arrays for CEBL blocks to prevent interface overwriting/interference
-    local cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz
-    local cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz
-    if cebl_enabled
-        cebl_max_nx = isdefined(Main, :cebl_Nx) ? Main.cebl_Nx : 256
-        cebl_max_ny = maximum(Ny_b)
-        cebl_max_nz = maximum(Nz_b)
-        cebl_shared_Fx  = gpu_zeros(FT, cebl_max_nx+1, cebl_max_ny, cebl_max_nz, Ncons)
-        cebl_shared_Fy  = gpu_zeros(FT, cebl_max_nx, cebl_max_ny+1, cebl_max_nz, Ncons)
-        cebl_shared_Fz  = gpu_zeros(FT, cebl_max_nx, cebl_max_ny, cebl_max_nz+1, Ncons)
-        cebl_shared_Fvx = gpu_zeros(FT, cebl_max_nx+1, cebl_max_ny, cebl_max_nz, Ncons)
-        cebl_shared_Fvy = gpu_zeros(FT, cebl_max_nx, cebl_max_ny+1, cebl_max_nz, Ncons)
-        cebl_shared_Fvz = gpu_zeros(FT, cebl_max_nx, cebl_max_ny, cebl_max_nz+1, Ncons)
-    else
-        # Define dummy/empty arrays so they are in scope
-        cebl_shared_Fx  = gpu_zeros(FT, 1, 1, 1, 1)
-        cebl_shared_Fy  = gpu_zeros(FT, 1, 1, 1, 1)
-        cebl_shared_Fz  = gpu_zeros(FT, 1, 1, 1, 1)
-        cebl_shared_Fvx = gpu_zeros(FT, 1, 1, 1, 1)
-        cebl_shared_Fvy = gpu_zeros(FT, 1, 1, 1, 1)
-        cebl_shared_Fvz = gpu_zeros(FT, 1, 1, 1, 1)
-    end
 
 
 
@@ -1843,33 +1551,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         if profiling; _ts = time_ns(); end
         copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
                          full_range=false)
-        if cebl_enabled
-            copy_ghost_face!(cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, :U, Ncons, cebl_ghost_pool;
-                             full_range=false)
-        end
         for (bid, b) in blocks
             @check_nan(b.U, "U after copy_ghost_face!", b.id, world_rank, tt_val)
-        end
-        if cebl_enabled
-            for (cebl_bid, c_block) in cebl_blocks
-                @check_nan(c_block.U, "cebl_block U after copy_ghost_face!", cebl_bid, world_rank, tt_val)
-            end
         end
         if profiling; gpu_sync(); t_sync_sub[1] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
 
         # Step 2: Physical Boundary Conditions (fills wall/periodic ghost)
-        if cebl_enabled
-            for (cebl_bid, c_block) in cebl_blocks
-                Apply_local_periodic_x!(c_block.U, c_block.Nx, c_block.Ny, c_block.Nz, NG, Ncons)
-                c_state = get(cebl_states, cebl_bid - 100, cebl_state)
-                fillGhost(c_block.Q, c_block.U, 0, c_block.ry, c_block.rz,
-                          c_block.nxi, c_block.nyi, c_block.nzi, c_block.nxj, c_block.nyj, c_block.nzj, c_block.nxk, c_block.nyk, c_block.nzk,
-                          c_block.x, c_block.y, c_block.z, c_block.id, c_block.Nx, c_block.Ny, c_block.Nz, cebl_Block_Nprocs[c_block.id + 1], tt_val, face_bc, bc_params,
-                          @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params,
-                          c_state.enabled, c_state.Q_cebl)
-            end
-        end
-
         for (bid, b) in blocks
             Nprocs_b = Block_Nprocs[bid + 1]
             rx_b = multi_block_mode ? 0 : rankx
@@ -1878,8 +1565,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             fillGhost(b.Q, b.U, rx_b, ry_b, rz_b,
                       b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj, b.nxk, b.nyk, b.nzk,
                       b.x, b.y, b.z, b.id, b.Nx, b.Ny, b.Nz, Nprocs_b, tt_val, face_bc, bc_params,
-                      @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params,
-                      get(cebl_states, b.id, cebl_state).enabled, get(cebl_states, b.id, cebl_state).Q_cebl)
+                      @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params)
             @check_nan(b.U, "U after fillGhost", b.id, world_rank, tt_val)
         end
         if profiling; gpu_sync(); t_sync_sub[2] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
@@ -1902,36 +1588,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         # (now includes ghost from ξ-exchange in step 3)
         copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
                          full_range=true, delta_mode=true)
-        if cebl_enabled
-            copy_ghost_face!(cebl_blocks, cebl_connectivity, cebl_Block_Nprocs, cebl_rank_offsets, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b, :U, Ncons, cebl_ghost_pool;
-                             full_range=true, delta_mode=true)
-        end
-        
-        # ─── GEOMETRIC JUMP CORRECTION FOR INTERBLOCK KINKS ───
-        for (bid, b) in blocks
-            copyto!(b.U_tmp, b.U)
-            nb_loc = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
-            @gpu_launch threads=nthreads blocks=nb_loc correct_ghost_kinks_kernel!(b.U, b.U_tmp, b.D_i, b.D_j, b.D_k, b.Nx+2*NG, b.Ny+2*NG, b.Nz+2*NG, Ncons)
-            @check_nan(b.U, "U after geometric jump correction", b.id, world_rank, tt_val)
-        end
-        if cebl_enabled
-            for (cebl_bid, c_block) in cebl_blocks
-                copyto!(c_block.U_tmp, c_block.U)
-                nb_loc_cebl = (cld(c_block.Nx+2*NG, nthreads[1]), cld(c_block.Ny+2*NG, nthreads[2]), cld(c_block.Nz+2*NG, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_loc_cebl correct_ghost_kinks_kernel!(c_block.U, c_block.U_tmp, c_block.D_i, c_block.D_j, c_block.D_k, c_block.Nx+2*NG, c_block.Ny+2*NG, c_block.Nz+2*NG, Ncons)
-            end
-        end
-        
         if profiling; gpu_sync(); t_sync_sub[4] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
 
         # ─── CHECKERBOARD DIAGNOSTIC (opt-in) ───
         if @isdefined(checkerboard_diag) && checkerboard_diag
             checkerboard_diagnostic!(blocks, connectivity, tt, world_rank)
-        end
-
-        # ─── FULL-FIELD DIAGNOSTIC (opt-in) ───
-        if @isdefined(fullfield_diag) && fullfield_diag
-            fullfield_diagnostic!(blocks, connectivity, tt, world_rank)
         end
 
         # ─── ADAPTIVE INTERFACE SMOOTHING ───
@@ -1940,9 +1601,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         #   lin_phi low  (central regions)       → σ high → more filter
         # Direction-specific lin_phi: η uses lin_phi_j, ζ uses lin_phi_k
         _intf_interval = @isdefined(intf_filter_interval) ? intf_filter_interval : 1
-        if (tt % _intf_interval == 0)
-            _σ_max = (isdefined(Main, :filtering) && Main.filtering) ? (isdefined(Main, :filtering_s0) ? FT(Main.filtering_s0) : FT(0.1)) : FT(0.0)
-            if _σ_max > FT(0.0)
+        if tt % _intf_interval == 0
+            _σ_max = FT(0.01)
             for (bid, b) in blocks
                 for ((dst_bid, fid), conn) in connectivity
                     if dst_bid == b.id
@@ -1962,17 +1622,50 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     end
                 end
             end
-            end # if _σ_max > 0
+
+            # ─── RE-SYNCHRONIZE AFTER INTERFACE FILTER ───
+            gpu_sync()
+            # 1. Update primitives (Q) in the outer real cell shell that was filtered
+            for (bid, b) in blocks
+                nb_loc = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
+                @gpu_launch threads=nthreads blocks=nb_loc c2Prim_ghost(b.U, b.Q, b.Nx, b.Ny, b.Nz)
+            end
+            gpu_sync()
+            # 2. Inter-block face ghost update for filtered U
+            copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
+                             full_range=false)
+            gpu_sync()
+            # 3. Physical Boundary Conditions (reads the freshly updated Q/U in outer real cells)
+            for (bid, b) in blocks
+                Nprocs_b = Block_Nprocs[bid + 1]
+                rx_b = multi_block_mode ? 0 : rankx
+                ry_b = multi_block_mode ? 0 : ranky
+                rz_b = multi_block_mode ? 0 : rankz
+                fillGhost(b.Q, b.U, rx_b, ry_b, rz_b,
+                          b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj, b.nxk, b.nyk, b.nzk,
+                          b.x, b.y, b.z, b.id, b.Nx, b.Ny, b.Nz, Nprocs_b, tt_val, face_bc, bc_params,
+                          @isdefined(dsrfg_params) ? dsrfg_params : default_dsrfg_params)
+            end
+            gpu_sync()
+            # 4. Exchange ghost periodically
+            for (bid, b) in blocks
+                exchange_ghost(b.U, Ncons, block_comms[bid], b.Nx, b.Ny, b.Nz,
+                               b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
+                               b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
+                               b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
+                               sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
+                               rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2,
+                               compute_fn=compute_fn)
+            end
+            gpu_sync()
+            # 5. Full-range copy
+            copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, :U, Ncons, ghost_pool;
+                             full_range=true, delta_mode=true)
+            gpu_sync()
         end
         if profiling; gpu_sync(); t_sync_sub[5] += (time_ns()-_ts)/1e9; _ts=time_ns(); end
 
         # Step 5: Ghost-only Primitive Refresh
-        if cebl_enabled
-            for (cebl_bid, c_block) in cebl_blocks
-                nb_loc_cebl = (cld(c_block.Nx+2*NG, nthreads[1]), cld(c_block.Ny+2*NG, nthreads[2]), cld(c_block.Nz+2*NG, nthreads[3]))
-                @gpu_launch threads=nthreads blocks=nb_loc_cebl c2Prim_ghost(c_block.U, c_block.Q, c_block.Nx, c_block.Ny, c_block.Nz)
-            end
-        end
         for (bid, b) in blocks
             nb_loc = (cld(b.Nx+2*NG, nthreads[1]), cld(b.Ny+2*NG, nthreads[2]), cld(b.Nz+2*NG, nthreads[3]))
             @gpu_launch threads=nthreads blocks=nb_loc c2Prim_ghost(b.U, b.Q, b.Nx, b.Ny, b.Nz)
@@ -2117,6 +1810,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
             # ── Pseudo-time inner iterations ──
             prev_max_res = Inf
+            min_max_res = Inf
             for m_iter = 1:dual_time_sub_iters
                 # 1. Update boundary conditions and MPI ghost cells for current U^{n+1,m}
                 sync_blocks!(activeTime)
@@ -2134,7 +1828,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         threads_recon_i, threads_recon_j, threads_recon_k,
                         threads_visc_i, threads_visc_j, threads_visc_k, threads_light,
                         forcex, flowx, cmf_f1_val, ac_f1_val,
-                        hit_u_mean, hit_v_mean, hit_w_mean, activeTime)
+                        hit_u_mean, hit_v_mean, hit_w_mean, activeTime;
+                        sync_ghost_fn = () -> sync_blocks!(activeTime))
                     local_max_res = max(local_max_res, res)
                     # Monitor solution growth (first 20 steps)
                     if tt <= 20
@@ -2169,13 +1864,28 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     break
                 end
 
+                # (AC sub-iteration break removed →skew-symmetric + GMRES handles p-u coupling)
+
                 # Safety: detect diverging sub-iterations and bail out
-                # LU-SGS: monotonic convergence expected
-                if m_iter > 1 && global_max_res > prev_max_res * 2.0
-                    if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
-                        @printf "    →Sub-iter diverging (%.2e > 2×%.2e), breaking\n" global_max_res prev_max_res
+                # GMRES has non-monotonic convergence →compare against best residual, not previous
+                _is_gmres = isdefined(@__MODULE__, :implicit_solver) ? (implicit_solver == :gmres) : false
+                if _is_gmres
+                    # GMRES: allow temporary increase, only bail if 10× worse than best seen
+                    if m_iter > 1 && global_max_res > min_max_res * 10.0
+                        if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
+                            @printf "    →Sub-iter diverging (%.2e > 10×%.2e), breaking\n" global_max_res min_max_res
+                        end
+                        break
                     end
-                    break
+                    min_max_res = min(min_max_res, global_max_res)
+                else
+                    # LU-SGS: monotonic convergence expected
+                    if m_iter > 1 && global_max_res > prev_max_res * 2.0
+                        if world_rank == 0 && (tt % 100 == 0 || tt <= 20)
+                            @printf "    →Sub-iter diverging (%.2e > 2×%.2e), breaking\n" global_max_res prev_max_res
+                        end
+                        break
+                    end
                 end
                 prev_max_res = global_max_res
             end
@@ -2212,7 +1922,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
         # ── Sync blocks (ghost exchange + BC) ──
         if profiling; _t0 = time_ns(); end
-
         sync_blocks!(activeTime)
         if profiling; gpu_sync(); t_sync += (time_ns() - _t0) / 1e9; end
 
@@ -2223,7 +1932,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
       else
         # ═══════════════════════════════════════════════════════
-        #  EXPLICIT PATH (compressible / MHD)
+        #  STANDARD EXPLICIT RK3 PATH (compressible / MHD)
         # ═══════════════════════════════════════════════════════
         # RK3
         for KRK = 1:3
@@ -2332,39 +2041,30 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
             end
 
-            # ── Block advance (reconstruction + viscous) →Phase 2 overlapped ──
-            if profiling; _t0 = time_ns(); end
-            if KRK == 1
-                # First RK stage: full blockAdvance (no pending interior work)
-                for (bid, b) in blocks
+            # ── Combined Block Loop (Advance + Forcing + Divergence) ──
+            # Fused to prevent shared_Fx/Fy/Fz/Fvx/Fvy/Fvz and shared_dU_forced
+            # overwrite issues in multi-block mode on a single card.
+            for (bid, b) in blocks
+                # ── Block advance (reconstruction + viscous) ──
+                if profiling; _t0 = time_ns(); end
+                if KRK == 1 || multi_block_mode
+                    # First RK stage or multi-block: full blockAdvance
+                    # (no pending interior work, or overlap disabled)
                     blockAdvance(b, current_dt, b.ϕ, shared_Fx, shared_Fy, shared_Fz, shared_Fvx, shared_Fvy, shared_Fvz, world_rank, tt, threads_recon_i, threads_recon_j, threads_recon_k, threads_visc_i, threads_visc_j, threads_visc_k)
-                end
-            else
-                # Stages 2-3: interior was launched during previous sync's MPI
-                # and completed via copyto! device sync. Only boundary needed.
-                for (bid, b) in blocks
+                else
+                    # Stages 2-3: interior was launched during previous sync's MPI
+                    # and completed via copyto! device sync. Only boundary needed.
                     blockAdvance_boundary(b, current_dt, b.ϕ, shared_Fx, shared_Fy, shared_Fz, shared_Fvx, shared_Fvy, shared_Fvz, world_rank, tt, threads_recon_i, threads_recon_j, threads_recon_k)
                 end
-            end
-            if profiling; gpu_sync(); t_advance += (time_ns() - _t0) / 1e9; end
+                if profiling; gpu_sync(); t_advance += (time_ns() - _t0) / 1e9; end
 
-            # ── Interface flux synchronization (ensures unique flux at interblock faces) ──
-            sync_interface_flux!(blocks, connectivity, rank_offsets, Block_Nprocs,
-                                 shared_Fx, shared_Fy, shared_Fz, ch_glm_current, Nx_b, Ny_b, Nz_b)
-            if cebl_enabled
-                sync_interface_flux!(cebl_blocks, cebl_connectivity, cebl_rank_offsets, cebl_Block_Nprocs,
-                                     cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz, ch_glm_current, cebl_Nx_b, cebl_Ny_b, cebl_Nz_b)
-            end
-
-            # ── Forcing + Divergence ──
-            if profiling; _t0 = time_ns(); end
-            for (bid, b) in blocks
+                # ── Forcing ──
+                if profiling; _t0 = time_ns(); end
                 nb_l = (Int32(cld(b.Nx+2*NG, threads_light[1])), Int32(cld(b.Ny+2*NG, threads_light[2])), Int32(cld(b.Nz+2*NG, threads_light[3])))
                 if flow_forcing
                     # Skip Volume_force_kernel (Coriolis + centrifugal) when rotation is zero
                     if Omega_x != zero(FT)
-                        ramp_val = tanh(FT(activeTime) / FT(0.05))
-                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz, ramp_val)
+                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz)
                         if forcing_mode == 1
                             Apply_bulk_force!(shared_dU_forced, b.Q, forcex, flowx, current_dt, b.Nx, b.Ny, b.Nz)
                         elseif forcing_mode == 2
@@ -2401,11 +2101,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(shared_dU_forced, b.Nx, b.Ny, b.Nz)
                             Apply_trip_force!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, activeTime)
                             @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(b.U, shared_dU_forced, current_dt, b.Vol, b.Nx, b.Ny, b.Nz)
-                        else
-                            # If forcing_mode == 0 or other, we still want trip forcing
-                            @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(shared_dU_forced, b.Nx, b.Ny, b.Nz)
-                            Apply_trip_force!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, activeTime)
-                            @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(b.U, shared_dU_forced, current_dt, b.Vol, b.Nx, b.Ny, b.Nz)
                         end
                     end
                 end
@@ -2413,11 +2108,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     Apply_HIT_forcing!(shared_dU_forced, b.Q, hit_forcing_A, hit_u_mean, hit_v_mean, hit_w_mean, b.Nx, b.Ny, b.Nz)
                     @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(b.U, shared_dU_forced, current_dt, b.Vol, b.Nx, b.Ny, b.Nz)
                 end
-            end
-            if profiling; gpu_sync(); t_forcing += (time_ns() - _t0) / 1e9; end
+                if profiling; gpu_sync(); t_forcing += (time_ns() - _t0) / 1e9; end
 
-            if profiling; _t0 = time_ns(); end
-            for (bid, b) in blocks
+                # ── Divergence ──
+                if profiling; _t0 = time_ns(); end
                 nb_f = (cld(b.Nx, nthreads[1]), cld(b.Ny, nthreads[2]), cld(b.Nz, nthreads[3]))
                 if LTS
                     # LTS uses per-cell dt →cannot fuse with RK combination
@@ -2440,52 +2134,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     # Update ψ in Q as well (Q[10] = U[9])
                     # This will be done by the next c2Prim / fillGhost cycle
                 end
+                if profiling; gpu_sync(); t_div += (time_ns() - _t0) / 1e9; end
             end
-
-            # ── CEBL block RK3 step ──
-            if cebl_enabled
-                local cebl_f1 = zero(FT)
-                local cebl_flowx = zero(FT)
-                if cebl_forcing_type == :deschamps
-                    cebl_f1, cebl_flowx = Update_cebl_deschamps_params(cebl_blocks, tt, KRK, current_dt, MPI.COMM_WORLD, world_rank)
-                end
-                
-                for (cebl_bid, c_block) in cebl_blocks
-                    if KRK == 1
-                        copyto!(c_block.Un, c_block.U)
-                    end
-                    
-                    nb_l_cebl = (Int32(cld(c_block.Nx+2*NG, threads_light[1])), Int32(cld(c_block.Ny+2*NG, threads_light[2])), Int32(cld(c_block.Nz+2*NG, threads_light[3])))
-                    @gpu_launch threads=threads_light blocks=nb_l_cebl shockSensor(c_block.ϕ, c_block.Q, c_block.Nx, c_block.Ny, c_block.Nz)
-                    
-                    blockAdvance(c_block, current_dt, c_block.ϕ, cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz, cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz, world_rank, tt, threads_recon_i, threads_recon_j, threads_recon_k, threads_visc_i, threads_visc_j, threads_visc_k)
-                    
-                    nb_f_cebl = (cld(c_block.Nx, nthreads[1]), cld(c_block.Ny, nthreads[2]), cld(c_block.Nz, nthreads[3]))
-                    if cebl_forcing_type == :deschamps
-                        @gpu_launch threads=nthreads blocks=nb_f_cebl fused_deschamps_source_kernel!(c_block.U, c_block.Q, cebl_f1, cebl_flowx, current_dt, c_block.Nx, c_block.Ny, c_block.Nz)
-                    else
-                        @gpu_launch threads=nthreads blocks=nb_f_cebl zero_dU_forced_kernel!(shared_dU_forced, c_block.Nx, c_block.Ny, c_block.Nz)
-                        c_state = get(cebl_states, cebl_bid - 100, cebl_state)
-                        Apply_CEBL_force!(shared_dU_forced, c_block.Q, c_block.y, c_block.z, c_state, c_block.Nx, c_block.Ny, c_block.Nz)
-                        @gpu_launch threads=threads_light blocks=nb_l_cebl add_source_kernel!(c_block.U, shared_dU_forced, current_dt, c_block.Vol, c_block.Nx, c_block.Ny, c_block.Nz)
-                    end
-                    
-                    rk_a = KRK == 2 ? FT(0.25) : (KRK == 3 ? FT(2)/FT(3) : one(FT))
-                    @gpu_launch threads=nthreads blocks=nb_f_cebl div_rk_clip_prim(
-                        c_block.U, c_block.Un, c_block.Q,
-                        cebl_shared_Fx, cebl_shared_Fy, cebl_shared_Fz,
-                        cebl_shared_Fvx, cebl_shared_Fvy, cebl_shared_Fvz,
-                        current_dt, c_block.Vol, rk_a,
-                        c_block.Nx, c_block.Ny, c_block.Nz
-                    )
-                end
-            end
-
-            if profiling; gpu_sync(); t_div += (time_ns() - _t0) / 1e9; end
 
             # ── Sync blocks with comm-compute overlap (Phase 2) ──
             if profiling; _t0 = time_ns(); end
-            if KRK < 3
+            if KRK < 3 && !multi_block_mode
                 # Stages 1-2: launch NEXT stage's interior recon during MPI
                 _ol = Ref(false)
                 sync_blocks!(activeTime; compute_fn = function(slot::Int)
@@ -2501,7 +2155,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     end
                 end)
             else
-                # Last stage: plain sync (no next stage to overlap)
+                # Last stage or multi-block: plain sync (no next stage to overlap)
                 sync_blocks!(activeTime)
             end
             if profiling; gpu_sync(); t_sync += (time_ns() - _t0) / 1e9; end
@@ -2645,7 +2299,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             printstyled("\tdt: ")
             @printf "%.2e" current_dt
             if use_implicit
-                printstyled("\t[LU-SGS]")
+                _solver_label = (isdefined(@__MODULE__, :implicit_solver) && implicit_solver == :gmres) ? "[GMRES]" : "[LU-SGS]"
+                printstyled("\t$(_solver_label)")
             else
                 printstyled("\t[RK3]")
             end

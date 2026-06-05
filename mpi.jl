@@ -717,10 +717,10 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
                 u_pack_end   = local_u_dst_e + 2NG
                 u_pack_len   = u_pack_end - u_pack_start + 1
 
+                # Check if src block is local (on the same rank)
                 src_is_local = (haskey(blocks, src_b_id) && world_rank == src_rank_global)
                 if !src_is_local && @isdefined(Block_to_rank)
-                    mapped_src_b = src_b_id >= 100 ? src_b_id - 100 : src_b_id
-                    src_is_local = (Block_to_rank[mapped_src_b + 1] == world_rank)
+                    src_is_local = (Block_to_rank[src_b_id + 1] == world_rank)
                 end
 
                 # ── Method C: Delta mode — pack only border sub-regions ──
@@ -888,8 +888,8 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
 
     if length(reqs_send) > 0 || length(local_unpack_jobs) > 0
         if length(reqs_send) > 0
-            reqs_all = [reqs_send; reqs_recv]
-            MPI.Waitall(reqs_all)
+            MPI.Waitall(reqs_send)
+            MPI.Waitall(reqs_recv)
         end
 
         # ── Per-slot H2D + unpack for remote slots ──

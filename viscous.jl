@@ -276,7 +276,6 @@ function viscous_flux_k(Q, Fv_z,
     end
     near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
     near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
-
     kL = k; kR = k + 1
     @inbounds begin
         u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])

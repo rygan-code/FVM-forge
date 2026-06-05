@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 # physics.jl — Equation system abstraction layer
 # ═══════════════════════════════════════════════════════════════════════
-# Defines the equation type (compressible / MHD)
+# Defines the equation type (compressible / incompressible_AC / MHD)
 # and derived constants (Ncons, Nprim). All downstream code uses these
 # compile-time constants for dispatch — zero runtime overhead.
 #
@@ -19,7 +19,7 @@ end
 @assert FT === Float32 || FT === Float64 "FT must be Float32 or Float64, got $FT"
 
 # ─── Equation system type ───
-# Must be defined as `const equation_type = :compressible` (or :MHD)
+# Must be defined as `const equation_type = :compressible` (or :incompressible_AC, :MHD)
 # in the run script BEFORE including this file.
 # If not defined, default to compressible:
 if !@isdefined(equation_type)

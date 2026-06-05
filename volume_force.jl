@@ -80,7 +80,7 @@ function Assign_rotation_var(Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp, x_rot_start,
     return
 end
 
-function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ωz, ramp)
+function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ωz)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -95,20 +95,15 @@ function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ω
     @inbounds v = Q[ii, jj, kk, 3]
     @inbounds w = Q[ii, jj, kk, 4]
     
-    # Scale local rotation vectors by ramp factor
-    @inbounds Ωx_loc = Ωx[ii, jj, kk] * ramp
-    @inbounds Ωy_loc = Ωy[ii, jj, kk] * ramp
-    @inbounds Ωz_loc = Ωz[ii, jj, kk] * ramp
-
     # Coriolis force
-    fx = FT(2.0)*ρ*(v*Ωz_loc-w*Ωy_loc)
-    fy = FT(2.0)*ρ*(w*Ωx_loc-u*Ωz_loc)
-    fz = FT(2.0)*ρ*(u*Ωy_loc-v*Ωx_loc)
+    @inbounds fx = FT(2.0)*ρ*(v*Ωz[ii, jj, kk]-w*Ωy[ii, jj, kk])
+    @inbounds fy = FT(2.0)*ρ*(w*Ωx[ii, jj, kk]-u*Ωz[ii, jj, kk])
+    @inbounds fz = FT(2.0)*ρ*(u*Ωy[ii, jj, kk]-v*Ωx[ii, jj, kk])
 
     # Centrifugal force
-    fx += ρ*((Ωy_loc^2 + Ωz_loc^2)*x[ii, jj, kk]-Ωx_loc*(Ωy_loc*y[ii, jj, kk]+Ωz_loc*z[ii, jj, kk]))
-    fy += ρ*((Ωz_loc^2 + Ωx_loc^2)*y[ii, jj, kk]-Ωy_loc*(Ωz_loc*z[ii, jj, kk]+Ωx_loc*x[ii, jj, kk]))
-    fz += ρ*((Ωx_loc^2 + Ωy_loc^2)*z[ii, jj, kk]-Ωz_loc*(Ωx_loc*x[ii, jj, kk]+Ωy_loc*y[ii, jj, kk]))
+    @inbounds fx += ρ*((Ωy[ii, jj, kk]^2 + Ωz[ii, jj, kk]^2)*x[ii, jj, kk]-Ωx[ii, jj, kk]*(Ωy[ii, jj, kk]*y[ii, jj, kk]+Ωz[ii, jj, kk]*z[ii, jj, kk]))
+    @inbounds fy += ρ*((Ωz[ii, jj, kk]^2 + Ωx[ii, jj, kk]^2)*y[ii, jj, kk]-Ωy[ii, jj, kk]*(Ωz[ii, jj, kk]*z[ii, jj, kk]+Ωx[ii, jj, kk]*x[ii, jj, kk]))
+    @inbounds fz += ρ*((Ωx[ii, jj, kk]^2 + Ωy[ii, jj, kk]^2)*z[ii, jj, kk]-Ωz[ii, jj, kk]*(Ωx[ii, jj, kk]*x[ii, jj, kk]+Ωy[ii, jj, kk]*y[ii, jj, kk]))
 
     # Euler force (requires Omega gradients)
     # Note: For constant Omega, this is zero. 
@@ -170,13 +165,12 @@ function Update_bulk_force_params(blocks, tt, KRK, comm_world, rank)
         u_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 2]
         vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
         
-        # Avoid multi-array mapreduce on views (which causes compilation or value mismatch bugs in older AMDGPU versions)
-        temp_ρ = ρ_v ./ vol_v
-        temp_vol = one(FT) ./ vol_v
-        temp_ρu = ρ_v .* u_v ./ vol_v
-        ρ_local_sum += sum(temp_ρ)
-        volume_local_sum += sum(temp_vol)
-        u_local_sum += sum(temp_ρu)
+        # 2-arg mapreduce is well-supported on GPUArrays (zero allocation)
+        ρ_local_sum += mapreduce(/, +, ρ_v, vol_v)           # sum(ρ/vol)
+        volume_local_sum += mapreduce(v -> one(FT) / v, +, vol_v) # sum(1/vol)
+        
+        # Zero-allocation: avoids temporary GPU arrays that leak RDMA registrations
+        u_local_sum += mapreduce((r,u,v) -> r*u/v, +, ρ_v, u_v, vol_v)
     end
     
     # Global reduction across ALL blocks using comm_world
@@ -282,12 +276,9 @@ function Update_const_massflux_params(blocks, tt, KRK, dt, comm_world, rank)
         u_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 2]
         vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
         
-        temp_ρu = Float64.(ρ_v) .* Float64.(u_v) ./ Float64.(vol_v)
-        temp_ρ = Float64.(ρ_v) ./ Float64.(vol_v)
-        temp_vol = 1.0 ./ Float64.(vol_v)
-        ρu_local_sum += sum(temp_ρu)
-        ρ_local_sum += sum(temp_ρ)
-        volume_local_sum += sum(temp_vol)
+        ρu_local_sum += mapreduce((r,u,v) -> Float64(r)*Float64(u)/Float64(v), +, ρ_v, u_v, vol_v; init=0.0)
+        ρ_local_sum += mapreduce((r,v) -> Float64(r)/Float64(v), +, ρ_v, vol_v; init=0.0)
+        volume_local_sum += mapreduce(v -> 1.0 / Float64(v), +, vol_v; init=0.0)
     end
     
     # Global reduction
@@ -449,13 +440,11 @@ function Update_deschamps_pipe_params(blocks, tt, KRK, dt, comm_world, rank)
         u_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 2]
         vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
         
-        # Avoid multi-array mapreduce on views (which causes compilation or value mismatch bugs in older AMDGPU versions)
-        temp_ρu = ρ_v .* u_v ./ vol_v
-        temp_ρ = ρ_v ./ vol_v
-        temp_vol = one(FT) ./ vol_v
-        ρu_local_sum += Float64(sum(temp_ρu))
-        ρ_local_sum += Float64(sum(temp_ρ))
-        volume_local_sum += Float64(sum(temp_vol))
+        # Single fused reduction: compute all 3 sums in one GPU pass
+        # instead of 3 separate mapreduce calls (saves 2 GPU syncs + 2 D→H copies)
+        ρu_local_sum += Float64(mapreduce((r,u,v) -> r*u/v, +, ρ_v, u_v, vol_v))
+        ρ_local_sum += Float64(mapreduce((r,v) -> r/v, +, ρ_v, vol_v))
+        volume_local_sum += Float64(mapreduce(v -> one(FT) / v, +, vol_v))
     end
     
     # Global reduction
@@ -534,8 +523,8 @@ function Update_deschamps_pipe_params(blocks, tt, KRK, dt, comm_world, rank)
     deschamps_state.Qm_prev = Qm_current
     deschamps_state.g_prev = 0.0
     
-    if (tt % 100 == 0 || tt <= 20) && rank == 0 && KRK == 1
-        @printf "Main-Deschamps: Iteration %d | rho_avg: %.4e (target: %.4e) | u_avg: %.4e (target: %.4e) | f1: %.6e | Qm_err: %.4e | flowx: %.4e\n" tt ρ_avg ρ_bulk_target u_avg u_bulk_target deschamps_state.f1 Qm_error_curr flowx
+    if (tt % 100 == 0 || tt == 1) && rank == 0 && KRK == 1
+        @printf "Iteration: %d | rho_avg: %.4e (target: %.4e) | u_avg: %.4e (target: %.4e) | f1: %.6e | Qm_err: %.4e | flowx: %.4e\n" tt ρ_avg ρ_bulk_target u_avg u_bulk_target deschamps_state.f1 Qm_error_curr flowx
         flush(stdout)
     end
     
@@ -694,12 +683,9 @@ function Update_HIT_forcing(blocks, A_force, comm_world, rank, tt, KRK)
         w_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 4]
         
         ρ_local  += sum(ρ_v)
-        temp_ρu = ρ_v .* u_v
-        temp_ρv = ρ_v .* v_v
-        temp_ρw = ρ_v .* w_v
-        ρu_local += sum(temp_ρu)
-        ρv_local += sum(temp_ρv)
-        ρw_local += sum(temp_ρw)
+        ρu_local += mapreduce(*, +, ρ_v, u_v)
+        ρv_local += mapreduce(*, +, ρ_v, v_v)
+        ρw_local += mapreduce(*, +, ρ_v, w_v)
     end
     
     # Global reduction
@@ -740,7 +726,278 @@ function Apply_HIT_forcing!(dU_forced, Q, A_force, u_mean, v_mean, w_mean, nxp, 
     @gpu_launch threads=nthreads blocks=nb HIT_forcing_kernel!(dU_forced, Q, A_force, u_mean, v_mean, w_mean, nxp, nyp, nzp)
 end
 
+# =============================================================================
+# AC Incompressible Pipe Flow: Constant Pressure Gradient Forcing
+#
+# For incompressible pipe flow, the streamwise momentum equation is:
+#   ∂u/∂t + ... = -∂p/∂x + ν∇²u + f_x
+#
+# The body force f_x maintains the target bulk velocity U_bulk = 1.0.
+# With normalized quantities (U_bulk=1, D=1, ρ=1):
+#   Re = U_bulk * D / ν = 1/ν_AC
+#
+# Controller: integral (I) control on bulk velocity error
+#   f1^{n+1} = f1^n + K_I * (U_target - U_avg)
+# This ensures zero steady-state error in u_bulk.
+#
+# Initial guess: turbulent Dean correlation for fast startup:
+#   C_f = 0.073 * Re_D^{-0.25}
+#   f_x = C_f * ρ * U² * 2 / R  (force balance: f_x * πR²L = τ_w * 2πRL)
+#
+# Q = [p, u, v, w] — only 4 components, NO density or energy equation
+# =============================================================================
 
+# GPU kernel: apply streamwise body force to momentum equation only
+# For AC, U = [p, u, v, w] — force goes into U[...,2] (x-momentum)
+function ac_pipe_force_kernel!(U, f1_val, nxp, nyp, nzp, dt)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp
+        return
+    end
+    
+    ii, jj, kk = i+NG, j+NG, k+NG
+    
+    # Only streamwise momentum forcing (no pressure, no v, no w)
+    @inbounds U[ii, jj, kk, 2] += f1_val * dt
+    
+    return
+end
+
+# GPU kernel: AC pipe force for IMPLICIT path (writes to dU_forced with LOCAL indexing)
+# dU_forced has size (nxp, nyp, nzp, Ncons) — NO ghost padding.
+# Must zero all components and set force in component 2 only.
+function ac_pipe_force_rhs_kernel!(dU_forced, f1_val, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp
+        return
+    end
+    
+    # Zero all components, set streamwise force (intensive: force per unit volume)
+    @inbounds dU_forced[i, j, k, 1] = zero(FT)
+    @inbounds dU_forced[i, j, k, 2] = f1_val   # No dt factor — handled by div_to_rhs
+    @inbounds dU_forced[i, j, k, 3] = zero(FT)
+    @inbounds dU_forced[i, j, k, 4] = zero(FT)
+    
+    return
+end
+
+# =============================================================================
+# AC Pressure Diffusion — HPDC (Hyperbolic-Parabolic Divergence Cleaning)
+#
+# The standard AC pressure equation:
+#   ∂p/∂t + β²∇·u = 0
+# only propagates divergence errors as waves (speed β). These waves bounce
+# around the domain and are slow to decay.
+#
+# Adding pressure diffusion (stabilized AC / HPDC):
+#   ∂p/∂t + β²∇·u = ε_p · ∇²p
+#
+# The parabolic term ε_p·∇²p damps pseudo-acoustic oscillations, analogous
+# to the -ψ/c_r² damping in GLM-MHD (Dedner et al. 2002).
+#
+# ε_p choice: typically ε_p = α · ν_AC where α ~ 1-10
+#   - Too small: weak damping, acoustic noise persists
+#   - Too large: smears physical pressure gradients
+#   - Recommended: α ≈ 2-5 (aggressive cleaning for pipe flow)
+#
+# Uses volume-weighted FVM Laplacian: ∇²p ≈ (1/V) Σ_faces A·(∂p/∂n)
+# =============================================================================
+
+function ac_pressure_diffusion_kernel!(U, Q, Vol, Areai, Areaj, Areak,
+                                       dt, eps_p, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp
+        return
+    end
+    
+    ii, jj, kk = i+NG, j+NG, k+NG
+    
+    # FVM metric-weighted Laplacian: ∇²p ≈ (1/V) Σ_faces (p_nb - p_c) * A² / V_half
+    # V_half = 0.5*(V_center + V_neighbor) — harmonic-mean distance approximation
+    # This correctly handles non-uniform and curvilinear grids.
+    @inbounds p_c  = Q[ii, jj, kk, 1]
+    @inbounds v_c  = one(FT) / (Vol[ii, jj, kk] + FT(1.0e-30))  # cell volume (Vol stores 1/V)
+
+    # I-faces
+    @inbounds begin
+        p_L = Q[ii-1, jj, kk, 1];  v_L = one(FT) / (Vol[ii-1, jj, kk] + FT(1.0e-30))
+        p_R = Q[ii+1, jj, kk, 1];  v_R = one(FT) / (Vol[ii+1, jj, kk] + FT(1.0e-30))
+        A_iL = Areai[ii, jj, kk];  A_iR = Areai[ii+1, jj, kk]
+    end
+    coeff_iL = A_iL * A_iL / (FT(0.5) * (v_c + v_L) + FT(1.0e-30))
+    coeff_iR = A_iR * A_iR / (FT(0.5) * (v_c + v_R) + FT(1.0e-30))
+
+    # J-faces
+    @inbounds begin
+        p_B = Q[ii, jj-1, kk, 1];  v_B = one(FT) / (Vol[ii, jj-1, kk] + FT(1.0e-30))
+        p_T = Q[ii, jj+1, kk, 1];  v_T = one(FT) / (Vol[ii, jj+1, kk] + FT(1.0e-30))
+        A_jB = Areaj[ii, jj, kk];  A_jT = Areaj[ii, jj+1, kk]
+    end
+    coeff_jB = A_jB * A_jB / (FT(0.5) * (v_c + v_B) + FT(1.0e-30))
+    coeff_jT = A_jT * A_jT / (FT(0.5) * (v_c + v_T) + FT(1.0e-30))
+
+    # K-faces
+    @inbounds begin
+        p_D = Q[ii, jj, kk-1, 1];  v_D = one(FT) / (Vol[ii, jj, kk-1] + FT(1.0e-30))
+        p_U = Q[ii, jj, kk+1, 1];  v_U = one(FT) / (Vol[ii, jj, kk+1] + FT(1.0e-30))
+        A_kD = Areak[ii, jj, kk];  A_kU = Areak[ii, jj, kk+1]
+    end
+    coeff_kD = A_kD * A_kD / (FT(0.5) * (v_c + v_D) + FT(1.0e-30))
+    coeff_kU = A_kU * A_kU / (FT(0.5) * (v_c + v_U) + FT(1.0e-30))
+
+    # Extensive Laplacian: Σ coeff * (p_nb - p_c)
+    lap_p = coeff_iL * (p_L - p_c) + coeff_iR * (p_R - p_c) +
+            coeff_jB * (p_B - p_c) + coeff_jT * (p_T - p_c) +
+            coeff_kD * (p_D - p_c) + coeff_kU * (p_U - p_c)
+
+    # Intensive ∇²p = lap_p / V_center, apply: U[1] += ε_p × ∇²p × dt
+    @inbounds vol_inv = Vol[ii, jj, kk]
+    @inbounds U[ii, jj, kk, 1] += eps_p * lap_p * vol_inv * dt
+    
+    return
+end
+
+function Apply_ac_pressure_diffusion!(U, Q, Vol, Areai, Areaj, Areak,
+                                      dt, eps_p, nxp, nyp, nzp)
+    nb = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
+    @gpu_launch threads=nthreads blocks=nb ac_pressure_diffusion_kernel!(
+        U, Q, Vol, Areai, Areaj, Areak, dt, eps_p, nxp, nyp, nzp)
+end
+
+# ── HPDC for implicit (BDF2) path: add ε_p·∇²p to dU_rhs[...,1] ──
+# dU_rhs is in extensive form (same units as flux divergence).
+# Uses FVM metric-weighted Laplacian for curvilinear grid correctness.
+function ac_hpdc_rhs_kernel!(dU_rhs, Q, Vol, Areai, Areaj, Areak,
+                              eps_p, nxp, nyp, nzp)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp
+        return
+    end
+    
+    ii, jj, kk = i+NG, j+NG, k+NG
+    
+    @inbounds p_c = Q[ii, jj, kk, 1]
+    @inbounds v_c = one(FT) / (Vol[ii, jj, kk] + FT(1.0e-30))
+
+    @inbounds begin
+        p_L = Q[ii-1, jj, kk, 1]; v_L = one(FT) / (Vol[ii-1, jj, kk] + FT(1.0e-30))
+        p_R = Q[ii+1, jj, kk, 1]; v_R = one(FT) / (Vol[ii+1, jj, kk] + FT(1.0e-30))
+        A_iL = Areai[ii, jj, kk]; A_iR = Areai[ii+1, jj, kk]
+        p_B = Q[ii, jj-1, kk, 1]; v_B = one(FT) / (Vol[ii, jj-1, kk] + FT(1.0e-30))
+        p_T = Q[ii, jj+1, kk, 1]; v_T = one(FT) / (Vol[ii, jj+1, kk] + FT(1.0e-30))
+        A_jB = Areaj[ii, jj, kk]; A_jT = Areaj[ii, jj+1, kk]
+        p_D = Q[ii, jj, kk-1, 1]; v_D = one(FT) / (Vol[ii, jj, kk-1] + FT(1.0e-30))
+        p_U = Q[ii, jj, kk+1, 1]; v_U = one(FT) / (Vol[ii, jj, kk+1] + FT(1.0e-30))
+        A_kD = Areak[ii, jj, kk]; A_kU = Areak[ii, jj, kk+1]
+    end
+
+    lap_p = A_iL*A_iL / (FT(0.5)*(v_c+v_L)+FT(1e-30)) * (p_L - p_c) +
+            A_iR*A_iR / (FT(0.5)*(v_c+v_R)+FT(1e-30)) * (p_R - p_c) +
+            A_jB*A_jB / (FT(0.5)*(v_c+v_B)+FT(1e-30)) * (p_B - p_c) +
+            A_jT*A_jT / (FT(0.5)*(v_c+v_T)+FT(1e-30)) * (p_T - p_c) +
+            A_kD*A_kD / (FT(0.5)*(v_c+v_D)+FT(1e-30)) * (p_D - p_c) +
+            A_kU*A_kU / (FT(0.5)*(v_c+v_U)+FT(1e-30)) * (p_U - p_c)
+
+    # Add extensive Laplacian to pressure equation RHS (component 1)
+    @inbounds dU_rhs[i, j, k, 1] += eps_p * lap_p
+    
+    return
+end
+
+# Persistent state for AC pipe forcing controller  
+mutable struct ACPipeForceState
+    f1::Float64        # Current body force magnitude
+    u_bulk_prev::Float64   # Previous bulk velocity
+    initialized::Bool
+end
+
+const ac_pipe_state = ACPipeForceState(0.0, 0.0, false)
+
+# Compute forcing parameter: integral controller on bulk velocity
+# Target: u_bulk = 1.0 (normalized), so Re = 1/ν_AC = Re_target
+function Update_ac_pipe_force(blocks, tt, KRK, dt, comm_world, rank)
+    if !flow_forcing; return zero(FT); end
+    
+    u_bulk_target = 1.0  # Normalized for AC: Re = U_bulk * D / ν = 1/ν_AC
+    
+    # Compute volume-averaged streamwise velocity
+    u_local_sum = 0.0
+    volume_local_sum = 0.0
+    
+    for (bid, b) in blocks
+        NGp = NG+1
+        nx_end, ny_end, nz_end = b.Nx+NG, b.Ny+NG, b.Nz+NG
+        
+        u_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 2]  # Q[2] = u for AC
+        vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
+        
+        u_local_sum += Float64(mapreduce((u,v) -> u/v, +, u_v, vol_v))
+        volume_local_sum += Float64(mapreduce(v -> one(FT) / v, +, vol_v))
+    end
+    
+    # Global reduction
+    u_sum_global = MPI.Allreduce(u_local_sum, MPI.SUM, comm_world)
+    volume_sum_global = MPI.Allreduce(volume_local_sum, MPI.SUM, comm_world)
+    
+    u_avg = u_sum_global / volume_sum_global
+    
+    # Initialize on first call
+    if !ac_pipe_state.initialized
+        # ── Turbulent initial guess (Dean 1978 correlation) ──
+        # C_f = 0.073 * Re_D^{-0.25}
+        # Force balance for pipe: f_x = 2 τ_w / R = C_f * ρ * U² / R
+        # Normalized: ρ=1, U=1, R=0.5 → f_x = 2 * C_f
+        Re_D = Float64(Re_target)
+        C_f_dean = 0.073 * Re_D^(-0.25)
+        ac_pipe_state.f1 = 2.0 * C_f_dean / Float64(R0)
+        ac_pipe_state.u_bulk_prev = u_avg
+        ac_pipe_state.initialized = true
+        
+        # Also compute laminar value for reference
+        f1_laminar = 8.0 * Float64(ν_AC) * u_bulk_target / Float64(R0)^2
+        
+        if rank == 0 && KRK == 1
+            @printf "AC Pipe Force [INIT]: f1_turb = %.6e (Dean) | f1_lam = %.6e (Poiseuille, %.1f× lower) | u_avg = %.4e\n" ac_pipe_state.f1 f1_laminar (ac_pipe_state.f1/f1_laminar) u_avg
+            flush(stdout)
+        end
+        
+        return FT(ac_pipe_state.f1)
+    end
+    
+    # ── Integral controller: f1 += K_I * (u_target - u_avg) ──
+    # K_I must be gentle: the body force now correctly enters the implicit RHS,
+    # so the flow responds immediately. Aggressive K_I causes force overshoot
+    # during the initial transient → pressure field diverges.
+    # Rule of thumb: convergence in ~10 flow-throughs (Lx/u ≈ 7.5s physical)
+    K_I = 0.2
+    u_error = u_bulk_target - u_avg
+    ac_pipe_state.f1 += K_I * u_error
+    
+    # Anti-windup clamp: limit f1 to [0, f1_max]
+    # f1_max = 10× Dean correlation (generous upper bound for turbulent pipe)
+    Re_D = Float64(Re_target)
+    C_f_dean = 0.073 * Re_D^(-0.25)
+    f1_max = 10.0 * 2.0 * C_f_dean / Float64(R0)
+    ac_pipe_state.f1 = clamp(ac_pipe_state.f1, 0.0, f1_max)
+    
+    ac_pipe_state.u_bulk_prev = u_avg
+    
+    if (tt % 100 == 0 || tt == 1) && rank == 0 && KRK == 1
+        Re_actual = u_avg / Float64(ν_AC)  # Re = U_bulk * D / ν, D=1
+        @printf "AC Pipe Force: iter=%d | u_avg=%.4e (target=%.4e) | Re=%.0f (target=%.0f) | f1=%.6e | u_err=%.4e\n" tt u_avg u_bulk_target Re_actual Re_target ac_pipe_state.f1 u_error
+        flush(stdout)
+    end
+    
+    return FT(ac_pipe_state.f1)
+end
 
 # ═══════════════════════════════════════════════════════════════════════
 # volume_force_mhd.jl — MHD-specific volume source terms
@@ -802,260 +1059,3 @@ function compute_cf_max_kernel!(cf_arr, Q, nxp, nyp, nzp)
 
     return
 end
-
-# ═══════════════════════════════════════════════════════════════════════
-# CEBL-DNS volume source terms
-# ═══════════════════════════════════════════════════════════════════════
-
-using Adapt
-
-mutable struct CEBLForcingState{V, QType}
-    enabled::Bool
-    profile_size::Int32
-    y::V
-    M::V
-    F::V
-    Q::V
-    Q_cebl::QType
-end
-
-Adapt.adapt_structure(to, state::CEBLForcingState) = CEBLForcingState(
-    state.enabled,
-    state.profile_size,
-    adapt(to, state.y),
-    adapt(to, state.M),
-    adapt(to, state.F),
-    adapt(to, state.Q),
-    adapt(to, state.Q_cebl)
-)
-
-function create_dummy_cebl_state(FT::Type)
-    V = GPUVector{FT}
-    y_d = V(zeros(FT, 0))
-    M_d = V(zeros(FT, 0))
-    F_d = V(zeros(FT, 0))
-    Q_d = V(zeros(FT, 0))
-    return CEBLForcingState{V, Any}(
-        false, Int32(0), y_d, M_d, F_d, Q_d, nothing
-    )
-end
-
-function init_cebl_state(source_file::String)
-    h_y = h5read(source_file, "y_coord")
-    h_M = h5read(source_file, "M")
-    h_F = h5read(source_file, "F")
-    h_Q = h5read(source_file, "Q")
-    
-    h_y = FT.(h_y)
-    h_M = FT.(h_M)
-    h_F = FT.(h_F)
-    h_Q = FT.(h_Q)
-    
-    V = GPUVector{FT}
-    y_d = V(h_y)
-    M_d = V(h_M)
-    F_d = V(h_F)
-    Q_d = V(h_Q)
-    
-    return CEBLForcingState{V, Any}(
-        true, Int32(length(h_y)), y_d, M_d, F_d, Q_d, nothing
-    )
-end
-
-# GPU-compatible 1D interpolation helper
-@inline function interpolate_1d(val::FT, coords, profile, N::Int32) where {FT}
-    if N <= 0
-        return zero(FT)
-    end
-    if val <= coords[1]
-        return profile[1]
-    elseif val >= coords[N]
-        return profile[N]
-    end
-    
-    # Binary search
-    low = Int32(1)
-    high = N
-    while high - low > Int32(1)
-        mid = (low + high) >> 1
-        if val >= coords[mid]
-            low = mid
-        else
-            high = mid
-        end
-    end
-    
-    # Linear interpolation
-    c_low = coords[low]
-    c_high = coords[high]
-    t = (val - c_low) / (c_high - c_low + eps(FT))
-    return profile[low] + t * (profile[high] - profile[low])
-end
-
-# CEBL source terms kernel
-function cebl_force_kernel!(dU_forced, Q, y_coord, z_coord, nxp, nyp, nzp,
-                            cebl_y, cebl_M, cebl_F, cebl_Q, cebl_N, is_pipe::Bool)
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp || j > nyp || k > nzp
-        return
-    end
-    
-    ii, jj, kk = i+NG, j+NG, k+NG
-    
-    # Calculate wall distance
-    if is_pipe
-        r = sqrt(y_coord[ii, jj, kk]^2 + z_coord[ii, jj, kk]^2)
-        d_wall = R0 - r
-    else
-        d_wall = y_coord[ii, jj, kk]
-    end
-    
-    # Interpolate source terms
-    M_val = interpolate_1d(d_wall, cebl_y, cebl_M, cebl_N)
-    F_val = interpolate_1d(d_wall, cebl_y, cebl_F, cebl_N)
-    Q_val = interpolate_1d(d_wall, cebl_y, cebl_Q, cebl_N)
-    
-    # Add to dU_forced (negative source terms as per formulation)
-    @inbounds dU_forced[i, j, k, 1] -= M_val
-    @inbounds dU_forced[i, j, k, 2] -= F_val
-    @inbounds dU_forced[i, j, k, 5] -= Q_val
-    
-    return
-end
-
-function Apply_CEBL_force!(dU_forced, Q, y_coord, z_coord, state::CEBLForcingState, nxp, nyp, nzp)
-    if !state.enabled
-        return
-    end
-    is_pipe = (test_case == "PipeFlow")
-    nb = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
-    @gpu_launch threads=nthreads blocks=nb cebl_force_kernel!(
-        dU_forced, Q, y_coord, z_coord, nxp, nyp, nzp,
-        state.y, state.M, state.F, state.Q, state.profile_size, is_pipe
-    )
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# Local periodic wrapping in x-direction for CEBL auxiliary block
-# ═══════════════════════════════════════════════════════════════════════
-
-function local_periodic_x_kernel!(V, nxp, nyp, nzp, NG, Nvar)
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if j > nyp + 2*NG || k > nzp + 2*NG
-        return
-    end
-    for i in 1:NG
-        for n in 1:Nvar
-            @inbounds V[i, j, k, n] = V[nxp + i, j, k, n]
-            @inbounds V[nxp + NG + i, j, k, n] = V[NG + i, j, k, n]
-        end
-    end
-    return
-end
-
-function Apply_local_periodic_x!(V, nxp, nyp, nzp, NG, Nvar)
-    nthreads_2d = (16, 16)
-    nb_2d = (1, cld(nyp + 2*NG, nthreads_2d[1]), cld(nzp + 2*NG, nthreads_2d[2]))
-    @gpu_launch threads=(1, nthreads_2d[1], nthreads_2d[2]) blocks=nb_2d local_periodic_x_kernel!(
-        V, nxp, nyp, nzp, NG, Nvar
-    )
-end
-
-# ═══════════════════════════════════════════════════════════════════════
-# Local Deschamps Constant Mass Flux Forcing for CEBL Auxiliary Block
-# ═══════════════════════════════════════════════════════════════════════
-
-const cebl_deschamps_state = DeschampsState(0.0, 0.0, 0.0, 0.0, 0.0, false)
-
-function Update_cebl_deschamps_params(cebl_blocks, tt, KRK, dt, comm_world, rank)
-    c_wall = sqrt(γ * Rg * Tw)
-    u_bulk_target = Ma_target * c_wall
-    μw = C_s * Tw * sqrt(Tw) / (Tw + T_s)
-    ρ_bulk_target = Re_target * μw / (u_bulk_target * 2 * R0)
-    
-    # Cross-section area
-    A_cross = Float64(π) * Float64(R0)^2
-    Q0 = Float64(ρ_bulk_target) * Float64(u_bulk_target) * A_cross
-    
-    ρu_local_sum = 0.0
-    ρ_local_sum = 0.0
-    volume_local_sum = 0.0
-    
-    for (cebl_bid, b) in cebl_blocks
-        NGp = NG+1
-        nx_end, ny_end, nz_end = b.Nx+NG, b.Ny+NG, b.Nz+NG
-        
-        ρ_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 1]
-        u_v = @view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 2]
-        vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
-        
-        # Avoid multi-array mapreduce on views (which causes compilation or value mismatch bugs in older AMDGPU versions)
-        temp_ρu = ρ_v .* u_v ./ vol_v
-        temp_ρ = ρ_v ./ vol_v
-        temp_vol = one(FT) ./ vol_v
-        
-        ρu_local_sum += Float64(sum(temp_ρu))
-        ρ_local_sum += Float64(sum(temp_ρ))
-        volume_local_sum += Float64(sum(temp_vol))
-    end
-    
-    # Global reduction across ALL ranks in COMM_WORLD
-    ρu_sum_global = MPI.Allreduce(ρu_local_sum, MPI.SUM, comm_world)
-    ρ_sum_global = MPI.Allreduce(ρ_local_sum, MPI.SUM, comm_world)
-    volume_sum_global = MPI.Allreduce(volume_local_sum, MPI.SUM, comm_world)
-    
-    u_avg = ρu_sum_global / ρ_sum_global
-    ρ_avg = ρ_sum_global / volume_sum_global
-    Qm_current = ρu_sum_global / volume_sum_global * A_cross
-    
-    ρ_error = Float64(ρ_bulk_target) - ρ_avg
-    K_mass = 50.0
-    flowx = K_mass * ρ_error
-    
-    if !cebl_deschamps_state.initialized
-        cebl_deschamps_state.Qm_prev = Qm_current
-        cebl_deschamps_state.Qm_smooth = Qm_current
-        
-        Re_D = Float64(Re_target)
-        Cf_dean = 0.073 * Re_D^(-0.25)
-        ρ_init = Float64(ρ_bulk_target)
-        U_init = Float64(u_bulk_target)
-        cebl_deschamps_state.f1 = Cf_dean * ρ_init * U_init^2 / Float64(R0)
-        cebl_deschamps_state.f1_prev = cebl_deschamps_state.f1
-        cebl_deschamps_state.g_prev = 0.0
-        cebl_deschamps_state.initialized = true
-        
-        if rank == 0 && KRK == 1
-            f1_laminar = 8.0 * Float64(μw) * Float64(u_bulk_target) / Float64(R0)^2
-            @printf "CEBL-Deschamps: Iteration %d initialized | f1: %.6e (vs laminar: %.6e) | Qm_err: %.4e | flowx: %.4e\n" tt cebl_deschamps_state.f1 f1_laminar (Qm_current - Q0) flowx
-            flush(stdout)
-        end
-        return FT(cebl_deschamps_state.f1), FT(flowx)
-    end
-    
-    # EMA smoothing of Qm
-    α_ema = 0.01
-    cebl_deschamps_state.Qm_smooth = α_ema * Qm_current + (1.0 - α_ema) * cebl_deschamps_state.Qm_smooth
-    Qm_error_smooth = cebl_deschamps_state.Qm_smooth - Q0
-    Qm_error_curr = Qm_current - Q0
-    
-    # PI parameters (consistent with main blocks, K_p = 0.003)
-    K_p = 0.003
-    
-    cebl_deschamps_state.f1_prev = cebl_deschamps_state.f1
-    cebl_deschamps_state.f1 -= (K_p / A_cross) * Qm_error_smooth
-    cebl_deschamps_state.Qm_prev = Qm_current
-    cebl_deschamps_state.g_prev = 0.0
-    
-    if rank == 0 && KRK == 1 && (tt % 100 == 0 || tt <= 20)
-        @printf "CEBL-Deschamps: Iteration %d | rho_avg: %.4e | u_avg: %.4e | f1: %.6e | Qm_err: %.4e | flowx: %.4e\n" tt ρ_avg u_avg cebl_deschamps_state.f1 Qm_error_curr flowx
-        flush(stdout)
-    end
-    
-    return FT(cebl_deschamps_state.f1), FT(flowx)
-end
-
-
