@@ -800,6 +800,11 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
     end
     
     initialize(Q, x, y, z, rx, ry, Nprocs_block, nxp, nyp, nzp)
+    if rx == 0 && ry == 0 && rz == 0 && bid == 0 && world_rank == 0
+        Q_cpu = Array(Q[NG+1, NG+1, NG+1, 1:6])
+        println(">>> Debug init: rho=$(Q_cpu[1]), u=$(Q_cpu[2]), v=$(Q_cpu[3]), w=$(Q_cpu[4]), p=$(Q_cpu[5]), T=$(Q_cpu[6])")
+        flush(stdout)
+    end
     @check_nan(Q, "Q after initialize", bid, world_rank, 0)
     nb = (cld(Nx_tot, nthreads[1]), cld(Ny_tot, nthreads[2]), cld(Nz_tot, nthreads[3]))
     @gpu_launch threads=nthreads blocks=nb prim2c(U, Q, nxp, nyp, nzp)
@@ -1098,7 +1103,7 @@ function blockAdvance(block::Block, dt, ϕ, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, world_
         @check_nan(Fz, "Fz after Conser_reconstruct_k", block.id, world_rank, tt)
     end
 
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         # Edge ghost cells are already filled by two-pass exchange in sync_blocks!
         @gpu_launch threads=threads_visc_i blocks=nb_visc_i viscous_flux_i(Q, Fv_x, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, Vol, nxp, nyp, nzp, block.is_interblock)
         @check_nan(Fv_x, "Fv_x after viscous_flux_i", block.id, world_rank, tt)
@@ -1145,7 +1150,7 @@ function blockAdvance_interior(block::Block, dt, ϕ, Fx, Fy, Fz, Fv_x, Fv_y, Fv_
         @gpu_launch_stream stream threads=threads_recon_k blocks=nb_recon_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(1))
     end
     # Viscous flux interior (viscous stencil >= 2 cells, fully covered by mode=1 range)
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         @gpu_launch_stream stream threads=threads_visc_i blocks=nb_visc_i viscous_flux_i(Q, Fv_x, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, block.Vol, nxp, nyp, nzp, block.is_interblock)
         @gpu_launch_stream stream threads=threads_visc_j blocks=nb_visc_j viscous_flux_j(Q, Fv_y, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, block.Vol, nxp, nyp, nzp, block.is_interblock)
         @gpu_launch_stream stream threads=threads_visc_k blocks=nb_visc_k viscous_flux_k(Q, Fv_z, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, block.Vol, nxp, nyp, nzp, block.is_interblock)
@@ -1200,10 +1205,39 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     Nblocks, connectivity, face_bc, bc_params, Nx_b, Ny_b, Nz_b = load_multiblock_connectivity(conn_path)
     
     # Override physical walls to slip wall for inviscid validation test cases on pipe meshes
-    if isdefined(Main, :test_case) && (Main.test_case == "BrioWu" || Main.test_case == "OrszagTang" || Main.test_case == "TG5_debug")
+    if (isdefined(Main, :test_case) && (Main.test_case == "BrioWu" || Main.test_case == "OrszagTang" || Main.test_case == "TG5_debug" || Main.test_case == "MagneticDecay")) ||
+       (isdefined(Main, :slip_wall_override) && Main.slip_wall_override)
         for (k, v) in face_bc
             if v == Int32(BC_ISOTHERMAL_WALL) || v == Int32(BC_ADIABATIC_WALL)
                 face_bc[k] = Int32(BC_SLIP_WALL)
+            end
+        end
+    end
+
+    # Override NSCBC outflow to zero-gradient outflow for inviscid validation runs to ensure stability
+    if isdefined(Main, :viscous) && !Main.viscous
+        for (k, v) in face_bc
+            if v == Int32(BC_NSCBC_OUTFLOW)
+                face_bc[k] = Int32(BC_ZERO_GRADIENT)
+            end
+        end
+    end
+
+    # Override transition inflow to wave inflow for wave verification test cases
+    if isdefined(Main, :wave_inflow_override) && Main.wave_inflow_override
+        for (k, v) in face_bc
+            if v == Int32(BC_TRANSITION_INFLOW)
+                face_bc[k] = Int32(BC_WAVE_INFLOW)
+                w_amp   = isdefined(Main, :wave_amp)   ? FT(Main.wave_amp)   : FT(0.001)
+                w_omega = isdefined(Main, :wave_omega) ? FT(Main.wave_omega) : FT(2.0)
+                w_m     = isdefined(Main, :wave_m)     ? FT(Main.wave_m)     : FT(0.0)
+                
+                p_list = Vector{FT}(undef, N_BC_PARAMS)
+                fill!(p_list, zero(FT))
+                p_list[1] = w_amp     # BCP_WAVE_AMP
+                p_list[2] = w_omega   # BCP_WAVE_OMEGA
+                p_list[3] = w_m       # BCP_WAVE_M
+                bc_params[k] = ntuple(i -> p_list[i], Val(N_BC_PARAMS))
             end
         end
     end
@@ -1464,7 +1498,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     threads_recon_k = cfg_recon_k.threads
 
     # Viscous flux kernels →per-direction
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         cfg_visc_i = auto_tune_kernel("visc_i", viscous_flux_i,
             first_b.Q, shared_Fvx, first_b.Areai, first_b.Areaj, first_b.Areak,
             first_b.nxi, first_b.nyi, first_b.nzi,
@@ -1714,8 +1748,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     end
 
     global global_avg_count = 0
-
-    while activeTime < Time && tt < maxStep
+    max_time_limit = isdefined(Main, :Time) && !(Main.Time isa Type) ? Main.Time : (isdefined(Main, :maxTime) ? Main.maxTime : 100.0)
+    while activeTime < max_time_limit && tt < maxStep
         tt = tt + 1
 
       # Determine whether to use implicit path this step
@@ -1959,6 +1993,22 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         dt_min = min(dt_min, dt_local)
                     end
                     current_dt = MPI.Allreduce(dt_min, MPI.MIN, MPI.COMM_WORLD)
+                    if tt <= 2
+                        for (bid, b) in blocks
+                            dt_h = Array(b.LTS_dt)
+                            Q_h = Array(b.Q)
+                            min_d = Inf
+                            min_idx = (1+NG, 1+NG, 1+NG)
+                            for kk in 1+NG:b.Nz+NG, jj in 1+NG:b.Ny+NG, ii in 1+NG:b.Nx+NG
+                                if dt_h[ii,jj,kk] < min_d
+                                    min_d = dt_h[ii,jj,kk]
+                                    min_idx = (ii, jj, kk)
+                                end
+                            end
+                            println("Rank $world_rank Block $bid step $tt: min_dt=$min_d at $min_idx, rho=$(Q_h[min_idx..., 1]), u=$(Q_h[min_idx..., 2]), v=$(Q_h[min_idx..., 3]), w=$(Q_h[min_idx..., 4]), p=$(Q_h[min_idx..., 5]), T=$(Q_h[min_idx..., 6])")
+                        end
+                        flush(stdout)
+                    end
 
                     # ── MHD: auto-compute ch_glm from max fast magnetosonic speed ──
                     if equation_type == :MHD
@@ -2064,7 +2114,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 if flow_forcing
                     # Skip Volume_force_kernel (Coriolis + centrifugal) when rotation is zero
                     if Omega_x != zero(FT)
-                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz)
+                        x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : (isdefined(@__MODULE__, :x_rot_start) ? FT(x_rot_start) : zero(FT))
+                        x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : (isdefined(@__MODULE__, :x_rot_end)   ? FT(x_rot_end)   : zero(FT))
+                        omega_x_val     = isdefined(Main, :Omega_x)     ? FT(Main.Omega_x)     : (isdefined(@__MODULE__, :Omega_x)     ? FT(Omega_x)     : zero(FT))
+                        @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(shared_dU_forced, b.Q, b.x, b.y, b.z, b.Nx, b.Ny, b.Nz, b.Ωx, b.Ωy, b.Ωz, x_rot_start_val, x_rot_end_val, omega_x_val)
                         if forcing_mode == 1
                             Apply_bulk_force!(shared_dU_forced, b.Q, forcex, flowx, current_dt, b.Nx, b.Ny, b.Nz)
                         elseif forcing_mode == 2
@@ -2126,6 +2179,47 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     @gpu_launch threads=nthreads blocks=nb_f div_rk_clip_prim(b.U, b.Un, b.Q, shared_Fx, shared_Fy, shared_Fz, shared_Fvx, shared_Fvy, shared_Fvz, current_dt, b.Vol, rk_a, b.Nx, b.Ny, b.Nz)
                 end
                 @check_nan(b.Q, "Q after div_rk_clip", b.id, world_rank, tt)
+
+                if tt == 1 && world_rank == 0
+                    U_cpu = Array(b.U)
+                    Un_cpu = Array(b.Un)
+                    Q_cpu = Array(b.Q)
+                    Fy_cpu = Array(shared_Fy)
+                    Fvy_cpu = Array(shared_Fvy)
+                    Vol_cpu = Array(b.Vol)
+                    ii = NG + 8
+                    kk = NG + 8
+                    jj = NG + 1
+                    
+                    fy_1 = Fy_cpu[ii-NG, jj-NG, kk-NG, 6]
+                    fy_2 = Fy_cpu[ii-NG, jj-NG+1, kk-NG, 6]
+                    fvy_1 = Fvy_cpu[ii-NG, jj-NG, kk-NG, 6]
+                    fvy_2 = Fvy_cpu[ii-NG, jj-NG+1, kk-NG, 6]
+                    vol = Vol_cpu[ii, jj, kk]
+                    
+                    println("="^50)
+                    println("DEBUG AT STEP 1:")
+                    println("  ii=$ii, jj=$jj, kk=$kk")
+                    println("  vol = ", vol)
+                    println("  fy_1 (face j=NG) = ", fy_1)
+                    println("  fy_2 (face j=NG+1) = ", fy_2)
+                    println("  fvy_1 (face j=NG) = ", fvy_1)
+                    println("  fvy_2 (face j=NG+1) = ", fvy_2)
+                    println("  current_dt = ", current_dt)
+                    println("  rk_a = ", rk_a)
+                    
+                    U_before = Un_cpu[ii, jj, kk, 6]
+                    div_term = (fy_1 - fy_2) - (fvy_1 - fvy_2)
+                    U_predicted_temp = U_before + div_term * current_dt * vol
+                    U_predicted = U_before + rk_a * (U_predicted_temp - U_before)
+                    
+                    println("  U_before[6] (Un) = ", U_before)
+                    println("  U_after_kernel[6] = ", U_cpu[ii, jj, kk, 6])
+                    println("  U_predicted[6]    = ", U_predicted)
+                    println("  Q_after_kernel[7] (Bx) = ", Q_cpu[ii, jj, kk, 7])
+                    println("="^50)
+                end
+
 
                 # ── MHD: GLM ψ-damping source term (operator splitting) ──
                 if equation_type == :MHD
@@ -2380,10 +2474,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         activeTime += current_dt
     end
     if world_rank == 0
-        @printf(">>> Loop exited: activeTime=%.6e (limit=%.2f), tt=%d (maxStep=%d)\n", activeTime, Time, tt, maxStep)
+        @printf(">>> Loop exited: activeTime=%.6e (limit=%.2f), tt=%d (maxStep=%d)\n", activeTime, max_time_limit, tt, maxStep)
         printstyled("Done!\n", color=:green)
         flush(stdout)
     end
+    plotFile_multiblock(tt, activeTime, blocks, world_rank, Nblocks, Block_Nprocs, block_comms)
     MPI.Barrier(MPI.COMM_WORLD)
     return blocks, activeTime
 end

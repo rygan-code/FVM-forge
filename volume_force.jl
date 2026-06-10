@@ -80,7 +80,7 @@ function Assign_rotation_var(Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp, x_rot_start,
     return
 end
 
-function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ωz)
+function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ωz, x_rot_start, x_rot_end, Omega_x)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -106,8 +106,19 @@ function Volume_force_kernel!(dU_forced, Q, x, y, z, nxp, nyp, nzp, Ωx, Ωy, Ω
     @inbounds fz += ρ*((Ωx[ii, jj, kk]^2 + Ωy[ii, jj, kk]^2)*z[ii, jj, kk]-Ωz[ii, jj, kk]*(Ωx[ii, jj, kk]*x[ii, jj, kk]+Ωy[ii, jj, kk]*y[ii, jj, kk]))
 
     # Euler force (requires Omega gradients)
-    # Note: For constant Omega, this is zero. 
-    # Providing the code structure for future non-uniform rotation.
+    # Steady state but spatially varying Omega_x(x) introduces convective Euler force:
+    # f_E = -rho * dOmega/dt x r = -rho * (u * dOmega_x/dx * x_hat) x r
+    dΩx_dx = zero(FT)
+    @inbounds x_loc = x[ii, jj, kk]
+    if x_loc > x_rot_start && x_loc < x_rot_end
+        dΩx_dx = Omega_x / (x_rot_end - x_rot_start)
+    end
+    
+    @inbounds y_loc = y[ii, jj, kk]
+    @inbounds z_loc = z[ii, jj, kk]
+    
+    fy += ρ * u * dΩx_dx * z_loc
+    fz -= ρ * u * dΩx_dx * y_loc
     
     @inbounds dU_forced[i, j, k, 1] = zero(FT)
     @inbounds dU_forced[i, j, k, 2] = fx

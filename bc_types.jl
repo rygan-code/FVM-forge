@@ -25,7 +25,9 @@ const BC_AC_LID             = Int32(21)  # AC lid wall (prescribed velocity, pre
 const BC_MHD_WALL           = Int32(30)  # Perfectly conducting wall (B·n=0, reflect Et)
 const BC_MHD_INFLOW         = Int32(31)  # MHD inflow: all vars + B-field fixed
 const BC_MHD_OUTFLOW        = Int32(32)  # MHD outflow: zero-gradient for all
+const BC_MHD_INSULATING_WALL = Int32(33) # Insulating wall boundary condition (Dirichlet Bt=0, Neumann Bn)
 const BC_TRANSITION_INFLOW  = Int32(40)  # Dynamic spatial transition inflow (laminar + perturbation)
+const BC_WAVE_INFLOW        = Int32(41)  # Pure deterministic wave source inflow
 
 
 # ═══════════════════════════════════════════════════════════
@@ -51,6 +53,9 @@ const BCP_AC_W_LID  = 17   # AC lid w-velocity              (ac_lid)
 const BCP_BX_INF    = 18   # Freestream Bx                   (mhd_inflow)
 const BCP_BY_INF    = 19   # Freestream By                   (mhd_inflow)
 const BCP_BZ_INF    = 20   # Freestream Bz                   (mhd_inflow)
+const BCP_WAVE_AMP  = 1    # Wave amplitude for BC_WAVE_INFLOW
+const BCP_WAVE_OMEGA = 2   # Wave frequency omega for BC_WAVE_INFLOW
+const BCP_WAVE_M    = 3    # Wave azimuthal mode number m for BC_WAVE_INFLOW
 const N_BC_PARAMS   = 20   # Total number of parameter slots
 
 # ═══════════════════════════════════════════════════════════
@@ -78,7 +83,9 @@ const BC_NAME_MAP = Dict{String, Int32}(
     "mhd_wall"           => BC_MHD_WALL,
     "mhd_inflow"         => BC_MHD_INFLOW,
     "mhd_outflow"        => BC_MHD_OUTFLOW,
+    "mhd_insulating_wall" => BC_MHD_INSULATING_WALL,
     "transition_inflow"  => BC_TRANSITION_INFLOW,
+    "wave_inflow"        => BC_WAVE_INFLOW,
 )
 
 # Reverse mapping for printing

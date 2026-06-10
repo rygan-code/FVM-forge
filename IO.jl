@@ -29,7 +29,17 @@ function plotFile_multiblock(tt, time, blocks, world_rank, Nblocks, Block_Nprocs
             p    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 5]
             T    = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 6]
             ϕ_ng = @view ϕ_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG]
-            var_list = [("rho", ρ), ("u", u), ("v", v), ("w", w), ("p", p), ("T", T), ("phi", ϕ_ng)]
+            var_list = Any[("rho", ρ), ("u", u), ("v", v), ("w", w), ("p", p), ("T", T), ("phi", ϕ_ng)]
+            if equation_type == :MHD
+                Bx = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 7]
+                By = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 8]
+                Bz = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 9]
+                push!(var_list, ("Bx", Bx), ("By", By), ("Bz", Bz))
+                if Nprim >= 10
+                    ψv = @view Q_h[1+NG:b.Nx+NG, 1+NG:b.Ny+NG, 1+NG:b.Nz+NG, 10]
+                    push!(var_list, ("psi", ψv))
+                end
+            end
 
             # Global indices within this block for this rank (no ghost)
             lox = b.ox + 1; hix = b.ox + b.Nx
@@ -135,6 +145,37 @@ function checkpointFile(tt, time, blocks, world_rank, Block_Nprocs, block_comms)
                 end
             end
             println(">>> Checkpoint saved at step $tt")
+
+            # Robust automatic cleanup of older checkpoints
+            _keep_num = @isdefined(keep_chk_num) ? keep_chk_num : 0
+            if _keep_num > 0
+                try
+                    chk_files = readdir("./CHK")
+                    steps = Int64[]
+                    for f in chk_files
+                        m = match(r"^chk-(\d+)-b\d+\.h5$", f)
+                        if m !== nothing
+                            push!(steps, parse(Int64, m.captures[1]))
+                        end
+                    end
+                    unique!(steps)
+                    sort!(steps)
+                    if length(steps) > _keep_num
+                        keep_steps = steps[end-_keep_num+1:end]
+                        for f in chk_files
+                            m = match(r"^chk-(\d+)-b\d+\.h5$", f)
+                            if m !== nothing
+                                step_val = parse(Int64, m.captures[1])
+                                if !(step_val in keep_steps)
+                                    rm(joinpath("./CHK", f); force=true)
+                                end
+                            end
+                        end
+                    end
+                catch e
+                    # Prevent filesystem exception from crashing the solver
+                end
+            end
         end
         MPI.Barrier(MPI.COMM_WORLD)
     end
@@ -236,6 +277,12 @@ function write_XDMF_multiblock(tt, time, Nblocks)
             write(f, "    </Geometry>\n")
 
             varnames = ["rho", "u", "v", "w", "p", "T", "phi"]
+            if equation_type == :MHD
+                push!(varnames, "Bx", "By", "Bz")
+                if Nprim >= 10
+                    push!(varnames, "psi")
+                end
+            end
             for varname in varnames
                 write(f, "    <Attribute Name=\"$varname\" AttributeType=\"Scalar\" Center=\"Cell\">\n")
                 write(f, "     <DataItem Dimensions=\"$nz $ny $nx\" NumberType=\"Float\" Precision=\"4\" Format=\"HDF\">\n")

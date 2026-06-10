@@ -152,6 +152,7 @@ const step_plt::Int64 = 1000
 
 const chk_out::Bool = true
 const step_chk::Int64 = 1000
+const keep_chk_num::Int64 = 2
 const restart::String = "none"
 const inflow_restart::String = "none"
 
@@ -170,7 +171,7 @@ const filtering_nonlinear::Bool = false
 const filtering_interval::Int64 = 10     # Apply every 10 steps (more aggressive damping for L/R asymmetric stencils)
 const intf_filter_interval::Int64 = 1   # Interface 2Δx filter applied every 1 step
 const filtering_rth::FT = FT(1e-5)
-const filtering_s0::FT = FT(0.1e0)    # Filter strength σ: 0.02=conservative start, increase if needed
+const filtering_s0::FT = FT(0.01e0)    # Filter strength σ: 0.02=conservative start, increase if needed
 
 # ─── Equation (Ncons/Nprim defined in physics.jl) ───
 

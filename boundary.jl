@@ -221,7 +221,7 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
     # _U_int(n): U at mirror interior cell
 
     # ── Isothermal Wall ──
-    if bc_type == Int32(BC_ISOTHERMAL_WALL)
+    if bc_type == Int32(BC_ISOTHERMAL_WALL) || bc_type == Int32(BC_MHD_INSULATING_WALL)
         Tw_val = bcp[1]  # BCP_TW
         if Tw_val <= zero(FT); Tw_val = Tw; end
         if dir == Int32(1)
@@ -400,6 +400,70 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
             
             T1 = max(T_base + T_pr, FT(50.0))  # clamp to prevent negative/unphysical temperature
             
+            ρ1 = p_ext / (Rg * T1)
+            
+            Q[i,j,k,1]=ρ1; Q[i,j,k,2]=u1; Q[i,j,k,3]=v1; Q[i,j,k,4]=w1; Q[i,j,k,5]=p_ext; Q[i,j,k,6]=T1
+            U[i,j,k,1]=ρ1; U[i,j,k,2]=ρ1*u1; U[i,j,k,3]=ρ1*v1; U[i,j,k,4]=ρ1*w1
+            U[i,j,k,5]=p_ext/(γ-one(FT))+FT(0.5)*ρ1*(u1^2+v1^2+w1^2)
+        end
+
+    # ── Wave Inflow — Deterministic wave injection ──
+    elseif bc_type == Int32(BC_WAVE_INFLOW)
+        @inbounds begin
+            # Extrapolate pressure from interior (subsonic characteristic)
+            if dir == Int32(1)
+                p_ext = Q[idx_bnd,j,k,5]
+            elseif dir == Int32(2)
+                p_ext = Q[i,idx_bnd,k,5]
+            else
+                p_ext = Q[i,j,idx_bnd,5]
+            end
+            
+            # Base Flow (1/7 power law for turbulent profile)
+            yi = y[i,j,k]; zi = z[i,j,k]; xi = x[i,j,k]
+            r2 = yi*yi + zi*zi
+            r2_norm = r2 / (R0*R0)
+            
+            c_wall = sqrt(γ * Rg * Tw)
+            u_bulk = Ma_target * c_wall
+            
+            # Read wave parameters from boundary parameters
+            amp     = bcp[1] # BCP_WAVE_AMP
+            omega   = bcp[2] # BCP_WAVE_OMEGA
+            m_mode  = bcp[3] # BCP_WAVE_M
+            
+            is_visc = (isdefined(Main, :viscous) ? Main.viscous : true)
+            if is_visc
+                # 1/7 power law base profile
+                u_cl = (FT(60.0)/FT(49.0)) * u_bulk
+                u_base = u_cl * (max(one(FT) - sqrt(r2_norm), zero(FT))^(one(FT)/FT(7.0)))
+                
+                # Base temperature profile with viscous heating
+                Ma2 = Ma_target * Ma_target
+                β = FT(0.5) * Pr * (γ - one(FT)) * Ma2
+                T_base = Tw * (one(FT) + β * max(one(FT) - r2_norm*r2_norm, zero(FT)))
+            else
+                u_base = u_bulk
+                T_base = Tw
+            end
+            
+            # Deterministic wave structure
+            envelope = max(one(FT) - r2_norm, zero(FT))
+            θ = atan(zi, yi)
+            tt_f = FT(tt)
+            
+            # Phase: m * theta - omega * t
+            phase = m_mode * θ - omega * tt_f
+            
+            u_pr = amp * envelope * cos(phase)
+            v_pr = amp * envelope * cos(phase + θ)
+            w_pr = amp * envelope * sin(phase + θ)
+            
+            u1 = u_base + u_pr
+            v1 = v_pr
+            w1 = w_pr
+            
+            T1 = max(T_base, FT(50.0))
             ρ1 = p_ext / (Rg * T1)
             
             Q[i,j,k,1]=ρ1; Q[i,j,k,2]=u1; Q[i,j,k,3]=v1; Q[i,j,k,4]=w1; Q[i,j,k,5]=p_ext; Q[i,j,k,6]=T1
@@ -706,6 +770,35 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
             else
                 @inbounds begin
                     Q[i,j,k,7]=Q[i,j,idx_int,7]; Q[i,j,k,8]=Q[i,j,idx_int,8]; Q[i,j,k,9]=Q[i,j,idx_int,9]
+                    Q[i,j,k,10]=-Q[i,j,idx_int,10]
+                end
+            end
+            # Update conservative B and ψ, recompute energy with B²/2
+            @inbounds begin
+                Bx=Q[i,j,k,7]; By=Q[i,j,k,8]; Bz=Q[i,j,k,9]; ψv=Q[i,j,k,10]
+                U[i,j,k,6]=Bx; U[i,j,k,7]=By; U[i,j,k,8]=Bz; U[i,j,k,9]=ψv
+                B2=Bx*Bx+By*By+Bz*Bz
+                U[i,j,k,5]=Q[i,j,k,5]/(γ-one(FT))+FT(0.5)*Q[i,j,k,1]*(Q[i,j,k,2]^2+Q[i,j,k,3]^2+Q[i,j,k,4]^2)+FT(0.5)*B2
+            end
+        elseif bc_type == Int32(BC_MHD_INSULATING_WALL)
+            # Insulating wall: tangential B-field is zero (anti-symmetric), normal B-field is symmetric
+            if dir == Int32(1)
+                @inbounds begin
+                    Q[i,j,k,7]=Q[idx_int,j,k,7]
+                    Q[i,j,k,8]=-Q[idx_int,j,k,8]; Q[i,j,k,9]=-Q[idx_int,j,k,9]
+                    Q[i,j,k,10]=-Q[idx_int,j,k,10]
+                end
+            elseif dir == Int32(2)
+                @inbounds begin
+                    Q[i,j,k,7]=-Q[i,idx_int,k,7]
+                    Q[i,j,k,8]=Q[i,idx_int,k,8]
+                    Q[i,j,k,9]=-Q[i,idx_int,k,9]
+                    Q[i,j,k,10]=-Q[i,idx_int,k,10]
+                end
+            else
+                @inbounds begin
+                    Q[i,j,k,7]=-Q[i,j,idx_int,7]; Q[i,j,k,8]=-Q[i,j,idx_int,8]
+                    Q[i,j,k,9]=Q[i,j,idx_int,9]
                     Q[i,j,k,10]=-Q[i,j,idx_int,10]
                 end
             end

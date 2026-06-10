@@ -295,8 +295,15 @@ function Eigen_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nz
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end
@@ -545,8 +552,15 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end
@@ -793,8 +807,15 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end
@@ -1018,8 +1039,15 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, n
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end
@@ -1222,8 +1250,15 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, n
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end
@@ -1428,8 +1463,15 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, n
     @inbounds _ρL = UL_final[1]; _ρR = UR_final[1]
     _ρuL2 = UL_final[2]^2 + UL_final[3]^2 + UL_final[4]^2
     _ρuR2 = UR_final[2]^2 + UR_final[3]^2 + UR_final[4]^2
-    _eiL = UL_final[Ncons] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
-    _eiR = UR_final[Ncons] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    @static if equation_type == :MHD
+        _B2L = UL_final[6]^2 + UL_final[7]^2 + UL_final[8]^2
+        _B2R = UR_final[6]^2 + UR_final[7]^2 + UR_final[8]^2
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT)) - FT(0.5) * _B2L
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT)) - FT(0.5) * _B2R
+    else
+        _eiL = UL_final[5] - FT(0.5) * _ρuL2 / max(_ρL, eps(FT))
+        _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
+    end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
         for n = 1:Ncons; @inbounds UL_final[n] = U[i,j,k,n]; end
     end

@@ -597,7 +597,7 @@ function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int
     # 1. Compute i-face metrics (face center: i, j+1/2, k+1/2)
     for k in 1:Nz_cells_tot, j in 1:Ny_cells_tot, i in 1:Nx_nodes_tot
         Sx = (y_dz_k[i, j+1, k] - y_dz_k[i, j, k]) - (y_dz_j[i, j, k+1] - y_dz_j[i, j, k])
-        Sy = (z_dx_j[i, j, k+1] - z_dx_j[i, j, k]) - (z_dx_k[i, j+1, k] - z_dx_k[i, j, k])
+        Sy = (z_dx_k[i, j+1, k] - z_dx_k[i, j, k]) - (z_dx_j[i, j, k+1] - z_dx_j[i, j, k])
         Sz = (x_dy_k[i, j+1, k] - x_dy_k[i, j, k]) - (x_dy_j[i, j, k+1] - x_dy_j[i, j, k])
         
         area = sqrt(Sx^2 + Sy^2 + Sz^2)
@@ -610,7 +610,7 @@ function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int
     # 2. Compute j-face metrics (face center: i+1/2, j, k+1/2)
     for k in 1:Nz_cells_tot, j in 1:Ny_nodes_tot, i in 1:Nx_cells_tot
         Sx = (y_dz_i[i, j, k+1] - y_dz_i[i, j, k]) - (y_dz_k[i+1, j, k] - y_dz_k[i, j, k])
-        Sy = (z_dx_k[i+1, j, k] - z_dx_k[i, j, k]) - (z_dx_i[i, j, k+1] - z_dx_i[i, j, k])
+        Sy = (z_dx_i[i, j, k+1] - z_dx_i[i, j, k]) - (z_dx_k[i+1, j, k] - z_dx_k[i, j, k])
         Sz = (x_dy_i[i, j, k+1] - x_dy_i[i, j, k]) - (x_dy_k[i+1, j, k] - x_dy_k[i, j, k])
         
         area = sqrt(Sx^2 + Sy^2 + Sz^2)
@@ -623,7 +623,7 @@ function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int
     # 3. Compute k-face metrics (face center: i+1/2, j+1/2, k)
     for k in 1:Nz_nodes_tot, j in 1:Ny_cells_tot, i in 1:Nx_cells_tot
         Sx = (y_dz_j[i+1, j, k] - y_dz_j[i, j, k]) - (y_dz_i[i, j+1, k] - y_dz_i[i, j, k])
-        Sy = (z_dx_i[i, j+1, k] - z_dx_i[i, j, k]) - (z_dx_j[i+1, j, k] - z_dx_j[i, j, k])
+        Sy = (z_dx_j[i+1, j, k] - z_dx_j[i, j, k]) - (z_dx_i[i, j+1, k] - z_dx_i[i, j, k])
         Sz = (x_dy_j[i+1, j, k] - x_dy_j[i, j, k]) - (x_dy_i[i, j+1, k] - x_dy_i[i, j, k])
         
         area = sqrt(Sx^2 + Sy^2 + Sz^2)
