@@ -346,6 +346,7 @@ include("ghost_coords.jl")
 include("auto_tune.jl")
 include("filter_interface.jl")
 include("diag_checkerboard.jl")
+include("debug/fullfield_diagnostic.jl")
 include("fringe.jl")
 include("geometry_correction.jl")
 include("interface_flux_sync.jl")
@@ -1926,6 +1927,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         # ─── CHECKERBOARD DIAGNOSTIC (opt-in) ───
         if @isdefined(checkerboard_diag) && checkerboard_diag
             checkerboard_diagnostic!(blocks, connectivity, tt, world_rank)
+        end
+
+        # ─── FULL-FIELD DIAGNOSTIC (opt-in) ───
+        if @isdefined(fullfield_diag) && fullfield_diag
+            fullfield_diagnostic!(blocks, connectivity, tt, world_rank)
         end
 
         # ─── ADAPTIVE INTERFACE SMOOTHING ───
