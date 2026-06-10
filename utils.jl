@@ -245,26 +245,38 @@ function compute_dt(dt, Q, J, S1, S2, S3,
     # dt = CFL * Vol / (λ_ξ + λ_η + λ_ζ)   — sum formulation (more conservative, standard)
     dt_conv = Vol / (λ_ξ + λ_η + λ_ζ + FT(1.0e-30))
 
-    # Viscous stability limit
-    if viscous
+    # Viscous/Resistive stability limit
+    if viscous || (equation_type == :MHD && resistive)
         dx = Vol / (Ai + FT(1.0e-30))
         dy = Vol / (Aj + FT(1.0e-30))
         dz = Vol / (Ak + FT(1.0e-30))
-        if equation_type == :MHD
+        inv_dx2 = one(FT)/(dx*dx)
+        inv_dy2 = one(FT)/(dy*dy)
+        inv_dz2 = one(FT)/(dz*dz)
+        inv_d2_sum = inv_dx2 + inv_dy2 + inv_dz2
+
+        dt_diff = FT(1.0e10)
+
+        if viscous
             @inbounds rho = Q[i, j, k, 1]
-            mu = get_viscosity(T_val)
+            T_local = (equation_type == :MHD) ? T_val : T
+            mu = get_viscosity(T_local)
             nu_eff = mu / (rho * Pr + FT(1.0e-30))
-        else
-            @inbounds rho = Q[i, j, k, 1]
-            mu = get_viscosity(T)
-            nu_eff = mu / (rho * Pr + FT(1.0e-30))
+            dt_diff_hydro = FT(0.5) / (nu_eff * inv_d2_sum + FT(1.0e-30))
+            dt_diff = min(dt_diff, dt_diff_hydro)
         end
-        dt_diff = FT(0.5) / (nu_eff * (one(FT)/(dx*dx) + one(FT)/(dy*dy) + one(FT)/(dz*dz)) + FT(1.0e-30))
+
+        @static if equation_type == :MHD
+            if resistive
+                dt_diff_res = FT(0.5) / (η_mhd * inv_d2_sum + FT(1.0e-30))
+                dt_diff = min(dt_diff, dt_diff_res)
+            end
+        end
+
         @inbounds dt[i, j, k] = min(dt_conv, dt_diff) * CFL
     else
         @inbounds dt[i, j, k] = dt_conv * CFL
     end
-
     return
 end
 

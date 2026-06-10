@@ -7,6 +7,9 @@
 
 using HDF5
 
+const FT = Float64
+
+
 # ─── Configuration ───
 const NG = 4
 const Nx = 800         # cells in x (800 for good shock resolution)

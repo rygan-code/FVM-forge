@@ -118,7 +118,7 @@ end
 # Grid Generation Functions — Real nodes only (Nx+1, Ny+1, Nz+1)
 # =============================================================================
 
-function generate_block0(Nx_b, Ny_b0, Nz_b0, Lx=Lx)
+function generate_block0(Nx_b, Ny_b0, Nz_b0)
     Nx, Ny, Nz = Nx_b, Ny_b0, Nz_b0
     x = zeros(Float64, Nx+1, Ny+1, Nz+1)
     y = zeros(Float64, Nx+1, Ny+1, Nz+1)
@@ -136,7 +136,7 @@ function generate_block0(Nx_b, Ny_b0, Nz_b0, Lx=Lx)
     return x, y, z, Nx, Ny, Nz
 end
 
-function generate_block1(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
+function generate_block1(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer)
     Nx, Ny, Nz = Nx_b, N_rad, Nz_b0
     x = zeros(Float64, Nx+1, Ny+1, Nz+1)
     y = zeros(Float64, Nx+1, Ny+1, Nz+1)
@@ -163,7 +163,7 @@ function generate_block1(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
     return x, y, z, Nx, Ny, Nz
 end
 
-function generate_block2(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
+function generate_block2(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer)
     Nx, Ny, Nz = Nx_b, N_rad, Nz_b0
     x = zeros(Float64, Nx+1, Ny+1, Nz+1)
     y = zeros(Float64, Nx+1, Ny+1, Nz+1)
@@ -191,7 +191,7 @@ function generate_block2(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
     return x, y, z, Nx, Ny, Nz
 end
 
-function generate_block3(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
+function generate_block3(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer)
     Nx, Ny, Nz = Nx_b, Ny_b0, N_rad
     x = zeros(Float64, Nx+1, Ny+1, Nz+1)
     y = zeros(Float64, Nx+1, Ny+1, Nz+1)
@@ -217,7 +217,7 @@ function generate_block3(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
     return x, y, z, Nx, Ny, Nz
 end
 
-function generate_block4(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer, Lx=Lx)
+function generate_block4(Nx_b, Ny_b0, Nz_b0, N_rad, dr_outer)
     Nx, Ny, Nz = Nx_b, Ny_b0, N_rad
     x = zeros(Float64, Nx+1, Ny+1, Nz+1)
     y = zeros(Float64, Nx+1, Ny+1, Nz+1)
@@ -457,24 +457,20 @@ end
 
 
 function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad)
-    build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad, Lx)
-end
-
-function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad, Lx::Float64)
-    println("Generating FVM Butterfly Mesh into ", out_dir, " (Lx=$(Lx)) ...")
+    println("Generating FVM Butterfly Mesh into ", out_dir, " ...")
     mkpath(out_dir)
     blocks_data = []
-
+    
     max_dr_outer = 0.00035 * (1024.0 / Nx_b)
-
-    push!(blocks_data, generate_block0(Nx_b, Ny_b0, Nz_b0, Lx))
-    push!(blocks_data, generate_block1(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer, Lx))
-    push!(blocks_data, generate_block2(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer, Lx))
-    push!(blocks_data, generate_block3(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer, Lx))
-    push!(blocks_data, generate_block4(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer, Lx))
-
+    
+    push!(blocks_data, generate_block0(Nx_b, Ny_b0, Nz_b0))
+    push!(blocks_data, generate_block1(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer))
+    push!(blocks_data, generate_block2(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer))
+    push!(blocks_data, generate_block3(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer))
+    push!(blocks_data, generate_block4(Nx_b, Ny_b0, Nz_b0, N_rad, max_dr_outer))
+    
     build_interpolation_weights(blocks_data, out_dir)
-
+    
     for bid in 0:4
         x, y, z, Nx, Ny, Nz = blocks_data[bid + 1]
         h5open(joinpath(out_dir, "mesh_b$bid.h5"), "w") do f
@@ -483,42 +479,54 @@ function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad, Lx::Float64)
             f["Ny"] = Int64(Ny)
             f["Nz"] = Int64(Nz)
             f["coords"] = Float32.(cat(reshape(x, (1, size(x)...)), reshape(y, (1, size(y)...)), reshape(z, (1, size(z)...)), dims=1))
+            # Separate x/y/z datasets for XDMF X_Y_Z geometry (most compatible)
             f["x"] = Float32.(x)
             f["y"] = Float32.(y)
             f["z"] = Float32.(z)
         end
     end
-
+    
     # ─── Connectivity with auto-computed reverse_tan ───
+    connections = Dict(
+        (0, 3) => (1, 4), (1, 4) => (0, 3),
+        (0, 4) => (2, 3), (2, 3) => (0, 4),
+        (0, 5) => (3, 6), (3, 6) => (0, 5),
+        (0, 6) => (4, 5), (4, 5) => (0, 6),
+        (1, 5) => (3, 3), (3, 3) => (1, 5),
+        (1, 6) => (4, 3), (4, 3) => (1, 6),
+        (2, 5) => (3, 4), (3, 4) => (2, 5),
+        (2, 6) => (4, 4), (4, 4) => (2, 6)
+    )
+    
     connectivity_rows = [
         0 3 1 4; 1 4 0 3; 0 4 2 3; 2 3 0 4;
         0 5 3 6; 3 6 0 5; 0 6 4 5; 4 5 0 6;
         1 5 3 3; 3 3 1 5; 1 6 4 3; 4 3 1 6;
         2 5 3 4; 3 4 2 5; 2 6 4 4; 4 4 2 6
     ]
-
+    
     function get_tangential_vector(blocks_data, bid, fid)
         x, y, z, Nx, Ny, Nz = blocks_data[bid + 1]
         mid_i = size(x, 1) ÷ 2
-        if fid == 3
+        if fid == 3      
             j0 = 1; mid_k = (Nz + 2) ÷ 2
-            return [y[mid_i, j0, mid_k+1] - y[mid_i, j0, mid_k],
+            return [y[mid_i, j0, mid_k+1] - y[mid_i, j0, mid_k], 
                     z[mid_i, j0, mid_k+1] - z[mid_i, j0, mid_k]]
-        elseif fid == 4
+        elseif fid == 4  
             j0 = Ny + 1; mid_k = (Nz + 2) ÷ 2
             return [y[mid_i, j0, mid_k+1] - y[mid_i, j0, mid_k],
                     z[mid_i, j0, mid_k+1] - z[mid_i, j0, mid_k]]
-        elseif fid == 5
+        elseif fid == 5  
             k0 = 1; mid_j = (Ny + 2) ÷ 2
             return [y[mid_i, mid_j+1, k0] - y[mid_i, mid_j, k0],
                     z[mid_i, mid_j+1, k0] - z[mid_i, mid_j, k0]]
-        elseif fid == 6
+        elseif fid == 6  
             k0 = Nz + 1; mid_j = (Ny + 2) ÷ 2
             return [y[mid_i, mid_j+1, k0] - y[mid_i, mid_j, k0],
                     z[mid_i, mid_j+1, k0] - z[mid_i, mid_j, k0]]
         end
     end
-
+    
     reverse_tan_arr = zeros(Int64, size(connectivity_rows, 1))
     flip_normal_arr = zeros(Int64, size(connectivity_rows, 1))
     for i in 1:size(connectivity_rows, 1)
@@ -526,7 +534,7 @@ function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad, Lx::Float64)
         t1 = get_tangential_vector(blocks_data, b1, f1)
         t2 = get_tangential_vector(blocks_data, b2, f2)
         reverse_tan_arr[i] = dot(t1, t2) < 0 ? 1 : 0
-
+        
         f1_is_eta = (f1 == 3 || f1 == 4)
         f1_is_zeta = (f1 == 5 || f1 == 6)
         f2_is_eta = (f2 == 3 || f2 == 4)
@@ -535,27 +543,29 @@ function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad, Lx::Float64)
             flip_normal_arr[i] = 1
         end
     end
-
-    face_bc = zeros(Int64, 5, 6)
+    
+    face_bc = zeros(Int64, 5, 6) 
     for bid in 0:4
-        face_bc[bid+1, 1] = 2
-        face_bc[bid+1, 2] = 2
+        face_bc[bid+1, 1] = 2  
+        face_bc[bid+1, 2] = 2  
     end
     for i in 1:size(connectivity_rows, 1)
         b1, f1 = connectivity_rows[i, 1], connectivity_rows[i, 2]
-        face_bc[b1+1, f1] = 0
+        face_bc[b1+1, f1] = 0  
     end
-    face_bc[2, 3] = 1
-    face_bc[3, 4] = 1
-    face_bc[4, 5] = 1
-    face_bc[5, 6] = 1
-
-    bc_params = zeros(FT, 5, 6, 17)
-    bc_params[2, 3, 1] = FT(307.0e0)
-    bc_params[3, 4, 1] = FT(307.0e0)
-    bc_params[4, 5, 1] = FT(307.0e0)
-    bc_params[5, 6, 1] = FT(307.0e0)
-
+    face_bc[2, 3] = 1  
+    face_bc[3, 4] = 1  
+    face_bc[4, 5] = 1  
+    face_bc[5, 6] = 1  
+    
+    # BC parameters: store Tw for each isothermal wall face
+    # BCP_TW = slot 1 (matching bc_types.jl)
+    bc_params = zeros(FT, 5, 6, 17)  # 17 = N_BC_PARAMS (current version)
+    bc_params[2, 3, 1] = FT(307.0e0)  # Block 1, η-, Tw
+    bc_params[3, 4, 1] = FT(307.0e0)  # Block 2, η+, Tw
+    bc_params[4, 5, 1] = FT(307.0e0)  # Block 3, ζ-, Tw
+    bc_params[5, 6, 1] = FT(307.0e0)  # Block 4, ζ+, Tw
+    
     h5open(joinpath(out_dir, "block_connectivity.h5"), "w") do f
         f["Nblocks"] = 5
         f["Nx_b"] = fill(Int64(Nx_b), 5)

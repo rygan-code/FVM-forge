@@ -124,7 +124,7 @@ end
 # D[i,j,k] = Vol/dt + 0.5 * Σ(σ at all 6 faces)
 # Scalar approximation: D is a scalar multiplying I (identity), not a full 5×5 block
 function compute_lusgs_diagonal!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
-                                  Areai, Areaj, Areak, dt, nxp, nyp, nzp)
+                                  Areai, Areaj, Areak, dt, w_LU, nxp, nyp, nzp)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -164,12 +164,19 @@ function compute_lusgs_diagonal!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
             σ_sum += FT(2.0) * σ_visc  # factor 2 for both sides of the cell
         end
 
-
+        @static if equation_type == :MHD
+            if resistive
+                Ai_res = FT(0.5) * (Areai[ig, jg, kg] + Areai[ig+1, jg, kg])
+                Aj_res = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
+                Ak_res = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
+                σ_res = η_mhd * (Ai_res*Ai_res + Aj_res*Aj_res + Ak_res*Ak_res) / (cell_vol + FT(1.0e-30))
+                σ_sum += FT(2.0) * σ_res
+            end
+        end
 
         # w_LU: LU-SGS relaxation factor (EC uses 1~2, default 1.5)
         # Larger w_LU → stronger diagonal dominance → more stable but slower convergence
         # Standard 0.5 is insufficient for WENO's imaginary eigenvalues
-        w_LU = isdefined(@__MODULE__, :implicit_w_LU) ? implicit_w_LU : FT(1.5e0)
         D = cell_vol / dt + w_LU * σ_sum  # [m³/s] — dimensionally consistent
         D_inv[ig, jg, kg] = one(FT) / (D + FT(1.0e-30))
     end
@@ -412,36 +419,75 @@ function implicit_update!(U, Q, ΔU, nxp, nyp, nzp)
             U[i, j, k, n] += ΔU[i, j, k, n]
         end
 
-        # In-place c2Prim + positivity clipping (same as linComb_clip_prim)
-        ρ = max(U[i, j, k, 1], eps(FT))
-        ρinv = one(FT) / ρ
-        u = U[i, j, k, 2] * ρinv
-        v = U[i, j, k, 3] * ρinv
-        w = U[i, j, k, 4] * ρinv
-        ei = max(U[i, j, k, 5] - FT(0.5) * ρ * (u * u + v * v + w * w), eps(FT))
-        p = (γ - one(FT)) * ei
+        @static if equation_type == :MHD
+            ρ = max(U[i, j, k, 1], eps(FT))
+            ρinv = one(FT) / ρ
+            u = U[i, j, k, 2] * ρinv
+            v = U[i, j, k, 3] * ρinv
+            w = U[i, j, k, 4] * ρinv
+            Bx = U[i, j, k, 6]
+            By = U[i, j, k, 7]
+            Bz = U[i, j, k, 8]
+            B2 = Bx*Bx + By*By + Bz*Bz
+            ei = max(U[i, j, k, 5] - FT(0.5) * ρ * (u * u + v * v + w * w) - FT(0.5) * B2, eps(FT))
+            p = (γ - one(FT)) * ei
 
-        # Positivity clipping
-        ρ_min = FT(1.0e-5)
-        p_min = FT(1.0e-5)
-        ρ = max(ρ, ρ_min)
-        p = max(p, p_min)
-        T = p / (ρ * Rg)
+            # Positivity clipping
+            ρ_min = FT(1.0e-5)
+            p_min = FT(1.0e-5)
+            ρ = max(ρ, ρ_min)
+            p = max(p, p_min)
+            T = p / (ρ * Rg)
 
-        Q[i, j, k, 1] = ρ
-        Q[i, j, k, 2] = u
-        Q[i, j, k, 3] = v
-        Q[i, j, k, 4] = w
-        Q[i, j, k, 5] = p
-        Q[i, j, k, 6] = T
+            Q[i, j, k, 1] = ρ
+            Q[i, j, k, 2] = u
+            Q[i, j, k, 3] = v
+            Q[i, j, k, 4] = w
+            Q[i, j, k, 5] = p
+            Q[i, j, k, 6] = T
+            Q[i, j, k, 7] = Bx
+            Q[i, j, k, 8] = By
+            Q[i, j, k, 9] = Bz
+            Q[i, j, k, 10] = U[i, j, k, 9]
 
-        # Write back clamped U
-        if ρ != U[i, j, k, 1] || p != (γ - one(FT)) * ei
+            # Write back clamped U
             U[i, j, k, 1] = ρ
             U[i, j, k, 2] = ρ * u
             U[i, j, k, 3] = ρ * v
             U[i, j, k, 4] = ρ * w
-            U[i, j, k, 5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u * u + v * v + w * w)
+            U[i, j, k, 5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u * u + v * v + w * w) + FT(0.5) * B2
+        else
+            # In-place c2Prim + positivity clipping (same as linComb_clip_prim)
+            ρ = max(U[i, j, k, 1], eps(FT))
+            ρinv = one(FT) / ρ
+            u = U[i, j, k, 2] * ρinv
+            v = U[i, j, k, 3] * ρinv
+            w = U[i, j, k, 4] * ρinv
+            ei = max(U[i, j, k, 5] - FT(0.5) * ρ * (u * u + v * v + w * w), eps(FT))
+            p = (γ - one(FT)) * ei
+
+            # Positivity clipping
+            ρ_min = FT(1.0e-5)
+            p_min = FT(1.0e-5)
+            ρ = max(ρ, ρ_min)
+            p = max(p, p_min)
+            T = p / (ρ * Rg)
+
+            Q[i, j, k, 1] = ρ
+            Q[i, j, k, 2] = u
+            Q[i, j, k, 3] = v
+            Q[i, j, k, 4] = w
+            Q[i, j, k, 5] = p
+            Q[i, j, k, 6] = T
+
+            # Write back clamped U
+            if ρ != U[i, j, k, 1] || p != (γ - one(FT)) * ei
+                U[i, j, k, 1] = ρ
+                U[i, j, k, 2] = ρ * u
+                U[i, j, k, 3] = ρ * v
+                U[i, j, k, 4] = ρ * w
+                U[i, j, k, 5] = p / (γ - one(FT)) + FT(0.5) * ρ * (u * u + v * v + w * w)
+            end
         end
     end
     return
@@ -497,9 +543,10 @@ function implicit_step!(block::Block, dt_val::FT,
 
     # ── Step 2: Compute diagonal D and its inverse ──
     nb_real = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
+    w_LU = isdefined(Main, :implicit_w_LU) ? Main.implicit_w_LU : FT(1.5e0)
     @gpu_launch threads=nthreads blocks=nb_real compute_lusgs_diagonal!(
         block.D_inv, block.Q, block.Vol, block.σ_i, block.σ_j, block.σ_k,
-        block.Areai, block.Areaj, block.Areak, dt_val, nxp, nyp, nzp)
+        block.Areai, block.Areaj, block.Areak, dt_val, w_LU, nxp, nyp, nzp)
 
     # ── Step 3: Compute explicit RHS ──
     # 3a. Reconstruction + Riemann solver + viscous flux (reuse blockAdvance)
@@ -510,9 +557,12 @@ function implicit_step!(block::Block, dt_val::FT,
 
     # 3b. Volume forces (reuse existing logic)
     if flow_forcing
+        x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : (isdefined(@__MODULE__, :x_rot_start) ? FT(x_rot_start) : zero(FT))
+        x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : (isdefined(@__MODULE__, :x_rot_end)   ? FT(x_rot_end)   : zero(FT))
+        omega_x_val     = isdefined(Main, :Omega_x)     ? FT(Main.Omega_x)     : (isdefined(@__MODULE__, :Omega_x)     ? FT(Omega_x)     : zero(FT))
         @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
             shared_dU_forced, block.Q, block.x, block.y, block.z,
-            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
+            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, x_rot_start_val, x_rot_end_val, omega_x_val)
         if forcing_mode == 1
             Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
         elseif forcing_mode == 2
@@ -650,7 +700,7 @@ end
 # ─── Diagonal for BDF2: D = (3/(2dt))·Vol + 0.5·Σσ ───
 # The diagonal is modified to include the BDF2 time derivative coefficient
 function compute_lusgs_diagonal_bdf2!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
-                                       Areai, Areaj, Areak, dt, nxp, nyp, nzp)
+                                       Areai, Areaj, Areak, dt, w_LU, nxp, nyp, nzp)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -682,6 +732,16 @@ function compute_lusgs_diagonal_bdf2!(D_inv, Q, Vol, σ_i, σ_j, σ_k,
             nu_eff = max(FT(4.0)/FT(3.0) * μ_c, γ * μ_c / Pr) / ρ_c
             σ_visc = nu_eff * (Ai*Ai + Aj*Aj + Ak*Ak) / (cell_vol + FT(1.0e-30))
             σ_sum += FT(2.0) * σ_visc
+        end
+
+        @static if equation_type == :MHD
+            if resistive
+                Ai_res = FT(0.5) * (Areai[ig, jg, kg] + Areai[ig+1, jg, kg])
+                Aj_res = FT(0.5) * (Areaj[ig, jg, kg] + Areaj[ig, jg+1, kg])
+                Ak_res = FT(0.5) * (Areak[ig, jg, kg] + Areak[ig, jg, kg+1])
+                σ_res = η_mhd * (Ai_res*Ai_res + Aj_res*Aj_res + Ak_res*Ak_res) / (cell_vol + FT(1.0e-30))
+                σ_sum += FT(2.0) * σ_res
+            end
         end
 
 
@@ -723,9 +783,10 @@ function bdf2_prepare_step!(block::Block, dt_val::FT)
         block.σ_k, block.Q, block.Areak, block.nxk, block.nyk, block.nzk, nxp, nyp, nzp)
 
     # Compute BDF2 diagonal
+    w_LU = isdefined(Main, :implicit_w_LU) ? Main.implicit_w_LU : FT(1.5e0)
     @gpu_launch threads=nthreads blocks=nb_real compute_lusgs_diagonal_bdf2!(
         block.D_inv, block.Q, block.Vol, block.σ_i, block.σ_j, block.σ_k,
-        block.Areai, block.Areaj, block.Areak, dt_val, nxp, nyp, nzp)
+        block.Areai, block.Areaj, block.Areak, dt_val, w_LU, nxp, nyp, nzp)
 end
 
 function bdf2_inner_iteration!(block::Block, dt_val::FT,
@@ -753,9 +814,12 @@ function bdf2_inner_iteration!(block::Block, dt_val::FT,
 
     # Volume forces
     if flow_forcing
+        x_rot_start_val = isdefined(Main, :x_rot_start) ? FT(Main.x_rot_start) : (isdefined(@__MODULE__, :x_rot_start) ? FT(x_rot_start) : zero(FT))
+        x_rot_end_val   = isdefined(Main, :x_rot_end)   ? FT(Main.x_rot_end)   : (isdefined(@__MODULE__, :x_rot_end)   ? FT(x_rot_end)   : zero(FT))
+        omega_x_val     = isdefined(Main, :Omega_x)     ? FT(Main.Omega_x)     : (isdefined(@__MODULE__, :Omega_x)     ? FT(Omega_x)     : zero(FT))
         @gpu_launch threads=threads_light blocks=nb_light Volume_force_kernel!(
             shared_dU_forced, block.Q, block.x, block.y, block.z,
-            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz)
+            nxp, nyp, nzp, block.Ωx, block.Ωy, block.Ωz, x_rot_start_val, x_rot_end_val, omega_x_val)
         if forcing_mode == 1
             Apply_bulk_force!(shared_dU_forced, block.Q, forcex, flowx, dt_val, nxp, nyp, nzp)
         elseif forcing_mode == 2

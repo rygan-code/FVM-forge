@@ -1,14 +1,8 @@
-# Benchmark/BRIO_WU/run.jl — Brio-Wu MHD Shock Tube validation
-# Usage: cd Benchmark/BRIO_WU && mpirun -np 1 julia run.jl [nsteps]
-# Default: 10000 steps (to reach t=0.1)
-#
-# Brio & Wu (1988) standard MHD Riemann problem.
-# 1D problem in x-direction, uniform mesh [0, 1], single block.
-# γ = 2.0 (required for this test case!)
+# Benchmark/HARTMANN/run.jl — Hartmann channel flow validation
+# Usage: cd Benchmark/HARTMANN && mpirun -np 1 julia run.jl
 
-# ─── Parse CLI ───
 const FT = Float64
-const PROFILE_STEPS = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 10000
+const PROFILE_STEPS = 20000
 
 # ─── Debug/Runtime flags ───
 const debug_nan::Bool = true
@@ -16,29 +10,38 @@ const debug_sync::Bool = false
 const profiling::Bool = false
 const gpu_aware_mpi::Bool = false
 
-const flow_forcing::Bool = false
+const flow_forcing::Bool = true
 const forcing_mode::Int64 = 1
 const wall_perturbation::Bool = false
 const wall_perturbation_type::Int32 = 0
 const cache_metrics::Bool = true
-# Parameters required by solver (not relevant for Brio-Wu but must exist)
-const Re_target::FT = FT(1000.0)
-const Ma_target::FT = FT(0.3e0)
+
+# Physics constants
+const equation_type = :MHD
+const resistive::Bool = true   # Resistive MHD (magnetic diffusion enabled)
+const η_mhd::FT = FT(0.1)      # Magnetic resistivity
+const B0::FT = FT(1.0)         # Transverse magnetic field (Ha = B0 * H * sqrt(1/(eta * mu)))
+const cr_glm::FT = FT(0.18e0)  # GLM damping ratio
+
+# Viscous parameters (mu = C_s * sqrt(T) -> 0.1 at T=1.0)
+const viscous::Bool = true
+const C_s::FT = FT(0.1)
+const T_s::FT = FT(1.0e-10)    # Constant viscosity model
+const Tw::FT = FT(1.0)
+const R0::FT = FT(1.0)         # Half-channel height H
+
+# Mach number (incompressible limit)
+const Ma_target::FT = FT(0.1e0)
 const Ro_target::FT = zero(FT)
-const Tw::FT = FT(300.0)
-const Lx::FT = one(FT)
+const Omega_x::FT = zero(FT)
+const Lx::FT = FT(1.0)
 const hit_forcing_A::FT = zero(FT)
 const weno_z::Bool = true
 
 # GPU backend
-using CUDA
+using AMDGPU
 
-# ─── Physics / Equation System ───
-const equation_type = :MHD
-const resistive::Bool = false   # Ideal MHD (no magnetic diffusion)
-const cr_glm::FT = FT(0.18e0) # GLM damping ratio
-
-# Project root for includes (two levels up from Benchmark/BRIO_WU/)
+# Project root for includes (two levels up from Benchmark/HARTMANN/)
 const _project_root = joinpath(@__DIR__, "..", "..")
 include(joinpath(_project_root, "physics.jl"))
 include(joinpath(_project_root, "solver.jl"))
@@ -48,15 +51,18 @@ const LES_smag::Bool = false
 const LES_wale::Bool = false
 
 # ─── Thermal state ───
-# IMPORTANT: Brio-Wu uses γ = 2.0!
-const γ::FT = FT(2.0)
-const Rg::FT = one(FT)    # Normalized gas constant
+const γ::FT = FT(1.4)
+const Rg::FT = one(FT)
 const Cp::FT = Rg*γ/(γ-1)
-const C_s::FT = zero(FT)   # No Sutherland viscosity needed for inviscid
-const T_s::FT = one(FT)
 const Pr::FT = 0.71
 
-# ─── Mesh (relative to Benchmark/BRIO_WU/) ───
+# Target parameters for bulk forcing
+const u_bulk_target::FT = Ma_target * sqrt(γ * Rg * Tw)
+const μw::FT = C_s * Tw * sqrt(Tw) / (Tw + T_s)
+# Re_target set to make the target density exactly 1.0 (bulk_density = Re * mu / (u * 2 * R0) = 1.0)
+const Re_target::FT = u_bulk_target * 2 * R0 * one(FT) / μw
+
+# ─── Mesh (relative to Benchmark/HARTMANN/) ───
 const mesh_dir = joinpath(@__DIR__, "MESH")
 const _mesh_dir = mesh_dir
 
@@ -74,14 +80,10 @@ const Nx_b::NTuple{Nblocks, Int64} = _conf_data[2]
 const Ny_b::NTuple{Nblocks, Int64} = _conf_data[3]
 const Nz_b::NTuple{Nblocks, Int64} = _conf_data[4]
 const NG::Int64 = _conf_data[5]
-const R0::FT = FT(0.5)
-
-const Omega_x::FT = zero(FT)
 
 # ─── GPU Partition ───
 const auto_partition_enabled::Bool = true
 const gpu_vram_gb::Float64 = 16.0
-
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
@@ -99,35 +101,37 @@ const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
 else
     (Block_Nprocs_manual, collect(0:length(Block_Nprocs_manual)-1))
 end
-const Iperiodic = (false, false, false)  # No periodic for shock tube
+const Iperiodic = (true, false, true)  # Periodic in x and z, wall boundaries in y
 
 # ─── Flow control ───
-const test_case::String = "BrioWu"
+const test_case::String = "Hartmann"
 const mesh::String = joinpath(_mesh_dir, "mesh_b0.h5")
 const metrics::String = joinpath(_mesh_dir, "metrics_b0.h5")
 
 const adaptive_dt::Bool = true
-const CFL::FT = FT(0.3e0)        # Conservative CFL for MHD
+const CFL::FT = FT(0.3e0)
 const LTS::Bool = false
-const dt::FT = FT(1.0e-4)
-const Time::FT = FT(0.1)       # Brio-Wu final time t=0.1
-const maxStep::Int64 = profiling ? PROFILE_STEPS : 10000
+const dt::FT = FT(1.0e-3)
+const Time::FT = FT(1000.0)       # Increased to ensure full steady state convergence
+const maxStep::Int64 = 80000
 
 # ─── Implicit Time Advancement ───
-const implicit::Bool = false
+const implicit::Bool = true
 const implicit_CFL::FT = FT(10.0)
+const implicit_CFL_max::FT = FT(25000.0)
+const implicit_CFL_ramp_steps::Int64 = 2000
 const implicit_lusgs_sweeps::Int64 = 1
 const dual_time::Bool = false
 const dual_time_sub_iters::Int64 = 5
 const dual_time_tol::FT = FT(1.0e-3)
 
-# ─── Output (relative to Benchmark/BRIO_WU/) ───
+# ─── Output ───
 const plt_xdmf::Bool = true
 const plt_out::Bool = true
-const step_plt::Int64 = 500
+const step_plt::Int64 = 10000
 
 const chk_out::Bool = false
-const step_chk::Int64 = 1000
+const step_chk::Int64 = 5000
 const restart::String = "none"
 const inflow_restart::String = "none"
 
@@ -141,25 +145,24 @@ const sample_step::Int64 = 1000
 const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
-const filtering::Bool = false       # Inviscid test — no filtering
+const filtering::Bool = false
 const filtering_nonlinear::Bool = false
 const filtering_interval::Int64 = 10
 const filtering_rth::FT = FT(1e-5)
 const filtering_s0::FT = FT(0.02e0)
 
-# ─── Equation (Ncons/Nprim defined in physics.jl) ───
-const viscous::Bool = false         # Inviscid Brio-Wu
+# ─── Equation ───
 const viscous_order::Int64 = 2
 const gg_blend::FT = zero(FT)
 
 # ─── FVM Config ───
-const eigen_reconstruction::Bool = false  # Must be false for MHD (no 9×9 eigensystem)
+const eigen_reconstruction::Bool = false
 const character::Bool = false
-const splitMethodID::Int32 = 1     # 1=Rusanov (safe default for MHD debugging)
-const hybrid_ϕ1::FT = FT(0.01e0) # Low threshold: use WENO aggressively for shock tube
+const splitMethodID::Int32 = 1     # Rusanov
+const hybrid_ϕ1::FT = FT(0.01e0)
 const hybrid_ϕ2::FT = one(FT)
 const hybrid_ϕ3::FT = FT(10.0)
-const Linear_ϕ::FT = one(FT)   # Pure upwind (no KEP blend for shock tube)
+const Linear_ϕ::FT = one(FT)       # Upwind
 const UP7::SVector{7, FT} = SVector(-3/420, 25/420, -101/420, 319/420, 214/420, -38/420, 4/420)
 const CD6::SVector{7, FT} = SVector(0, 1/60, -2/15, 37/60, 37/60, -2/15, 1/60)
 const Linear::SVector{7, FT} = UP7 * Linear_ϕ + CD6 * (one(FT) - Linear_ϕ)
@@ -174,22 +177,27 @@ const nthreads2::Tuple{Int32, Int32, Int32} = (16, 8, 8)
 #                  ENTRY POINT
 # ═════════════════════════════════════════════════════════
 
-# Create output directories
 mkpath(joinpath(@__DIR__, "PLT"))
 
 comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
 
 if rank == 0
+    # Calculate analytic Hartmann number for display
+    mu = C_s
+    Ha = B0 * R0 * sqrt(1.0 / (η_mhd * mu))
+    
     println("=" ^ 70)
-    println("  Flame3D — Brio-Wu MHD Shock Tube Validation")
+    println("  Flame3D — Hartmann Flow Validation")
     println("=" ^ 70)
     print_gpu_backend_info()
     println("  Equation:   MHD (Ncons=$Ncons, Nprim=$Nprim)")
-    println("  γ:          $γ")
-    println("  Rg:         $Rg")
-    println("  GLM cr:     $cr_glm")
-    println("  Solver:     Rusanov (splitMethodID=$splitMethodID)")
+    println("  Hartmann:   Ha = $Ha")
+    println("  Resistivity: η = $η_mhd")
+    println("  B0:          $B0")
+    println("  Viscosity:  mu = $mu")
+    println("  u_target:   $u_bulk_target")
+    println("  Re_target:  $Re_target")
     println("  Test case:  ", test_case)
     println("  Blocks:     ", Nblocks)
     println("  Max steps:  ", maxStep)
@@ -206,7 +214,7 @@ warmup_time = (time_ns() - warmup_start) / 1e9
 if rank == 0
     println()
     println("=" ^ 70)
-    println("  BRIO-WU COMPLETE")
+    println("  HARTMANN COMPLETE")
     println("=" ^ 70)
     @printf("  Total wall time:     %.3f s\n", warmup_time)
     println("=" ^ 70)

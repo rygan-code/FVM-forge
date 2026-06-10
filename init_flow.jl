@@ -129,76 +129,82 @@ function init_pipe_flow(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
     @inbounds zi = z[i,j,k]
     r2 = yi*yi + zi*zi
     r2_norm = r2 / (R0*R0)
-    u_hp = FT(2.0) * u_bulk * max(one(FT) - r2_norm, zero(FT))
     
-    # Temperature with frictional heating profile
-    Ma2 = Ma_target * Ma_target
-    β = FT(0.5) * Pr * (γ - one(FT)) * Ma2
-    T_local = Tw * (one(FT) + β * max(one(FT) - r2_norm*r2_norm, zero(FT)))
+    is_visc = (isdefined(Main, :viscous) ? Main.viscous : true)
     
-    # Reference metrics (u_bulk matches Re_target)
-    μw = C_s * Tw * sqrt(Tw) / (Tw + T_s)
-    ρ_ref = Re_target * μw / (u_bulk * FT(2.0) * R0)
-    
-    # Analytical correction for volume-averaged density due to viscous heating:
-    # ∫ 1/(1 + β(1-u²)) du = (1 / 2A√β) * ln((A+√β)/(A-√β)) where A = √(1+β)
-    if β > 1e-6
-        A = sqrt(one(FT) + β)
-        sqrt_β = sqrt(β)
-        integral_factor = (one(FT) / (FT(2.0) * A * sqrt_β)) * log((A + sqrt_β) / (A - sqrt_β))
-        p_ref = ρ_ref * Rg * Tw / integral_factor
-    else
-        p_ref = ρ_ref * Rg * Tw
-    end
-    
-    ρ = p_ref / (Rg * T_local)
-    p = p_ref
-
-    # ── SEM (Synthetic Eddy Method) perturbation ──────────────────────
-    # Spatially correlated fluctuations via superposition of tent-function eddies.
-    # Each eddy contributes within a cube of side 2*l_sem centered at its position.
-    # Ref: Jarrin et al. (2006), adapted from Incompact3d's sem_init_channel.
-    
-    # Volume of the SEM domain (pipe length × diameter × diameter)
-    vol_sem = Lx * (FT(2.0) * R0) * (FT(2.0) * R0)
-    
-    upr = zero(FT)
-    vpr = zero(FT)
-    wpr = zero(FT)
-    
-    for jj = Int32(1):n_sem
-        @inbounds dx_e = abs(xi - eddy_pos_x[jj])
-        @inbounds dy_e = abs(yi - eddy_pos_y[jj])
-        @inbounds dz_e = abs(zi - eddy_pos_z[jj])
+    if is_visc
+        u_hp = FT(2.0) * u_bulk * max(one(FT) - r2_norm, zero(FT))
         
-        # Periodic in x: check also wrapped distance
-        dx_e = min(dx_e, Lx - dx_e)
+        # Temperature with frictional heating profile
+        Ma2 = Ma_target * Ma_target
+        β = FT(0.5) * Pr * (γ - one(FT)) * Ma2
+        T_local = Tw * (one(FT) + β * max(one(FT) - r2_norm*r2_norm, zero(FT)))
         
-        if dx_e < l_sem && dy_e < l_sem && dz_e < l_sem
-            # Tent function: f = (1-|dx|/l)(1-|dy|/l)(1-|dz|/l) / (sqrt(2l/3))^3
-            ftent = (one(FT) - dx_e/l_sem) * (one(FT) - dy_e/l_sem) * (one(FT) - dz_e/l_sem)
-            ftent = ftent / (sqrt(FT(2.0)/FT(3.0) * l_sem))^3
-            
-            @inbounds upr += eddy_sign1[jj] * ftent
-            @inbounds vpr += eddy_sign2[jj] * ftent
-            @inbounds wpr += eddy_sign3[jj] * ftent
+        # Reference metrics (u_bulk matches Re_target)
+        μw = C_s * Tw * sqrt(Tw) / (Tw + T_s)
+        ρ_ref = Re_target * μw / (u_bulk * FT(2.0) * R0)
+        
+        # Analytical correction for volume-averaged density due to viscous heating:
+        if β > 1e-6
+            A = sqrt(one(FT) + β)
+            sqrt_β = sqrt(β)
+            integral_factor = (one(FT) / (FT(2.0) * A * sqrt_β)) * log((A + sqrt_β) / (A - sqrt_β))
+            p_ref = ρ_ref * Rg * Tw / integral_factor
+        else
+            p_ref = ρ_ref * Rg * Tw
         end
+        
+        ρ = p_ref / (Rg * T_local)
+        p = p_ref
+        
+        # ── SEM (Synthetic Eddy Method) perturbation ──────────────────────
+        vol_sem = Lx * (FT(2.0) * R0) * (FT(2.0) * R0)
+        upr = zero(FT)
+        vpr = zero(FT)
+        wpr = zero(FT)
+        
+        for jj = Int32(1):n_sem
+            @inbounds dx_e = abs(xi - eddy_pos_x[jj])
+            @inbounds dy_e = abs(yi - eddy_pos_y[jj])
+            @inbounds dz_e = abs(zi - eddy_pos_z[jj])
+            
+            dx_e = min(dx_e, Lx - dx_e)
+            
+            if dx_e < l_sem && dy_e < l_sem && dz_e < l_sem
+                ftent = (one(FT) - dx_e/l_sem) * (one(FT) - dy_e/l_sem) * (one(FT) - dz_e/l_sem)
+                ftent = ftent / (sqrt(FT(2.0)/FT(3.0) * l_sem))^3
+                
+                @inbounds upr += eddy_sign1[jj] * ftent
+                @inbounds vpr += eddy_sign2[jj] * ftent
+                @inbounds wpr += eddy_sign3[jj] * ftent
+            end
+        end
+        
+        scale = sqrt(vol_sem / FT(n_sem))
+        upr *= scale
+        vpr *= scale
+        wpr *= scale
+        
+        envelope = max(one(FT) - r2_norm, zero(FT))
+        turb_scale = amp_sem * sqrt(FT(2.0)/FT(3.0) * envelope)
+        
+        u_final = u_hp  + upr * turb_scale
+        v_final = vpr * turb_scale
+        w_final = wpr * turb_scale
+    else
+        u_final = u_bulk
+        v_final = zero(FT)
+        w_final = zero(FT)
+        T_local = Tw
+        
+        # Consistent initial density/pressure for inviscid cases
+        μw = C_s * Tw * sqrt(Tw) / (Tw + T_s)
+        ρ_ref = Re_target * μw / (u_bulk * FT(2.0) * R0)
+        p_ref = ρ_ref * Rg * Tw
+        
+        ρ = ρ_ref
+        p = p_ref
     end
-    
-    # Scale by sqrt(V_domain / N_sem)
-    scale = sqrt(vol_sem / FT(n_sem))
-    upr *= scale
-    vpr *= scale
-    wpr *= scale
-    
-    # Radial envelope: (1 - r²/R0²) — perturbation vanishes at wall
-    # Also scale by local mean velocity for realistic turbulence intensity
-    envelope = max(one(FT) - r2_norm, zero(FT))
-    turb_scale = amp_sem * sqrt(FT(2.0)/FT(3.0) * envelope)
-    
-    u_final = u_hp  + upr * turb_scale
-    v_final = vpr * turb_scale
-    w_final = wpr * turb_scale
     
     @inbounds begin
         Q[i, j, k, 1] = ρ
@@ -326,6 +332,11 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
         @gpu_launch threads=nthreads blocks=nb init_tg5_debug(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     elseif test_case == "UniformDimensional"
         @gpu_launch threads=nthreads blocks=nb init_uniform_dimensional(Q, x, y, z)
+    elseif test_case == "MagneticDecay"
+        Lx_val = isdefined(Main, :Lx) ? Main.Lx : FT(7.5)
+        @gpu_launch threads=nthreads blocks=nb init_magnetic_decay(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp), Lx_val)
+    elseif test_case == "Hartmann"
+        @gpu_launch threads=nthreads blocks=nb init_hartmann(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     end
 end
 
@@ -433,3 +444,78 @@ function init_orszag_tang(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
     end
     return
 end
+
+function init_magnetic_decay(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32, Lx_val::FT)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+Int32(2*NG) || j > nyp+Int32(2*NG) || k > nzp+Int32(2*NG); return; end
+    if i < Int32(NG+1) || i > nxp+Int32(NG) || j < Int32(NG+1) || j > nyp+Int32(NG) || k < Int32(NG+1) || k > nzp+Int32(NG); return; end
+
+    @inbounds xc = x[i, j, k]
+
+    rho = one(FT)
+    u = zero(FT)
+    v = zero(FT)
+    w = zero(FT)
+    p = one(FT)
+    T = p / (rho * Rg)
+
+    Bx = zero(FT)
+    By = FT(0.1) * sin(FT(2.0) * FT(pi) * xc / Lx_val)
+    Bz = zero(FT)
+    psi = zero(FT)
+
+    @inbounds begin
+        Q[i, j, k, 1] = rho
+        Q[i, j, k, 2] = u
+        Q[i, j, k, 3] = v
+        Q[i, j, k, 4] = w
+        Q[i, j, k, 5] = p
+        Q[i, j, k, 6] = T
+        Q[i, j, k, 7] = Bx
+        Q[i, j, k, 8] = By
+        Q[i, j, k, 9] = Bz
+        Q[i, j, k, 10] = psi
+    end
+    return
+end
+
+function init_hartmann(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+Int32(2*NG) || j > nyp+Int32(2*NG) || k > nzp+Int32(2*NG); return; end
+    if i < Int32(NG+1) || i > nxp+Int32(NG) || j < Int32(NG+1) || j > nyp+Int32(NG) || k < Int32(NG+1) || k > nzp+Int32(NG); return; end
+
+    B0_val = isdefined(Main, :B0) ? Main.B0 : FT(1.0)
+
+    rho = one(FT)
+    u = FT(0.1)
+    v = zero(FT)
+    w = zero(FT)
+    p = one(FT)
+    T = p / (rho * Rg)
+
+    Bx = zero(FT)
+    By = B0_val
+    Bz = zero(FT)
+    psi = zero(FT)
+
+    @inbounds begin
+        Q[i, j, k, 1] = rho
+        Q[i, j, k, 2] = u
+        Q[i, j, k, 3] = v
+        Q[i, j, k, 4] = w
+        Q[i, j, k, 5] = p
+        Q[i, j, k, 6] = T
+        Q[i, j, k, 7] = Bx
+        Q[i, j, k, 8] = By
+        Q[i, j, k, 9] = Bz
+        Q[i, j, k, 10] = psi
+    end
+    return
+end
+

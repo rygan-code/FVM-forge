@@ -8,7 +8,7 @@ function div(U, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, dt, J, nxp, nyp, nzp)
 
     @inbounds Jact::FT = J[i+NG, j+NG, k+NG] * dt
 
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         for n = 1:Ncons
             @inbounds U[i+NG, j+NG, k+NG, n] += (
                 (Fx[i, j, k, n]   - Fx[i+1, j, k, n]) + 
@@ -41,7 +41,7 @@ function div_LTS(U, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, dt, J, nxp, nyp, nzp)
 
     @inbounds Jact::FT = J[i+NG, j+NG, k+NG] * dt[i+NG, j+NG, k+NG]
 
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         for n = 1:Ncons
             @inbounds U[i+NG, j+NG, k+NG, n] += (
                 (Fx[i, j, k, n]   - Fx[i+1, j, k, n]) + 
@@ -84,7 +84,7 @@ function div_rk_clip_prim(U, Un, Q, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z,
     # Step 1: Divergence → update U in place
     @inbounds Jact::FT = J[ii, jj, kk] * dt
 
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         for n = 1:Ncons
             @inbounds U[ii, jj, kk, n] += (
                 (Fx[i, j, k, n]   - Fx[i+1, j, k, n]) + 
@@ -195,7 +195,7 @@ function div_to_rhs(dU_rhs, U, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z,
 
     @inbounds vol_inv::FT = J[i+NG, j+NG, k+NG]  # J = 1/Vol
 
-    if viscous
+    if viscous || (equation_type == :MHD && resistive)
         for n = 1:Ncons
             @inbounds flux_div = (
                 (Fx[i, j, k, n]   - Fx[i+1, j, k, n]) +

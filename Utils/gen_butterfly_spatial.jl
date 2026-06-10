@@ -8,6 +8,13 @@
 include("gen_butterfly_fvm.jl")
 
 function main_spatial()
+    # Parse command line args
+    Nx_base = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : 512
+    Ny_val  = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 108
+    out_dir = length(ARGS) >= 3 ? ARGS[3] : "../MESH_SPATIAL"
+    wall_bc_str = length(ARGS) >= 4 ? ARGS[4] : "isothermal"
+    wall_bc_type = (wall_bc_str == "slip" || wall_bc_str == "slip_wall" || wall_bc_str == "12") ? 12 : 1
+ 
     # ─── Domain Length Settings ───
     Lx_override = 50.0        # Length in meters. R0=0.5m, so this is 100 R0.
     scale = Lx_override / Lx  # Lx in base generator is 7.5
@@ -15,17 +22,12 @@ function main_spatial()
     println("=== Spatial Transition Pipe Mesh ===")
     println("  Lx = $(Lx_override) ($(Lx_override/R0)R₀)")
     println("  Scale factor:  $(scale)")
+    println("  Target directory: $(out_dir)")
+    println("  Wall BC: $(wall_bc_str) (type ID: $(wall_bc_type))")
 
     # ─── Resolution Settings ───
-    # Set to a very coarse mesh for local debugging first.
-    # For the final production run on the cluster, increase these!
-    out_dir = "../MESH_SPATIAL"  # Save to root folder
-    
-    # Base streamwise resolution before scaling (e.g., 64 for testing, 512 for production)
-    Nx_base = 512
-    
-    # Cross-section resolution (e.g., 32 for testing, 108 for production)
-    Ny_b0, Nz_b0, N_rad = 108, 108, 108
+    # Cross-section resolution
+    Ny_b0, Nz_b0, N_rad = Ny_val, Ny_val, Ny_val
 
     # Scale Nx proportionally to maintain cell aspect ratio, round to multiple of 8
     Nx_b = 8 * cld(round(Int, Nx_base * scale), 8)
@@ -122,10 +124,10 @@ function main_spatial()
     end
     
     # Outer walls
-    face_bc[2, 3] = 1  # BC_ISOTHERMAL_WALL
-    face_bc[3, 4] = 1
-    face_bc[4, 5] = 1
-    face_bc[5, 6] = 1
+    face_bc[2, 3] = wall_bc_type
+    face_bc[3, 4] = wall_bc_type
+    face_bc[4, 5] = wall_bc_type
+    face_bc[5, 6] = wall_bc_type
 
     # ─── Boundary Parameters Array ───
     # Dimension is 20 to match N_BC_PARAMS in bc_types.jl

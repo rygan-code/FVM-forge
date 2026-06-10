@@ -106,6 +106,11 @@ function viscous_flux_i(Q, Fv_x,
     @inbounds begin
         u_f = FT(0.5)*(Q[iL,j,k,2]+Q[iR,j,k,2]); v_f = FT(0.5)*(Q[iL,j,k,3]+Q[iR,j,k,3])
         w_f = FT(0.5)*(Q[iL,j,k,4]+Q[iR,j,k,4]); T_f = FT(0.5)*(Q[iL,j,k,6]+Q[iR,j,k,6])
+        @static if equation_type == :MHD
+            Bx_f = FT(0.5)*(Q[iL,j,k,7]+Q[iR,j,k,7])
+            By_f = FT(0.5)*(Q[iL,j,k,8]+Q[iR,j,k,8])
+            Bz_f = FT(0.5)*(Q[iL,j,k,9]+Q[iR,j,k,9])
+        end
         area = Areai[i+1,j,k]; fnx = nxi[i+1,j,k]; fny = nyi[i+1,j,k]; fnz = nzi[i+1,j,k]
         Vf_inv = FT(2.0) / (FT(1.0)/Vol[iL,j,k] + FT(1.0)/Vol[iR,j,k])
         xix = nxi[i+1,j,k] * Areai[i+1,j,k] * Vf_inv
@@ -120,6 +125,12 @@ function viscous_flux_i(Q, Fv_x,
     end
     mu = get_viscosity(T_f); kappa = mu * Cp / Pr
     @inbounds begin
+        dudeta = zero(FT); dvdeta = zero(FT); dwdeta = zero(FT); dTdeta = zero(FT)
+        dudzeta = zero(FT); dvdzeta = zero(FT); dwdzeta = zero(FT); dTdzeta = zero(FT)
+        @static if equation_type == :MHD
+            dBxdeta = zero(FT); dBydeta = zero(FT); dBzdeta = zero(FT)
+            dBxdzeta = zero(FT); dBydzeta = zero(FT); dBzdzeta = zero(FT)
+        end
         dudxi = gradFace(Q[i-2,j,k,2],Q[i-1,j,k,2],Q[i,j,k,2],Q[i+1,j,k,2],Q[i+2,j,k,2],Q[i+3,j,k,2], FT(1.0))
         dvdxi = gradFace(Q[i-2,j,k,3],Q[i-1,j,k,3],Q[i,j,k,3],Q[i+1,j,k,3],Q[i+2,j,k,3],Q[i+3,j,k,3], FT(1.0))
         dwdxi = gradFace(Q[i-2,j,k,4],Q[i-1,j,k,4],Q[i,j,k,4],Q[i+1,j,k,4],Q[i+2,j,k,4],Q[i+3,j,k,4], FT(1.0))
@@ -147,6 +158,32 @@ function viscous_flux_i(Q, Fv_x,
             dwdzetaL=gradCell(Q[iL,j,k-3,4],Q[iL,j,k-2,4],Q[iL,j,k-1,4],Q[iL,j,k+1,4],Q[iL,j,k+2,4],Q[iL,j,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[iR,j,k-3,4],Q[iR,j,k-2,4],Q[iR,j,k-1,4],Q[iR,j,k+1,4],Q[iR,j,k+2,4],Q[iR,j,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
             dTdzetaL=gradCell(Q[iL,j,k-3,6],Q[iL,j,k-2,6],Q[iL,j,k-1,6],Q[iL,j,k+1,6],Q[iL,j,k+2,6],Q[iL,j,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[iR,j,k-3,6],Q[iR,j,k-2,6],Q[iR,j,k-1,6],Q[iR,j,k+1,6],Q[iR,j,k+2,6],Q[iR,j,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
         end
+        @static if equation_type == :MHD
+            if resistive
+                dBxdxi = gradFace(Q[i-2,j,k,7],Q[i-1,j,k,7],Q[i,j,k,7],Q[i+1,j,k,7],Q[i+2,j,k,7],Q[i+3,j,k,7], FT(1.0))
+                dBydxi = gradFace(Q[i-2,j,k,8],Q[i-1,j,k,8],Q[i,j,k,8],Q[i+1,j,k,8],Q[i+2,j,k,8],Q[i+3,j,k,8], FT(1.0))
+                dBzdxi = gradFace(Q[i-2,j,k,9],Q[i-1,j,k,9],Q[i,j,k,9],Q[i+1,j,k,9],Q[i+2,j,k,9],Q[i+3,j,k,9], FT(1.0))
+
+                if near_inter_j
+                    dBxdetaL=gradCell2(Q[iL,j-1,k,7],Q[iL,j+1,k,7],FT(1.0));dBxdetaR=gradCell2(Q[iR,j-1,k,7],Q[iR,j+1,k,7],FT(1.0));dBxdeta=FT(0.5)*(dBxdetaL+dBxdetaR)
+                    dBydetaL=gradCell2(Q[iL,j-1,k,8],Q[iL,j+1,k,8],FT(1.0));dBydetaR=gradCell2(Q[iR,j-1,k,8],Q[iR,j+1,k,8],FT(1.0));dBydeta=FT(0.5)*(dBydetaL+dBydetaR)
+                    dBzdetaL=gradCell2(Q[iL,j-1,k,9],Q[iL,j+1,k,9],FT(1.0));dBzdetaR=gradCell2(Q[iR,j-1,k,9],Q[iR,j+1,k,9],FT(1.0));dBzdeta=FT(0.5)*(dBzdetaL+dBzdetaR)
+                else
+                    dBxdetaL=gradCell(Q[iL,j-3,k,7],Q[iL,j-2,k,7],Q[iL,j-1,k,7],Q[iL,j+1,k,7],Q[iL,j+2,k,7],Q[iL,j+3,k,7],FT(1.0));dBxdetaR=gradCell(Q[iR,j-3,k,7],Q[iR,j-2,k,7],Q[iR,j-1,k,7],Q[iR,j+1,k,7],Q[iR,j+2,k,7],Q[iR,j+3,k,7],FT(1.0));dBxdeta=FT(0.5)*(dBxdetaL+dBxdetaR)
+                    dBydetaL=gradCell(Q[iL,j-3,k,8],Q[iL,j-2,k,8],Q[iL,j-1,k,8],Q[iL,j+1,k,8],Q[iL,j+2,k,8],Q[iL,j+3,k,8],FT(1.0));dBydetaR=gradCell(Q[iR,j-3,k,8],Q[iR,j-2,k,8],Q[iR,j-1,k,8],Q[iR,j+1,k,8],Q[iR,j+2,k,8],Q[iR,j+3,k,8],FT(1.0));dBydeta=FT(0.5)*(dBydetaL+dBydetaR)
+                    dBzdetaL=gradCell(Q[iL,j-3,k,9],Q[iL,j-2,k,9],Q[iL,j-1,k,9],Q[iL,j+1,k,9],Q[iL,j+2,k,9],Q[iL,j+3,k,9],FT(1.0));dBzdetaR=gradCell(Q[iR,j-3,k,9],Q[iR,j-2,k,9],Q[iR,j-1,k,9],Q[iR,j+1,k,9],Q[iR,j+2,k,9],Q[iR,j+3,k,9],FT(1.0));dBzdeta=FT(0.5)*(dBzdetaL+dBzdetaR)
+                end
+                if near_inter_k
+                    dBxdzetaL=gradCell2(Q[iL,j,k-1,7],Q[iL,j,k+1,7],FT(1.0));dBxdzetaR=gradCell2(Q[iR,j,k-1,7],Q[iR,j,k+1,7],FT(1.0));dBxdzeta=FT(0.5)*(dBxdzetaL+dBxdzetaR)
+                    dBydzetaL=gradCell2(Q[iL,j,k-1,8],Q[iL,j,k+1,8],FT(1.0));dBydzetaR=gradCell2(Q[iR,j,k-1,8],Q[iR,j,k+1,8],FT(1.0));dBydzeta=FT(0.5)*(dBydzetaL+dBydzetaR)
+                    dBzdzetaL=gradCell2(Q[iL,j,k-1,9],Q[iL,j,k+1,9],FT(1.0));dBzdzetaR=gradCell2(Q[iR,j,k-1,9],Q[iR,j,k+1,9],FT(1.0));dBzdzeta=FT(0.5)*(dBzdzetaL+dBzdzetaR)
+                else
+                    dBxdzetaL=gradCell(Q[iL,j,k-3,7],Q[iL,j,k-2,7],Q[iL,j,k-1,7],Q[iL,j,k+1,7],Q[iL,j,k+2,7],Q[iL,j,k+3,7],FT(1.0));dBxdzetaR=gradCell(Q[iR,j,k-3,7],Q[iR,j,k-2,7],Q[iR,j,k-1,7],Q[iR,j,k+1,7],Q[iR,j,k+2,7],Q[iR,j,k+3,7],FT(1.0));dBxdzeta=FT(0.5)*(dBxdzetaL+dBxdzetaR)
+                    dBydzetaL=gradCell(Q[iL,j,k-3,8],Q[iL,j,k-2,8],Q[iL,j,k-1,8],Q[iL,j,k+1,8],Q[iL,j,k+2,8],Q[iL,j,k+3,8],FT(1.0));dBydzetaR=gradCell(Q[iR,j,k-3,8],Q[iR,j,k-2,8],Q[iR,j,k-1,8],Q[iR,j,k+1,8],Q[iR,j,k+2,8],Q[iR,j,k+3,8],FT(1.0));dBydzeta=FT(0.5)*(dBydzetaL+dBydzetaR)
+                    dBzdzetaL=gradCell(Q[iL,j,k-3,9],Q[iL,j,k-2,9],Q[iL,j,k-1,9],Q[iL,j,k+1,9],Q[iL,j,k+2,9],Q[iL,j,k+3,9],FT(1.0));dBzdzetaR=gradCell(Q[iR,j,k-3,9],Q[iR,j,k-2,9],Q[iR,j,k-1,9],Q[iR,j,k+1,9],Q[iR,j,k+2,9],Q[iR,j,k+3,9],FT(1.0));dBzdzeta=FT(0.5)*(dBzdzetaL+dBzdzetaR)
+                end
+            end
+        end
     end
     dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
     dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
@@ -170,13 +207,41 @@ function viscous_flux_i(Q, Fv_x,
     tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    @static if equation_type == :MHD
+        if resistive
+            dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
+            dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
+            dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
+
+            Jx = dBzdy - dBydz
+            Jy = dBxdz - dBzdx
+            Jz = dBydx - dBxdy
+
+            fres_Bx = η_mhd * (Jy * fnz - Jz * fny)
+            fres_By = η_mhd * (Jz * fnx - Jx * fnz)
+            fres_Bz = η_mhd * (Jx * fny - Jy * fnx)
+            fres_E  = fres_Bx * Bx_f + fres_By * By_f + fres_Bz * Bz_f
+        end
+    end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @static if equation_type == :MHD
+        if resistive
+            fv_E += fres_E
+        end
+    end
     @inbounds begin
         Fv_x[i-NG+1,j-NG,k-NG,1]=FT(0e0); Fv_x[i-NG+1,j-NG,k-NG,2]=fv_rhou*area
         Fv_x[i-NG+1,j-NG,k-NG,3]=fv_rhov*area; Fv_x[i-NG+1,j-NG,k-NG,4]=fv_rhow*area; Fv_x[i-NG+1,j-NG,k-NG,5]=fv_E*area
+        @static if equation_type == :MHD
+            Fv_x[i-NG+1,j-NG,k-NG,6] = resistive ? fres_Bx * area : zero(FT)
+            Fv_x[i-NG+1,j-NG,k-NG,7] = resistive ? fres_By * area : zero(FT)
+            Fv_x[i-NG+1,j-NG,k-NG,8] = resistive ? fres_Bz * area : zero(FT)
+            Fv_x[i-NG+1,j-NG,k-NG,9] = zero(FT)
+        end
     end
     return
 end
+
 
 function viscous_flux_j(Q, Fv_y,
         Areai, Areaj, Areak,
@@ -194,6 +259,11 @@ function viscous_flux_j(Q, Fv_y,
     @inbounds begin
         u_f = FT(0.5)*(Q[i,jL,k,2]+Q[i,jR,k,2]); v_f = FT(0.5)*(Q[i,jL,k,3]+Q[i,jR,k,3])
         w_f = FT(0.5)*(Q[i,jL,k,4]+Q[i,jR,k,4]); T_f = FT(0.5)*(Q[i,jL,k,6]+Q[i,jR,k,6])
+        @static if equation_type == :MHD
+            Bx_f = FT(0.5)*(Q[i,jL,k,7]+Q[i,jR,k,7])
+            By_f = FT(0.5)*(Q[i,jL,k,8]+Q[i,jR,k,8])
+            Bz_f = FT(0.5)*(Q[i,jL,k,9]+Q[i,jR,k,9])
+        end
         area = Areaj[i,j+1,k]; fnx = nxj[i,j+1,k]; fny = nyj[i,j+1,k]; fnz = nzj[i,j+1,k]
         Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,jL,k] + FT(1.0)/Vol[i,jR,k])
         xix = FT(0.25) * (nxi[i,jL,k]*Areai[i,jL,k] + nxi[i+1,jL,k]*Areai[i+1,jL,k] + nxi[i,jR,k]*Areai[i,jR,k] + nxi[i+1,jR,k]*Areai[i+1,jR,k]) * Vf_inv
@@ -208,6 +278,12 @@ function viscous_flux_j(Q, Fv_y,
     end
     mu = get_viscosity(T_f); kappa = mu * Cp / Pr
     @inbounds begin
+        dudxi = zero(FT); dvdxi = zero(FT); dwdxi = zero(FT); dTdxi = zero(FT)
+        dudzeta = zero(FT); dvdzeta = zero(FT); dwdzeta = zero(FT); dTdzeta = zero(FT)
+        @static if equation_type == :MHD
+            dBxdxi = zero(FT); dBydxi = zero(FT); dBzdxi = zero(FT)
+            dBxdzeta = zero(FT); dBydzeta = zero(FT); dBzdzeta = zero(FT)
+        end
         dudeta = gradFace(Q[i,j-2,k,2],Q[i,j-1,k,2],Q[i,j,k,2],Q[i,j+1,k,2],Q[i,j+2,k,2],Q[i,j+3,k,2], FT(1.0))
         dvdeta = gradFace(Q[i,j-2,k,3],Q[i,j-1,k,3],Q[i,j,k,3],Q[i,j+1,k,3],Q[i,j+2,k,3],Q[i,j+3,k,3], FT(1.0))
         dwdeta = gradFace(Q[i,j-2,k,4],Q[i,j-1,k,4],Q[i,j,k,4],Q[i,j+1,k,4],Q[i,j+2,k,4],Q[i,j+3,k,4], FT(1.0))
@@ -235,6 +311,32 @@ function viscous_flux_j(Q, Fv_y,
             dwdzetaL=gradCell(Q[i,jL,k-3,4],Q[i,jL,k-2,4],Q[i,jL,k-1,4],Q[i,jL,k+1,4],Q[i,jL,k+2,4],Q[i,jL,k+3,4],FT(1.0));dwdzetaR=gradCell(Q[i,jR,k-3,4],Q[i,jR,k-2,4],Q[i,jR,k-1,4],Q[i,jR,k+1,4],Q[i,jR,k+2,4],Q[i,jR,k+3,4],FT(1.0));dwdzeta=FT(0.5)*(dwdzetaL+dwdzetaR)
             dTdzetaL=gradCell(Q[i,jL,k-3,6],Q[i,jL,k-2,6],Q[i,jL,k-1,6],Q[i,jL,k+1,6],Q[i,jL,k+2,6],Q[i,jL,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[i,jR,k-3,6],Q[i,jR,k-2,6],Q[i,jR,k-1,6],Q[i,jR,k+1,6],Q[i,jR,k+2,6],Q[i,jR,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
         end
+        @static if equation_type == :MHD
+            if resistive
+                dBxdeta = gradFace(Q[i,j-2,k,7],Q[i,j-1,k,7],Q[i,j,k,7],Q[i,j+1,k,7],Q[i,j+2,k,7],Q[i,j+3,k,7], FT(1.0))
+                dBydeta = gradFace(Q[i,j-2,k,8],Q[i,j-1,k,8],Q[i,j,k,8],Q[i,j+1,k,8],Q[i,j+2,k,8],Q[i,j+3,k,8], FT(1.0))
+                dBzdeta = gradFace(Q[i,j-2,k,9],Q[i,j-1,k,9],Q[i,j,k,9],Q[i,j+1,k,9],Q[i,j+2,k,9],Q[i,j+3,k,9], FT(1.0))
+
+                if near_inter_i
+                    dBxdxiL=gradCell2(Q[i-1,jL,k,7],Q[i+1,jL,k,7],FT(1.0));dBxdxiR=gradCell2(Q[i-1,jR,k,7],Q[i+1,jR,k,7],FT(1.0));dBxdxi=FT(0.5)*(dBxdxiL+dBxdxiR)
+                    dBydxiL=gradCell2(Q[i-1,jL,k,8],Q[i+1,jL,k,8],FT(1.0));dBydxiR=gradCell2(Q[i-1,jR,k,8],Q[i+1,jR,k,8],FT(1.0));dBydxi=FT(0.5)*(dBydxiL+dBydxiR)
+                    dBzdxiL=gradCell2(Q[i-1,jL,k,9],Q[i+1,jL,k,9],FT(1.0));dBzdxiR=gradCell2(Q[i-1,jR,k,9],Q[i+1,jR,k,9],FT(1.0));dBzdxi=FT(0.5)*(dBzdxiL+dBzdxiR)
+                else
+                    dBxdxiL=gradCell(Q[i-3,jL,k,7],Q[i-2,jL,k,7],Q[i-1,jL,k,7],Q[i+1,jL,k,7],Q[i+2,jL,k,7],Q[i+3,jL,k,7],FT(1.0));dBxdxiR=gradCell(Q[i-3,jR,k,7],Q[i-2,jR,k,7],Q[i-1,jR,k,7],Q[i+1,jR,k,7],Q[i+2,jR,k,7],Q[i+3,jR,k,7],FT(1.0));dBxdxi=FT(0.5)*(dBxdxiL+dBxdxiR)
+                    dBydxiL=gradCell(Q[i-3,jL,k,8],Q[i-2,jL,k,8],Q[i-1,jL,k,8],Q[i+1,jL,k,8],Q[i+2,jL,k,8],Q[i+3,jL,k,8],FT(1.0));dBydxiR=gradCell(Q[i-3,jR,k,8],Q[i-2,jR,k,8],Q[i-1,jR,k,8],Q[i+1,jR,k,8],Q[i+2,jR,k,8],Q[i+3,jR,k,8],FT(1.0));dBydxi=FT(0.5)*(dBydxiL+dBydxiR)
+                    dBzdxiL=gradCell(Q[i-3,jL,k,9],Q[i-2,jL,k,9],Q[i-1,jL,k,9],Q[i+1,jL,k,9],Q[i+2,jL,k,9],Q[i+3,jL,k,9],FT(1.0));dBzdxiR=gradCell(Q[i-3,jR,k,9],Q[i-2,jR,k,9],Q[i-1,jR,k,9],Q[i+1,jR,k,9],Q[i+2,jR,k,9],Q[i+3,jR,k,9],FT(1.0));dBzdxi=FT(0.5)*(dBzdxiL+dBzdxiR)
+                end
+                if near_inter_k
+                    dBxdzetaL=gradCell2(Q[i,jL,k-1,7],Q[i,jL,k+1,7],FT(1.0));dBxdzetaR=gradCell2(Q[i,jR,k-1,7],Q[i,jR,k+1,7],FT(1.0));dBxdzeta=FT(0.5)*(dBxdzetaL+dBxdzetaR)
+                    dBydzetaL=gradCell2(Q[i,jL,k-1,8],Q[i,jL,k+1,8],FT(1.0));dBydzetaR=gradCell2(Q[i,jR,k-1,8],Q[i,jR,k+1,8],FT(1.0));dBydzeta=FT(0.5)*(dBydzetaL+dBydzetaR)
+                    dBzdzetaL=gradCell2(Q[i,jL,k-1,9],Q[i,jL,k+1,9],FT(1.0));dBzdzetaR=gradCell2(Q[i,jR,k-1,9],Q[i,jR,k+1,9],FT(1.0));dBzdzeta=FT(0.5)*(dBzdzetaL+dBzdzetaR)
+                else
+                    dBxdzetaL=gradCell(Q[i,jL,k-3,7],Q[i,jL,k-2,7],Q[i,jL,k-1,7],Q[i,jL,k+1,7],Q[i,jL,k+2,7],Q[i,jL,k+3,7],FT(1.0));dBxdzetaR=gradCell(Q[i,jR,k-3,7],Q[i,jR,k-2,7],Q[i,jR,k-1,7],Q[i,jR,k+1,7],Q[i,jR,k+2,7],Q[i,jR,k+3,7],FT(1.0));dBxdzeta=FT(0.5)*(dBxdzetaL+dBxdzetaR)
+                    dBydzetaL=gradCell(Q[i,jL,k-3,8],Q[i,jL,k-2,8],Q[i,jL,k-1,8],Q[i,jL,k+1,8],Q[i,jL,k+2,8],Q[i,jL,k+3,8],FT(1.0));dBydzetaR=gradCell(Q[i,jR,k-3,8],Q[i,jR,k-2,8],Q[i,jR,k-1,8],Q[i,jR,k+1,8],Q[i,jR,k+2,8],Q[i,jR,k+3,8],FT(1.0));dBydzeta=FT(0.5)*(dBydzetaL+dBydzetaR)
+                    dBzdzetaL=gradCell(Q[i,jL,k-3,9],Q[i,jL,k-2,9],Q[i,jL,k-1,9],Q[i,jL,k+1,9],Q[i,jL,k+2,9],Q[i,jL,k+3,9],FT(1.0));dBzdzetaR=gradCell(Q[i,jR,k-3,9],Q[i,jR,k-2,9],Q[i,jR,k-1,9],Q[i,jR,k+1,9],Q[i,jR,k+2,9],Q[i,jR,k+3,9],FT(1.0));dBzdzeta=FT(0.5)*(dBzdzetaL+dBzdzetaR)
+                end
+            end
+        end
     end
     dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
     dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
@@ -256,13 +358,41 @@ function viscous_flux_j(Q, Fv_y,
     tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    @static if equation_type == :MHD
+        if resistive
+            dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
+            dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
+            dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
+
+            Jx = dBzdy - dBydz
+            Jy = dBxdz - dBzdx
+            Jz = dBydx - dBxdy
+
+            fres_Bx = η_mhd * (Jy * fnz - Jz * fny)
+            fres_By = η_mhd * (Jz * fnx - Jx * fnz)
+            fres_Bz = η_mhd * (Jx * fny - Jy * fnx)
+            fres_E  = fres_Bx * Bx_f + fres_By * By_f + fres_Bz * Bz_f
+        end
+    end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @static if equation_type == :MHD
+        if resistive
+            fv_E += fres_E
+        end
+    end
     @inbounds begin
         Fv_y[i-NG,j-NG+1,k-NG,1]=FT(0e0); Fv_y[i-NG,j-NG+1,k-NG,2]=fv_rhou*area
         Fv_y[i-NG,j-NG+1,k-NG,3]=fv_rhov*area; Fv_y[i-NG,j-NG+1,k-NG,4]=fv_rhow*area; Fv_y[i-NG,j-NG+1,k-NG,5]=fv_E*area
+        @static if equation_type == :MHD
+            Fv_y[i-NG,j-NG+1,k-NG,6] = resistive ? fres_Bx * area : zero(FT)
+            Fv_y[i-NG,j-NG+1,k-NG,7] = resistive ? fres_By * area : zero(FT)
+            Fv_y[i-NG,j-NG+1,k-NG,8] = resistive ? fres_Bz * area : zero(FT)
+            Fv_y[i-NG,j-NG+1,k-NG,9] = zero(FT)
+        end
     end
     return
 end
+
 
 function viscous_flux_k(Q, Fv_z,
         Areai, Areaj, Areak,
@@ -280,6 +410,11 @@ function viscous_flux_k(Q, Fv_z,
     @inbounds begin
         u_f = FT(0.5)*(Q[i,j,kL,2]+Q[i,j,kR,2]); v_f = FT(0.5)*(Q[i,j,kL,3]+Q[i,j,kR,3])
         w_f = FT(0.5)*(Q[i,j,kL,4]+Q[i,j,kR,4]); T_f = FT(0.5)*(Q[i,j,kL,6]+Q[i,j,kR,6])
+        @static if equation_type == :MHD
+            Bx_f = FT(0.5)*(Q[i,j,kL,7]+Q[i,j,kR,7])
+            By_f = FT(0.5)*(Q[i,j,kL,8]+Q[i,j,kR,8])
+            Bz_f = FT(0.5)*(Q[i,j,kL,9]+Q[i,j,kR,9])
+        end
         area = Areak[i,j,k+1]; fnx = nxk[i,j,k+1]; fny = nyk[i,j,k+1]; fnz = nzk[i,j,k+1]
         Vf_inv = FT(2.0) / (FT(1.0)/Vol[i,j,kL] + FT(1.0)/Vol[i,j,kR])
         xix = FT(0.25) * (nxi[i,j,kL]*Areai[i,j,kL] + nxi[i+1,j,kL]*Areai[i+1,j,kL] + nxi[i,j,kR]*Areai[i,j,kR] + nxi[i+1,j,kR]*Areai[i+1,j,kR]) * Vf_inv
@@ -294,6 +429,12 @@ function viscous_flux_k(Q, Fv_z,
     end
     mu = get_viscosity(T_f); kappa = mu * Cp / Pr
     @inbounds begin
+        dudxi = zero(FT); dvdxi = zero(FT); dwdxi = zero(FT); dTdxi = zero(FT)
+        dudeta = zero(FT); dvdeta = zero(FT); dwdeta = zero(FT); dTdeta = zero(FT)
+        @static if equation_type == :MHD
+            dBxdxi = zero(FT); dBydxi = zero(FT); dBzdxi = zero(FT)
+            dBxdeta = zero(FT); dBydeta = zero(FT); dBzdeta = zero(FT)
+        end
         dudzeta = gradFace(Q[i,j,k-2,2],Q[i,j,k-1,2],Q[i,j,k,2],Q[i,j,k+1,2],Q[i,j,k+2,2],Q[i,j,k+3,2], FT(1.0))
         dvdzeta = gradFace(Q[i,j,k-2,3],Q[i,j,k-1,3],Q[i,j,k,3],Q[i,j,k+1,3],Q[i,j,k+2,3],Q[i,j,k+3,3], FT(1.0))
         dwdzeta = gradFace(Q[i,j,k-2,4],Q[i,j,k-1,4],Q[i,j,k,4],Q[i,j,k+1,4],Q[i,j,k+2,4],Q[i,j,k+3,4], FT(1.0))
@@ -321,6 +462,32 @@ function viscous_flux_k(Q, Fv_z,
             dwdetaL=gradCell(Q[i,j-3,kL,4],Q[i,j-2,kL,4],Q[i,j-1,kL,4],Q[i,j+1,kL,4],Q[i,j+2,kL,4],Q[i,j+3,kL,4],FT(1.0));dwdetaR=gradCell(Q[i,j-3,kR,4],Q[i,j-2,kR,4],Q[i,j-1,kR,4],Q[i,j+1,kR,4],Q[i,j+2,kR,4],Q[i,j+3,kR,4],FT(1.0));dwdeta=FT(0.5)*(dwdetaL+dwdetaR)
             dTdetaL=gradCell(Q[i,j-3,kL,6],Q[i,j-2,kL,6],Q[i,j-1,kL,6],Q[i,j+1,kL,6],Q[i,j+2,kL,6],Q[i,j+3,kL,6],FT(1.0));dTdetaR=gradCell(Q[i,j-3,kR,6],Q[i,j-2,kR,6],Q[i,j-1,kR,6],Q[i,j+1,kR,6],Q[i,j+2,kR,6],Q[i,j+3,kR,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
         end
+        @static if equation_type == :MHD
+            if resistive
+                dBxdzeta = gradFace(Q[i,j,k-2,7],Q[i,j,k-1,7],Q[i,j,k,7],Q[i,j,k+1,7],Q[i,j,k+2,7],Q[i,j,k+3,7], FT(1.0))
+                dBydzeta = gradFace(Q[i,j,k-2,8],Q[i,j,k-1,8],Q[i,j,k,8],Q[i,j,k+1,8],Q[i,j,k+2,8],Q[i,j,k+3,8], FT(1.0))
+                dBzdzeta = gradFace(Q[i,j,k-2,9],Q[i,j,k-1,9],Q[i,j,k,9],Q[i,j,k+1,9],Q[i,j,k+2,9],Q[i,j,k+3,9], FT(1.0))
+
+                if near_inter_i
+                    dBxdxiL=gradCell2(Q[i-1,j,kL,7],Q[i+1,j,kL,7],FT(1.0));dBxdxiR=gradCell2(Q[i-1,j,kR,7],Q[i+1,j,kR,7],FT(1.0));dBxdxi=FT(0.5)*(dBxdxiL+dBxdxiR)
+                    dBydxiL=gradCell2(Q[i-1,j,kL,8],Q[i+1,j,kL,8],FT(1.0));dBydxiR=gradCell2(Q[i-1,j,kR,8],Q[i+1,j,kR,8],FT(1.0));dBydxi=FT(0.5)*(dBydxiL+dBydxiR)
+                    dBzdxiL=gradCell2(Q[i-1,j,kL,9],Q[i+1,j,kL,9],FT(1.0));dBzdxiR=gradCell2(Q[i-1,j,kR,9],Q[i+1,j,kR,9],FT(1.0));dBzdxi=FT(0.5)*(dBzdxiL+dBzdxiR)
+                else
+                    dBxdxiL=gradCell(Q[i-3,j,kL,7],Q[i-2,j,kL,7],Q[i-1,j,kL,7],Q[i+1,j,kL,7],Q[i+2,j,kL,7],Q[i+3,j,kL,7],FT(1.0));dBxdxiR=gradCell(Q[i-3,j,kR,7],Q[i-2,j,kR,7],Q[i-1,j,kR,7],Q[i+1,j,kR,7],Q[i+2,j,kR,7],Q[i+3,j,kR,7],FT(1.0));dBxdxi=FT(0.5)*(dBxdxiL+dBxdxiR)
+                    dBydxiL=gradCell(Q[i-3,j,kL,8],Q[i-2,j,kL,8],Q[i-1,j,kL,8],Q[i+1,j,kL,8],Q[i+2,j,kL,8],Q[i+3,j,kL,8],FT(1.0));dBydxiR=gradCell(Q[i-3,j,kR,8],Q[i-2,j,kR,8],Q[i-1,j,kR,8],Q[i+1,j,kR,8],Q[i+2,j,kR,8],Q[i+3,j,kR,8],FT(1.0));dBydxi=FT(0.5)*(dBydxiL+dBydxiR)
+                    dBzdxiL=gradCell(Q[i-3,j,kL,9],Q[i-2,j,kL,9],Q[i-1,j,kL,9],Q[i+1,j,kL,9],Q[i+2,j,kL,9],Q[i+3,j,kL,9],FT(1.0));dBzdxiR=gradCell(Q[i-3,j,kR,9],Q[i-2,j,kR,9],Q[i-1,j,kR,9],Q[i+1,j,kR,9],Q[i+2,j,kR,9],Q[i+3,j,kR,9],FT(1.0));dBzdxi=FT(0.5)*(dBzdxiL+dBzdxiR)
+                end
+                if near_inter_j
+                    dBxdetaL=gradCell2(Q[i,j-1,kL,7],Q[i,j+1,kL,7],FT(1.0));dBxdetaR=gradCell2(Q[i,j-1,kR,7],Q[i,j+1,kR,7],FT(1.0));dBxdeta=FT(0.5)*(dBxdetaL+dBxdetaR)
+                    dBydetaL=gradCell2(Q[i,j-1,kL,8],Q[i,j+1,kL,8],FT(1.0));dBydetaR=gradCell2(Q[i,j-1,kR,8],Q[i,j+1,kR,8],FT(1.0));dBydeta=FT(0.5)*(dBydetaL+dBydetaR)
+                    dBzdetaL=gradCell2(Q[i,j-1,kL,9],Q[i,j+1,kL,9],FT(1.0));dBzdetaR=gradCell2(Q[i,j-1,kR,9],Q[i,j+1,kR,9],FT(1.0));dBzdeta=FT(0.5)*(dBzdetaL+dBzdetaR)
+                else
+                    dBxdetaL=gradCell(Q[i,j-3,kL,7],Q[i,j-2,kL,7],Q[i,j-1,kL,7],Q[i,j+1,kL,7],Q[i,j+2,kL,7],Q[i,j+3,kL,7],FT(1.0));dBxdetaR=gradCell(Q[i,j-3,kR,7],Q[i,j-2,kR,7],Q[i,j-1,kR,7],Q[i,j+1,kR,7],Q[i,j+2,kR,7],Q[i,j+3,kR,7],FT(1.0));dBxdeta=FT(0.5)*(dBxdetaL+dBxdetaR)
+                    dBydetaL=gradCell(Q[i,j-3,kL,8],Q[i,j-2,kL,8],Q[i,j-1,kL,8],Q[i,j+1,kL,8],Q[i,j+2,kL,8],Q[i,j+3,kL,8],FT(1.0));dBydetaR=gradCell(Q[i,j-3,kR,8],Q[i,j-2,kR,8],Q[i,j-1,kR,8],Q[i,j+1,kR,8],Q[i,j+2,kR,8],Q[i,j+3,kR,8],FT(1.0));dBydeta=FT(0.5)*(dBydetaL+dBydetaR)
+                    dBzdetaL=gradCell(Q[i,j-3,kL,9],Q[i,j-2,kL,9],Q[i,j-1,kL,9],Q[i,j+1,kL,9],Q[i,j+2,kL,9],Q[i,j+3,kL,9],FT(1.0));dBzdetaR=gradCell(Q[i,j-3,kR,9],Q[i,j-2,kR,9],Q[i,j-1,kR,9],Q[i,j+1,kR,9],Q[i,j+2,kR,9],Q[i,j+3,kR,9],FT(1.0));dBzdeta=FT(0.5)*(dBzdetaL+dBzdetaR)
+                end
+            end
+        end
     end
     dudx = xix*dudxi + etax*dudeta + zetax*dudzeta; dudy = xiy*dudxi + etay*dudeta + zetay*dudzeta; dudz = xiz*dudxi + etaz*dudeta + zetaz*dudzeta
     dvdx = xix*dvdxi + etax*dvdeta + zetax*dvdzeta; dvdy = xiy*dvdxi + etay*dvdeta + zetay*dvdzeta; dvdz = xiz*dvdxi + etaz*dvdeta + zetaz*dvdzeta
@@ -342,10 +509,38 @@ function viscous_flux_k(Q, Fv_z,
     tau_xy=mu*(dudy+dvdx); tau_xz=mu*(dudz+dwdx); tau_yz=mu*(dvdz+dwdy)
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
+    @static if equation_type == :MHD
+        if resistive
+            dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
+            dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
+            dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
+
+            Jx = dBzdy - dBydz
+            Jy = dBxdz - dBzdx
+            Jz = dBydx - dBxdy
+
+            fres_Bx = η_mhd * (Jy * fnz - Jz * fny)
+            fres_By = η_mhd * (Jz * fnx - Jx * fnz)
+            fres_Bz = η_mhd * (Jx * fny - Jy * fnx)
+            fres_E  = fres_Bx * Bx_f + fres_By * By_f + fres_Bz * Bz_f
+        end
+    end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
+    @static if equation_type == :MHD
+        if resistive
+            fv_E += fres_E
+        end
+    end
     @inbounds begin
         Fv_z[i-NG,j-NG,k-NG+1,1]=FT(0e0); Fv_z[i-NG,j-NG,k-NG+1,2]=fv_rhou*area
         Fv_z[i-NG,j-NG,k-NG+1,3]=fv_rhov*area; Fv_z[i-NG,j-NG,k-NG+1,4]=fv_rhow*area; Fv_z[i-NG,j-NG,k-NG+1,5]=fv_E*area
+        @static if equation_type == :MHD
+            Fv_z[i-NG,j-NG,k-NG+1,6] = resistive ? fres_Bx * area : zero(FT)
+            Fv_z[i-NG,j-NG,k-NG+1,7] = resistive ? fres_By * area : zero(FT)
+            Fv_z[i-NG,j-NG,k-NG+1,8] = resistive ? fres_Bz * area : zero(FT)
+            Fv_z[i-NG,j-NG,k-NG+1,9] = zero(FT)
+        end
     end
     return
 end
+
