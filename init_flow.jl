@@ -158,7 +158,8 @@ function init_pipe_flow(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
         p = p_ref
         
         # ── SEM (Synthetic Eddy Method) perturbation ──────────────────────
-        vol_sem = Lx * (FT(2.0) * R0) * (FT(2.0) * R0)
+        L_domain = (xi < zero(FT)) ? (isdefined(Main, :cebl_Lx) ? FT(Main.cebl_Lx) : Lx) : Lx
+        vol_sem = L_domain * (FT(2.0) * R0) * (FT(2.0) * R0)
         upr = zero(FT)
         vpr = zero(FT)
         wpr = zero(FT)
@@ -168,7 +169,7 @@ function init_pipe_flow(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
             @inbounds dy_e = abs(yi - eddy_pos_y[jj])
             @inbounds dz_e = abs(zi - eddy_pos_z[jj])
             
-            dx_e = min(dx_e, Lx - dx_e)
+            dx_e = min(dx_e, L_domain - dx_e)
             
             if dx_e < l_sem && dy_e < l_sem && dz_e < l_sem
                 ftent = (one(FT) - dx_e/l_sem) * (one(FT) - dy_e/l_sem) * (one(FT) - dz_e/l_sem)
@@ -277,7 +278,165 @@ function init_flatplate(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
     return
 end
 
-function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
+# ═══════════════════════════════════════════════════════════════════════
+# Decaying MHD turbulence — Passot-Pouquet spectrum, divergence-free IC
+# ═══════════════════════════════════════════════════════════════════════
+# Generates a random solenoidal (divergence-free) velocity and magnetic field
+# on the CPU using a Passot-Pouquet energy spectrum
+#   E(k) ∝ k^4 · exp(-2 (k/k0)^2)
+# peaking at k0, then projects each Fourier mode onto the plane transverse to
+# its wavevector k so that ∇·v = 0 and ∇·B = 0 exactly (in spectral space).
+# The real-space fields are written into the GPU Q array (including periodic
+# ghost-cell fill).
+#
+# Parameters (read from Main if defined, else defaults):
+#   u_rms  — target RMS velocity (default 1.0)
+#   B_rms  — target RMS magnetic field (default 0.5)
+#   k0     — peak wavenumber of the spectrum (default 4.0)
+#   rho0   — uniform density (default 1.0)
+#   p0     — uniform pressure (default 1.0)
+#   seed   — random seed for reproducibility (default 42)
+#
+# This is a HOST function (not a GPU kernel): it generates the full field on
+# the CPU, then copies it into the GPU Q array. Requires `using FFTW` in the
+# calling run script.
+function init_mhd_turbulence_field!(Q, x, y, z, nxp, nyp, nzp)
+    FFTW = Main.FFTW
+
+    # ── Read parameters (with defaults) ──
+    u_rms = isdefined(Main, :u_rms_init) ? Main.u_rms_init : FT(1.0)
+    B_rms = isdefined(Main, :B_rms_init) ? Main.B_rms_init : FT(0.5)
+    k0    = isdefined(Main, :k0_init)    ? Main.k0_init    : FT(4.0)
+    rho0  = isdefined(Main, :rho0_init)  ? Main.rho0_init  : FT(1.0)
+    p0    = isdefined(Main, :p0_init)    ? Main.p0_init    : FT(1.0)
+    seed  = isdefined(Main, :seed_init)  ? Main.seed_init  : Int(42)
+
+    # Pull coordinate arrays to host (uniform Cartesian expected)
+    x_h = Array(x)
+    y_h = Array(y)
+    z_h = Array(z)
+
+    # Interior cell centers: index NG+1 .. nxp+NG map to real domain.
+    # For a uniform periodic box, cell spacing is constant.
+    Lx = x_h[nxp + NG, NG+1, NG+1] - x_h[NG+1, NG+1, NG+1]   # length spanned by interior cells (≈ domain)
+    Ly = y_h[NG+1, nyp + NG, NG+1] - y_h[NG+1, NG+1, NG+1]
+    Lz = z_h[NG+1, NG+1, nzp + NG] - z_h[NG+1, NG+1, NG+1]
+    # dx measured cell-to-cell (node-based coords → cell center spacing = node spacing)
+    dx = x_h[NG+2, NG+1, NG+1] - x_h[NG+1, NG+1, NG+1]
+    dy = y_h[NG+1, NG+2, NG+1] - y_h[NG+1, NG+1, NG+1]
+    dz = z_h[NG+1, NG+1, NG+2] - z_h[NG+1, NG+1, NG+1]
+
+    Random = Main.Random
+    Random.seed!(seed)
+
+    # ── Generate one divergence-free vector field of given rms and spectrum ──
+    # Returns a real Array of size (nxp, nyp, nzp, 3).
+    function _gen_solenoidal_field(nx, ny, nz, rms_target)
+        # Fourier-space coefficients with Passot-Pouquet amplitude
+        # rfft of a real (nx,ny,nz) array has shape (nx÷2+1, ny, nz) complex
+        vh = zeros(ComplexF64, nx÷2+1, ny, nz, 3)
+        for kz in 0:nz-1, ky in 0:ny-1, kx in 0:(nx÷2)
+            # Physical wavenumber (wrap negative frequencies for ky, kz)
+            kxi = kx
+            kyi = ky <= ny÷2 ? ky : ky - ny
+            kzi = kz <= nz÷2 ? kz : kz - nz
+            kx_p = 2π * kxi / Lx
+            ky_p = 2π * kyi / Ly
+            kz_p = 2π * kzi / Lz
+            kmag = sqrt(kx_p^2 + ky_p^2 + kz_p^2)
+            if kmag < 1e-12
+                continue   # leave DC mode zero (zero mean)
+            end
+            # Passot-Pouquet: E(k) ∝ k^4 exp(-2(k/k0)^2); amplitude per mode ∝ sqrt(E(k))
+            amp = kmag^2 * exp(-(kmag/k0)^2)
+            # Random complex coefficient (Hermitian symmetry handled by rfft automatically
+            # for the kx dimension; ky/kz full range is fine since we build all modes)
+            phase = 2π * rand()
+            coeff = amp * (cos(phase) + im * sin(phase)) / sqrt(kmag)
+            # Two random transverse unit vectors e1, e2 perpendicular to k
+            # Build via Gram-Schmidt against k
+            kvec = [kx_p, ky_p, kz_p]
+            # Pick a vector not parallel to k
+            ref = abs(kvec[1]) < 0.7*norm(kvec) ? [1.0,0.0,0.0] : [0.0,1.0,0.0]
+            e1 = ref - (dot(ref, kvec)/dot(kvec,kvec)) * kvec
+            e1 = e1 / norm(e1)
+            e2 = cross(kvec, e1); e2 = e2 / norm(e2)
+            # Split energy equally between the two polarizations
+            c1 = coeff / sqrt(2.0)
+            c2 = coeff / sqrt(2.0) * exp(2π*im*rand())   # independent phase for e2
+            vh[kx+1, ky+1, kz+1, 1] = c1*e1[1] + c2*e2[1]
+            vh[kx+1, ky+1, kz+1, 2] = c1*e1[2] + c2*e2[2]
+            vh[kx+1, ky+1, kz+1, 3] = c1*e1[3] + c2*e2[3]
+        end
+        # Inverse rfft → real field (each component)
+        field = zeros(Float64, nx, ny, nz, 3)
+        for d in 1:3
+            field[:,:,:,d] = FFTW.irfft(view(vh,:,:,:,d), nx)
+        end
+        # Scale to target rms
+        # rms of a vector field = sqrt(<|v|^2>) = sqrt(mean(vx^2+vy^2+vz^2))
+        v2 = sum(@. field[:,:,:,1]^2 + field[:,:,:,2]^2 + field[:,:,:,3]^2)
+        rms_current = sqrt(v2 / (nx*ny*nz))
+        if rms_current > 1e-12
+            field .*= rms_target / rms_current
+        end
+        return field
+    end
+
+    # ── Generate v and B fields (interior only, size nxp×nyp×nzp) ──
+    v_field = _gen_solenoidal_field(nxp, nyp, nzp, u_rms)
+    B_field = _gen_solenoidal_field(nxp, nyp, nzp, B_rms)
+
+    # ── Assemble full Q array on host including ghosts (periodic fill) ──
+    Q_h = zeros(FT, nxp + 2*NG, nyp + 2*NG, nzp + 2*NG, Nprim)
+    T0 = p0 / (rho0 * Rg)
+    NGp = NG + 1
+    for kk in 1:nzp, jj in 1:nyp, ii in 1:nxp
+        Q_h[ii+NG, jj+NG, kk+NG, 1] = rho0
+        Q_h[ii+NG, jj+NG, kk+NG, 2] = v_field[ii, jj, kk, 1]
+        Q_h[ii+NG, jj+NG, kk+NG, 3] = v_field[ii, jj, kk, 2]
+        Q_h[ii+NG, jj+NG, kk+NG, 4] = v_field[ii, jj, kk, 3]
+        Q_h[ii+NG, jj+NG, kk+NG, 5] = p0
+        Q_h[ii+NG, jj+NG, kk+NG, 6] = T0
+        Q_h[ii+NG, jj+NG, kk+NG, 7] = B_field[ii, jj, kk, 1]
+        Q_h[ii+NG, jj+NG, kk+NG, 8] = B_field[ii, jj, kk, 2]
+        Q_h[ii+NG, jj+NG, kk+NG, 9] = B_field[ii, jj, kk, 3]
+        Q_h[ii+NG, jj+NG, kk+NG, 10] = zero(FT)   # ψ
+    end
+    # Periodic ghost fill: left ghost [1:NG] ← interior right end [nxp+1-NG:nxp];
+    # right ghost [nxp+NG+1:end] ← interior left start [1:NG]. Same for y, z.
+    # Interior lives at indices [NG+1 : nxp+NG] in each direction.
+    int_range_x = (NG+1):(nxp+NG)
+    int_range_y = (NG+1):(nyp+NG)
+    int_range_z = (NG+1):(nzp+NG)
+    # x-direction ghosts
+    Q_h[1:NG,           int_range_y, int_range_z, :] = Q_h[(nxp+1):(nxp+NG), int_range_y, int_range_z, :]
+    Q_h[nxp+NG+1:end,   int_range_y, int_range_z, :] = Q_h[(NG+1):(NG+NG),   int_range_y, int_range_z, :]
+    # y-direction ghosts (x already filled, use full x range now)
+    Q_h[:, 1:NG,           int_range_z, :] = Q_h[:, (nyp+1):(nyp+NG), int_range_z, :]
+    Q_h[:, nyp+NG+1:end,   int_range_z, :] = Q_h[:, (NG+1):(NG+NG),   int_range_z, :]
+    # z-direction ghosts
+    Q_h[:, :, 1:NG,           :] = Q_h[:, :, (nzp+1):(nzp+NG), :]
+    Q_h[:, :, nzp+NG+1:end,   :] = Q_h[:, :, (NG+1):(NG+NG),   :]
+
+    # ── Copy host field into the GPU Q array ──
+    copyto!(Q, Q_h)
+    return
+end
+
+@inline function _run_initial_ct_face_flux_process!(
+    host_module::Module, blocks, world_rank, Block_Nprocs, block_comms,
+)
+    if isdefined(host_module, :in_situ_ct_initial_face_flux_process)
+        getfield(host_module, :in_situ_ct_initial_face_flux_process)(
+            blocks, world_rank, Block_Nprocs, block_comms,
+        )
+        return true
+    end
+    return false
+end
+
+function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp, bid::Int=0)
     nb = (cld(nxp+2*NG, nthreads[1]), cld(nyp+2*NG, nthreads[2]), cld(nzp+2*NG, nthreads[3]))
     if test_case == "TGV"
         @gpu_launch threads=nthreads blocks=nb init_tgv(Q, x, y, z)
@@ -300,8 +459,11 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
         l_sem = FT(0.15 * R0)   # eddy size ~ 15% of pipe radius
         amp_sem = FT(0.10 * Ma_target * sqrt(γ * Rg * Tw))  # 10% of u_bulk
 
+        is_precursor = (bid >= 5)
+        L_domain = is_precursor ? FT(Main.cebl_Lx) : Lx
+
         # Random eddy positions within the pipe domain
-        pos_x_h = FT.(rand(N_sem) .* Lx)                     # x ∈ [0, Lx]
+        pos_x_h = is_precursor ? FT.(rand(N_sem) .* L_domain .- L_domain) : FT.(rand(N_sem) .* L_domain)
         pos_y_h = FT.((rand(N_sem) .- FT(0.5)) .* FT(2.0) .* R0) # y ∈ [-R0, R0]
         pos_z_h = FT.((rand(N_sem) .- FT(0.5)) .* FT(2.0) .* R0) # z ∈ [-R0, R0]
         
@@ -328,6 +490,16 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
         @gpu_launch threads=nthreads blocks=nb init_brio_wu(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     elseif test_case == "OrszagTang"
         @gpu_launch threads=nthreads blocks=nb init_orszag_tang(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
+    elseif test_case == "OrszagTang3D"
+        @gpu_launch threads=nthreads blocks=nb init_orszag_tang_3d(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
+    elseif test_case == "MetricCTAlfven"
+        @gpu_launch threads=nthreads blocks=nb init_metric_ct_alfven(
+            Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp),
+        )
+    elseif test_case == "MetricCTUniform"
+        @gpu_launch threads=nthreads blocks=nb init_metric_ct_uniform(
+            Q, Int32(nxp), Int32(nyp), Int32(nzp),
+        )
     elseif test_case == "TG5_debug"
         @gpu_launch threads=nthreads blocks=nb init_tg5_debug(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     elseif test_case == "UniformDimensional"
@@ -335,9 +507,74 @@ function initialize(Q, x, y, z, rankx, ranky, Nprocs, nxp, nyp, nzp)
     elseif test_case == "MagneticDecay"
         Lx_val = isdefined(Main, :Lx) ? Main.Lx : FT(7.5)
         @gpu_launch threads=nthreads blocks=nb init_magnetic_decay(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp), Lx_val)
+    elseif test_case == "ResistiveCTDecay"
+        Lx_val = isdefined(Main, :Lx) ? Main.Lx : one(FT)
+        amplitude = isdefined(Main, :decay_amplitude) ?
+            Main.decay_amplitude : FT(0.1)
+        @gpu_launch threads=nthreads blocks=nb init_resistive_ct_decay(
+            Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp),
+            FT(Lx_val), FT(amplitude),
+        )
+    elseif test_case == "MHDdecay"
+        # Decaying MHD turbulence with Passot-Pouquet divergence-free IC (CPU-generated)
+        init_mhd_turbulence_field!(Q, x, y, z, nxp, nyp, nzp)
+    elseif test_case == "MHDHIT"
+        # Forced MHD turbulence: same Passot-Pouquet IC, but driven by HIT linear forcing
+        init_mhd_turbulence_field!(Q, x, y, z, nxp, nyp, nzp)
     elseif test_case == "Hartmann"
         @gpu_launch threads=nthreads blocks=nb init_hartmann(Q, x, y, z, Int32(nxp), Int32(nyp), Int32(nzp))
     end
+end
+
+const _METRIC_CT_UNIFORM_STATE = isdefined(Main, :metric_ct_uniform_state) ?
+    Main.metric_ct_uniform_state :
+    (one(FT), FT(0.23), FT(-0.17), FT(0.11), one(FT), one(FT),
+     FT(0.61), FT(-0.37), FT(0.29), zero(FT))
+
+function init_metric_ct_uniform(Q, nxp::Int32, nyp::Int32, nzp::Int32)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i < Int32(NG+1) || i > nxp+Int32(NG) ||
+       j < Int32(NG+1) || j > nyp+Int32(NG) ||
+       k < Int32(NG+1) || k > nzp+Int32(NG)
+        return
+    end
+    state = _METRIC_CT_UNIFORM_STATE
+    rho = state[1]
+    pressure = state[5]
+    @inbounds begin
+        Q[i,j,k,1] = rho
+        Q[i,j,k,2] = state[2]
+        Q[i,j,k,3] = state[3]
+        Q[i,j,k,4] = state[4]
+        Q[i,j,k,5] = pressure
+        Q[i,j,k,6] = pressure / (rho * Rg)
+        Q[i,j,k,7] = state[7]
+        Q[i,j,k,8] = state[8]
+        Q[i,j,k,9] = state[9]
+        Q[i,j,k,10] = state[10]
+    end
+    return
+end
+
+function init_metric_ct_alfven(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i < Int32(NG+1) || i > nxp+Int32(NG) ||
+       j < Int32(NG+1) || j > nyp+Int32(NG) ||
+       k < Int32(NG+1) || k > nzp+Int32(NG)
+        return
+    end
+    center = metric_ct_cell_center(x, y, z, i, j, k)
+    state = metric_ct_alfven_primitive(
+        center[1], zero(FT), FT(Rg), FT(1e-3),
+    )
+    @inbounds for n in 1:10
+        Q[i,j,k,n] = state[n]
+    end
+    return
 end
 
 function init_tg5_debug(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
@@ -445,6 +682,57 @@ function init_orszag_tang(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
     return
 end
 
+# ═══════════════════════════════════════════════════════════════════════
+# 3D Orszag-Tang Vortex — 3D extension of the classic 2D MHD vortex problem.
+# ═══════════════════════════════════════════════════════════════════════
+# The 2D Orszag-Tang setup (u=-sin(y), v=sin(x), Bx=-sin(y), By=sin(2x)) is
+# invariant along z, so a 3D run would stay 2D unless symmetry is broken by
+# numerical noise (slow and ambiguous). Here we add z-dependent modes so the
+# problem is genuinely 3D from t=0, producing MHD turbulence + shock
+# interactions in all three directions.
+#
+# Domain: [0, 2π]³, triply periodic, γ = 5/3
+# ρ = γ² (= 25/9), p = γ (= 5/3)
+# u = -sin(y) - 0.5·sin(2z)
+# v =  sin(x)
+# w =  sin(2x) + 0.5·sin(z)
+# Bx = -sin(y) - 0.5·sin(2z)
+# By =  sin(2x)
+# Bz =  sin(y) + 0.5·sin(2x)
+# ψ = 0
+function init_orszag_tang_3d(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+
+    if i > nxp+Int32(2*NG) || j > nyp+Int32(2*NG) || k > nzp+Int32(2*NG); return; end
+    if i < Int32(NG+1) || i > nxp+Int32(NG) || j < Int32(NG+1) || j > nyp+Int32(NG) || k < Int32(NG+1) || k > nzp+Int32(NG); return; end
+
+    @inbounds xc = x[i, j, k]
+    @inbounds yc = y[i, j, k]
+    @inbounds zc = z[i, j, k]
+
+    rho = γ * γ
+    p = γ
+    u = -sin(yc) - FT(0.5) * sin(FT(2.0) * zc)
+    v =  sin(xc)
+    w =  sin(FT(2.0) * xc) + FT(0.5) * sin(zc)
+    Bx = -sin(yc) - FT(0.5) * sin(FT(2.0) * zc)
+    By =  sin(FT(2.0) * xc)
+    # Each component is independent of its own coordinate, so div(B)=0
+    # analytically and under the Cartesian face-difference CT operator.
+    Bz =  sin(yc) + FT(0.5) * sin(FT(2.0) * xc)
+    T = p / (rho * Rg)
+
+    @inbounds begin
+        Q[i,j,k,1] = rho; Q[i,j,k,2] = u; Q[i,j,k,3] = v; Q[i,j,k,4] = w
+        Q[i,j,k,5] = p;   Q[i,j,k,6] = T
+        Q[i,j,k,7] = Bx;  Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
+        Q[i,j,k,10] = zero(FT)  # ψ
+    end
+    return
+end
+
 function init_magnetic_decay(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32, Lx_val::FT)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -478,6 +766,39 @@ function init_magnetic_decay(Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32, Lx_
         Q[i, j, k, 8] = By
         Q[i, j, k, 9] = Bz
         Q[i, j, k, 10] = psi
+    end
+    return
+end
+
+function init_resistive_ct_decay(
+    Q, x, y, z, nxp::Int32, nyp::Int32, nzp::Int32,
+    Lx_val::FT, amplitude::FT,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i < Int32(NG+1) || i > nxp+Int32(NG) ||
+       j < Int32(NG+1) || j > nyp+Int32(NG) ||
+       k < Int32(NG+1) || k > nzp+Int32(NG)
+        return
+    end
+
+    @inbounds xc = FT(0.5) * (x[i,j,k] + x[i+1,j,k])
+    wave_number = FT(2) * FT(pi) / Lx_val
+    phase = wave_number * xc
+    rho = one(FT)
+    pressure = one(FT)
+    @inbounds begin
+        Q[i,j,k,1] = rho
+        Q[i,j,k,2] = zero(FT)
+        Q[i,j,k,3] = zero(FT)
+        Q[i,j,k,4] = zero(FT)
+        Q[i,j,k,5] = pressure
+        Q[i,j,k,6] = pressure / (rho * Rg)
+        Q[i,j,k,7] = zero(FT)
+        Q[i,j,k,8] = amplitude * sin(phase)
+        Q[i,j,k,9] = amplitude * cos(phase)
+        Q[i,j,k,10] = zero(FT)
     end
     return
 end

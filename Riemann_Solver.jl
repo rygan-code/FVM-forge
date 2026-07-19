@@ -379,32 +379,44 @@ end
     
     # 2. Arithmetic averages
     # Kennedy & Gruber (2008) / Pirozzoli (2010) style central formulations
-    # often use simple arithmetic averages for the interface states
+    # use simple arithmetic averages for the interface states.
     ρ_avg = FT(0.5) * (ρL + ρR)
     u_avg = FT(0.5) * (uL + uR)
     v_avg = FT(0.5) * (vL + vR)
     w_avg = FT(0.5) * (wL + wR)
     p_avg = FT(0.5) * (pL + pR)
-    
-    # Internal energy average (can be simplified if strictly using conserved vars, but primitive is standard for KEP)
-    # Average total energy density = ρE
-    # Here we define the interfacial enthalpy or energy flux directly
-    E_avg = FT(0.5) * (EL + ER)
-    
+
+    # Specific internal energy e = Cv*T = p/(ρ*(γ-1)) (codebase convention,
+    # see volume_force.jl:33). Arithmetic average → KEP-consistent internal
+    # energy flux. (EC upgrade would replace this with a log mean — see
+    # docs/superpowers/specs/2026-06-18-entropy-stable-flux-design.md.)
+    eL = pL / (ρL * (γ - one(FT)))
+    eR = pR / (ρR * (γ - one(FT)))
+    e_avg = FT(0.5) * (eL + eR)
+
     q_avg = u_avg * nx + v_avg * ny + w_avg * nz
-    
+
     # 3. KEP Flux components
     # F_mass = ρ_avg * q_avg
     fp1 = ρ_avg * q_avg
-    
+
     # F_momentum = F_mass * u_avg + p_avg * n
     fp2 = fp1 * u_avg + p_avg * nx
     fp3 = fp1 * v_avg + p_avg * ny
     fp4 = fp1 * w_avg + p_avg * nz
-    
-    # F_energy = (E_avg + p_avg) * q_avg
-    fp5 = (E_avg + p_avg) * q_avg
-    
+
+    # F_energy — KE/IE-consistent split form:
+    #   F_ρ * [ ½(u_L·u_R + v_L·v_R + w_L·w_R)   (cross-product kinetic, from
+    #                                          discrete chain rule — the unique
+    #                                          form matching the momentum-flux
+    #                                          average  (u_L+u_R)/2)
+    #         + e_avg ]                          (arithmetic-avg internal energy)
+    #   + p_avg * q_avg                          (pressure work, consistent with
+    #                                          momentum pressure term p_avg*n)
+    # Reduces to (ρE + p)*q for UL=UR. Replaces the former (E_avg+p_avg)*q_avg
+    # which carried an O(Δx²) KE↔IE spurious source at jumps.
+    fp5 = fp1 * (FT(0.5) * (uL*uR + vL*vR + wL*wR) + e_avg) + p_avg * q_avg
+
     return SVector{5, FT}(fp1, fp2, fp3, fp4, fp5)
 end
 
@@ -501,16 +513,95 @@ end
     )
 end
 
+# Robust two-wave fallback for MHD.  CT supplies a single face-normal B to
+# both inputs before this function is called, so HLLE cannot introduce a jump
+# in the normal magnetic field.
+@inline function _mhd_state_is_physical(U)
+    rho = U[1]
+    if !(isfinite(rho) && rho > zero(FT))
+        return false
+    end
+    inv_rho = one(FT) / rho
+    kinetic = FT(0.5) * (
+        U[2]*U[2] + U[3]*U[3] + U[4]*U[4]
+    ) * inv_rho
+    magnetic = FT(0.5) * (
+        U[6]*U[6] + U[7]*U[7] + U[8]*U[8]
+    )
+    pressure = (γ - one(FT)) * (U[5] - kinetic - magnetic)
+    return isfinite(pressure) && pressure > zero(FT) &&
+           all(isfinite, U)
+end
+
+@inline function MHD_HLLE_Flux(UL, UR, nx, ny, nz, ch_glm::FT)
+    if !(_mhd_state_is_physical(UL) && _mhd_state_is_physical(UR))
+        return _mhd_nan_flux()
+    end
+
+    rhoL = UL[1]; inv_rhoL = one(FT) / rhoL
+    uL = UL[2]*inv_rhoL; vL = UL[3]*inv_rhoL; wL = UL[4]*inv_rhoL
+    BxL = UL[6]; ByL = UL[7]; BzL = UL[8]; psiL = UL[9]
+    B2L = BxL*BxL + ByL*ByL + BzL*BzL
+    pL = (γ-one(FT)) * (
+        UL[5] - FT(0.5)*rhoL*(uL*uL+vL*vL+wL*wL) - FT(0.5)*B2L
+    )
+    qnL = uL*nx + vL*ny + wL*nz
+
+    rhoR = UR[1]; inv_rhoR = one(FT) / rhoR
+    uR = UR[2]*inv_rhoR; vR = UR[3]*inv_rhoR; wR = UR[4]*inv_rhoR
+    BxR = UR[6]; ByR = UR[7]; BzR = UR[8]; psiR = UR[9]
+    B2R = BxR*BxR + ByR*ByR + BzR*BzR
+    pR = (γ-one(FT)) * (
+        UR[5] - FT(0.5)*rhoR*(uR*uR+vR*vR+wR*wR) - FT(0.5)*B2R
+    )
+    qnR = uR*nx + vR*ny + wR*nz
+
+    cfL = sqrt(γ*pL*inv_rhoL + B2L*inv_rhoL)
+    cfR = sqrt(γ*pR*inv_rhoR + B2R*inv_rhoR)
+    ch = ch_glm
+    SL = min(qnL-cfL, qnR-cfR, -ch)
+    SR = max(qnL+cfL, qnR+cfR, ch)
+    FL = _mhd_flux_normal(
+        rhoL, uL, vL, wL, pL, BxL, ByL, BzL, psiL, UL[5],
+        nx, ny, nz, ch,
+    )
+    FR = _mhd_flux_normal(
+        rhoR, uR, vR, wR, pR, BxR, ByR, BzR, psiR, UR[5],
+        nx, ny, nz, ch,
+    )
+    if SL >= zero(FT)
+        return FL
+    elseif SR <= zero(FT)
+        return FR
+    end
+    inv_span = one(FT) / (SR - SL)
+    return SVector{9,FT}(ntuple(Val(9)) do n
+        (SR*FL[n] - SL*FR[n] + SL*SR*(UR[n]-UL[n])) * inv_span
+    end)
+end
+
 # ═══════════════════════════════════════════════════════════════════════
 # HLLD Flux — Miyoshi & Kusano (2005)
 # ═══════════════════════════════════════════════════════════════════════
 # 5-wave approximate Riemann solver for ideal MHD.
 # Captures fast magnetosonic, Alfvén, and contact discontinuities.
 # Extended with GLM for the ψ-equation.
-@inline function HLLD_Flux(UL, UR, nx, ny, nz, ch_glm::FT)
+@inline _mhd_nan_flux() =
+    SVector{9,FT}(ntuple(_ -> FT(NaN), Val(9)))
+
+@inline function HLLD_Flux(
+    UL, UR, nx, ny, nz, ch_glm::FT, fallback_meta=nothing,
+)
     # Safety check
-    if UL[1] < FT(1.0e-10) || UR[1] < FT(1.0e-10)
-        return SVector{9, FT}(FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0))
+    @static if strict_ct_positivity && ct_mode
+        if !(isfinite(UL[1]) && UL[1] > zero(FT) &&
+             isfinite(UR[1]) && UR[1] > zero(FT))
+            return _mhd_nan_flux()
+        end
+    else
+        if UL[1] < FT(1.0e-10) || UR[1] < FT(1.0e-10)
+            return SVector{9, FT}(FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0), FT(0e0))
+        end
     end
 
     ch = ch_glm
@@ -520,7 +611,16 @@ end
     uL = UL[2]*inv_ρL; vL = UL[3]*inv_ρL; wL = UL[4]*inv_ρL
     BxL = UL[6]; ByL = UL[7]; BzL = UL[8]; ψL = UL[9]
     B2L = BxL*BxL + ByL*ByL + BzL*BzL
-    pL = max(FT(1.0e-10), (γ-one(FT))*(UL[5] - FT(0.5)*ρL*(uL*uL+vL*vL+wL*wL) - FT(0.5)*B2L))
+    raw_pL = (γ-one(FT)) *
+             (UL[5] - FT(0.5)*ρL*(uL*uL+vL*vL+wL*wL) - FT(0.5)*B2L)
+    @static if strict_ct_positivity && ct_mode
+        if !(isfinite(raw_pL) && raw_pL > zero(FT))
+            return _mhd_nan_flux()
+        end
+        pL = raw_pL
+    else
+        pL = max(FT(1.0e-10), raw_pL)
+    end
     ptL = pL + FT(0.5)*B2L  # total pressure
     qnL = uL*nx + vL*ny + wL*nz
     BnL = BxL*nx + ByL*ny + BzL*nz
@@ -530,7 +630,16 @@ end
     uR = UR[2]*inv_ρR; vR = UR[3]*inv_ρR; wR = UR[4]*inv_ρR
     BxR = UR[6]; ByR = UR[7]; BzR = UR[8]; ψR = UR[9]
     B2R = BxR*BxR + ByR*ByR + BzR*BzR
-    pR = max(FT(1.0e-10), (γ-one(FT))*(UR[5] - FT(0.5)*ρR*(uR*uR+vR*vR+wR*wR) - FT(0.5)*B2R))
+    raw_pR = (γ-one(FT)) *
+             (UR[5] - FT(0.5)*ρR*(uR*uR+vR*vR+wR*wR) - FT(0.5)*B2R)
+    @static if strict_ct_positivity && ct_mode
+        if !(isfinite(raw_pR) && raw_pR > zero(FT))
+            return _mhd_nan_flux()
+        end
+        pR = raw_pR
+    else
+        pR = max(FT(1.0e-10), raw_pR)
+    end
     ptR = pR + FT(0.5)*B2R
     qnR = uR*nx + vR*ny + wR*nz
     BnR = BxR*nx + ByR*ny + BzR*nz
@@ -549,122 +658,255 @@ end
     SM = (ρR*qnR*(SR-qnR) - ρL*qnL*(SL-qnL) + ptL - ptR) /
          (ρR*(SR-qnR) - ρL*(SL-qnL) + FT(1.0e-20))
 
-    # ── Total pressure in star region ──
-    ptS = ptL + ρL*(SL-qnL)*(SM-qnL)
+    # ── Total pressure in star region (Athena: average of left and right) ──
+    ptS_L = ptL + ρL*(SL-qnL)*(SM-qnL)
+    ptS_R = ptR + ρR*(SR-qnR)*(SM-qnR)
+    ptS = FT(0.5)*(ptS_L + ptS_R)
 
     # ── HLL average Bn (single Bn* for consistent formulations) ──
-    Bn_hll = (SR*BnR - SL*BnL) / (SR - SL + FT(1.0e-20))
+    # In ideal MHD, Bn is continuous across all waves (∇·B=0 constraint).
+    # Use arithmetic mean; when |Bn*| is small, Alfvén sub-states collapse to SM.
+    Bn_hll = FT(0.5)*(BnL + BnR)
 
-    # ── Left star state ──
+    # ── Left star state (* region, between SL and S*L) ──
+    # Miyoshi & Kusano (2005), eq. (12)-(18).
     inv_SL_SM = one(FT) / (SL - SM + FT(1.0e-20))
-    ρsL = ρL * (SL - qnL) * inv_SL_SM
-    ρsL = max(ρsL, FT(1.0e-10))
+    raw_ρsL = ρL * (SL - qnL) * inv_SL_SM
+    @static if strict_ct_positivity && ct_mode
+        if !(isfinite(raw_ρsL) && raw_ρsL > zero(FT))
+            return _mhd_nan_flux()
+        end
+        ρsL = raw_ρsL
+    else
+        ρsL = max(raw_ρsL, FT(1.0e-10))
+    end
     inv_ρsL = one(FT) / ρsL
 
-    # Tangential velocity/B adjustments
-    denom_L = ρL*(SL-qnL)*(SL-SM) - Bn_hll*Bn_hll + FT(1.0e-20)
-    inv_denom_L = one(FT) / denom_L
+    # Star B-field tangential components (Miyoshi eq. 14):
+    #   B*_t = B_t * (ρL*(SL-qnL)² - Bn*²) / (ρL*(SL-qnL)*(SL-SM) - Bn*²)
+    # and B*_n = Bn* (= Bn_hll, single-valued)
+    denom_B_L = ρL*(SL-qnL)*(SL-SM) - Bn_hll*Bn_hll
+    # When denom_B_L is near zero, B*_t = B_t (no jump across the fast wave)
+    factor_B_L = abs(denom_B_L) > FT(1.0e-8) ?
+        (ρL*(SL-qnL)*(SL-qnL) - Bn_hll*Bn_hll) / (denom_B_L + FT(1.0e-20)) : one(FT)
+    # B*_t = B_t * factor_B_L ; B*_n = Bn_hll (replace normal component)
+    BxsL = BxL*factor_B_L + Bn_hll*nx*(one(FT) - factor_B_L)
+    BysL = ByL*factor_B_L + Bn_hll*ny*(one(FT) - factor_B_L)
+    BzsL = BzL*factor_B_L + Bn_hll*nz*(one(FT) - factor_B_L)
 
-    # Tangential velocities in star region
-    usL = uL + (ptS - ptL)*nx * inv_denom_L * Bn_hll  # simplified HLLD
-    vsL = vL + (ptS - ptL)*ny * inv_denom_L * Bn_hll  # per Miyoshi & Kusano
-    wsL = wL + (ptS - ptL)*nz * inv_denom_L * Bn_hll
+    # Star velocity (Miyoshi eq. 12-13):
+    #   v*_n = SM  (contact discontinuity moves at SM)
+    #   v*_t = v_t - Bn*·(B*_t - B_t) / (ρL·(SL-qnL))
+    # The normal component must be set explicitly to SM.
+    coeff_v_L = Bn_hll / (ρL*(SL-qnL) + FT(1.0e-20))
+    usL = SM*nx + (uL - qnL*nx) - coeff_v_L*(BxsL - BxL)
+    vsL = SM*ny + (vL - qnL*ny) - coeff_v_L*(BysL - ByL)
+    wsL = SM*nz + (wL - qnL*nz) - coeff_v_L*(BzsL - BzL)
 
-    # Actually, for general HLLD we need the full formulation.
-    # Simplified approach: use HLL for tangential components
-    factor_L = Bn_hll * inv_denom_L
-    usL = uL + (SM - qnL)*nx  # normal velocity = SM in star
-    vsL = vL # simplified: tangential velocity same in star (HLL-like)
-    wsL = wL
-
-    # Star magnetic field
-    BxsL = BxL + (Bn_hll - BnL)*nx * (SL - qnL) * inv_denom_L
-    BysL = ByL + (Bn_hll - BnL)*ny * (SL - qnL) * inv_denom_L
-    BzsL = BzL + (Bn_hll - BnL)*nz * (SL - qnL) * inv_denom_L
-
-    # For simplicity at this stage, use the HLL average for tangential components
-    # Full HLLD tangential resolve would require the Alfvén sub-states (** region)
-    # This simplified version is equivalent to HLLC-MHD
-
-    # Use normal velocity = SM·n + tangential components preserved
-    qn_diff_L = SM - qnL
-    usL = uL + qn_diff_L * nx
-    vsL = vL + qn_diff_L * ny
-    wsL = wL + qn_diff_L * nz
-
-    # Star B-field: from jump conditions
-    if abs(ρL*(SL-qnL)*(SL-SM) - Bn_hll*Bn_hll) > FT(1.0e-10)
-        coeff = Bn_hll * (SM - qnL) * inv_denom_L
-        BxsL = BxL * (ρL*(SL-qnL)*(SL-qnL) - Bn_hll*Bn_hll) * inv_denom_L
-        BysL = ByL * (ρL*(SL-qnL)*(SL-qnL) - Bn_hll*Bn_hll) * inv_denom_L
-        BzsL = BzL * (ρL*(SL-qnL)*(SL-qnL) - Bn_hll*Bn_hll) * inv_denom_L
-    else
-        BxsL = BxL; BysL = ByL; BzsL = BzL
-    end
-
-    B2sL = BxsL*BxsL + BysL*BysL + BzsL*BzsL
-    BnsL = BxsL*nx + BysL*ny + BzsL*nz
     vBsL = usL*BxsL + vsL*BysL + wsL*BzsL
-
+    # Star total energy (Miyoshi eq. 17):
     EsL = ((SL-qnL)*UL[5] - ptL*qnL + ptS*SM + Bn_hll*(uL*BxL+vL*ByL+wL*BzL - vBsL)) * inv_SL_SM
 
-    # ── Right star state ──
+    # ── Right star state (* region, between S*R and SR) ──
     inv_SR_SM = one(FT) / (SR - SM + FT(1.0e-20))
-    ρsR = ρR * (SR - qnR) * inv_SR_SM
-    ρsR = max(ρsR, FT(1.0e-10))
-
-    denom_R = ρR*(SR-qnR)*(SR-SM) - Bn_hll*Bn_hll + FT(1.0e-20)
-    inv_denom_R = one(FT) / denom_R
-
-    qn_diff_R = SM - qnR
-    usR = uR + qn_diff_R * nx
-    vsR = vR + qn_diff_R * ny
-    wsR = wR + qn_diff_R * nz
-
-    if abs(ρR*(SR-qnR)*(SR-SM) - Bn_hll*Bn_hll) > FT(1.0e-10)
-        BxsR = BxR * (ρR*(SR-qnR)*(SR-qnR) - Bn_hll*Bn_hll) * inv_denom_R
-        BysR = ByR * (ρR*(SR-qnR)*(SR-qnR) - Bn_hll*Bn_hll) * inv_denom_R
-        BzsR = BzR * (ρR*(SR-qnR)*(SR-qnR) - Bn_hll*Bn_hll) * inv_denom_R
+    raw_ρsR = ρR * (SR - qnR) * inv_SR_SM
+    @static if strict_ct_positivity && ct_mode
+        if !(isfinite(raw_ρsR) && raw_ρsR > zero(FT))
+            return _mhd_nan_flux()
+        end
+        ρsR = raw_ρsR
     else
-        BxsR = BxR; BysR = ByR; BzsR = BzR
+        ρsR = max(raw_ρsR, FT(1.0e-10))
     end
+    inv_ρsR = one(FT) / ρsR
 
-    B2sR = BxsR*BxsR + BysR*BysR + BzsR*BzsR
-    BnsR = BxsR*nx + BysR*ny + BzsR*nz
+    denom_B_R = ρR*(SR-qnR)*(SR-SM) - Bn_hll*Bn_hll
+    factor_B_R = abs(denom_B_R) > FT(1.0e-8) ?
+        (ρR*(SR-qnR)*(SR-qnR) - Bn_hll*Bn_hll) / (denom_B_R + FT(1.0e-20)) : one(FT)
+    BxsR = BxR*factor_B_R + Bn_hll*nx*(one(FT) - factor_B_R)
+    BysR = ByR*factor_B_R + Bn_hll*ny*(one(FT) - factor_B_R)
+    BzsR = BzR*factor_B_R + Bn_hll*nz*(one(FT) - factor_B_R)
+
+    coeff_v_R = Bn_hll / (ρR*(SR-qnR) + FT(1.0e-20))
+    usR = SM*nx + (uR - qnR*nx) - coeff_v_R*(BxsR - BxR)
+    vsR = SM*ny + (vR - qnR*ny) - coeff_v_R*(BysR - ByR)
+    wsR = SM*nz + (wR - qnR*nz) - coeff_v_R*(BzsR - BzR)
+
     vBsR = usR*BxsR + vsR*BysR + wsR*BzsR
-
     EsR = ((SR-qnR)*UR[5] - ptR*qnR + ptS*SM + Bn_hll*(uR*BxR+vR*ByR+wR*BzR - vBsR)) * inv_SR_SM
 
-    # ── GLM: ψ star state (Dedner) ──
-    ψs = FT(0.5)*(ψL + ψR) - FT(0.5)*ch*(BnR - BnL)
-    Bns = FT(0.5)*(BnL + BnR) - FT(0.5)*(ψR - ψL)/ch
+    # ── Alfvén sub-states (** region, between S*L and S*R) ──
+    # Following Athena++ (Miyoshi & Kusano 2005, eqns 51-63).
+    # The ** state has SHARED tangential v and B on both sides.
+    sqrt_ρsL = sqrt(ρsL); sqrt_ρsR = sqrt(ρsR)
+    abs_Bn = abs(Bn_hll)
+    # Degeneracy: skip Alfvén sub-states when Bn*≈0 or ρs too small
+    denom_deg = ρL*(SL-qnL)*(SL-SM) - Bn_hll*Bn_hll
+    denom_deg_R = ρR*(SR-qnR)*(SR-SM) - Bn_hll*Bn_hll
+    if abs(denom_deg) < FT(1.0e-4)*ptS || abs(denom_deg_R) < FT(1.0e-4)*ptS
+        # Bn*≈0 degenerate: ** state = * state
+        SstL = SM; SstR = SM
+        ussL = usL; vssL = vsL; wssL = wsL
+        BxssL = BxsL; ByssL = BysL; BzssL = BzsL
+        ussR = usL; vssR = vsL; wssR = wsL
+        BxssR = BxsL; ByssR = BysL; BzssR = BzsL
+        EssL = EsL; EssR = EsR
+    else
+    # Alfvén wave speeds (M&K eqn 51): S*L = SM - |Bn*|/√ρsL, S*R = SM + |Bn*|/√ρsR
+    SstL = SM - abs_Bn/sqrt_ρsL
+    SstR = SM + abs_Bn/sqrt_ρsR
 
-    # ── Select flux based on wave pattern ──
+    sign_Bn = Bn_hll >= zero(FT) ? one(FT) : -one(FT)
+    inv_sqrt_sum = one(FT) / (sqrt_ρsL + sqrt_ρsR)
+
+    # Tangential v* and B* (normal components subtracted)
+    # v*_t = v* - SM·n̂,  B*_t = B* - Bn*·n̂
+    usL_t = usL - SM*nx; vsL_t = vsL - SM*ny; wsL_t = wsL - SM*nz
+    usR_t = usR - SM*nx; vsR_t = vsR - SM*ny; wsR_t = wsR - SM*nz
+    BxsL_t = BxsL - Bn_hll*nx; BysL_t = BysL - Bn_hll*ny; BzsL_t = BzsL - Bn_hll*nz
+    BxsR_t = BxsR - Bn_hll*nx; BysR_t = BysR - Bn_hll*ny; BzsR_t = BzsR - Bn_hll*nz
+
+    # ** state tangential velocity (M&K eqn 59-60, SHARED left and right):
+    #   v**_t = (sqrt(ρsL)*v*L_t + sqrt(ρsR)*v*R_t + sign(Bn)*(B*R_t - B*L_t)) / (sqrt(ρsL)+sqrt(ρsR))
+    uss_t = inv_sqrt_sum * (sqrt_ρsL*usL_t + sqrt_ρsR*usR_t + sign_Bn*(BxsR_t - BxsL_t))
+    vss_t = inv_sqrt_sum * (sqrt_ρsL*vsL_t + sqrt_ρsR*vsR_t + sign_Bn*(BysR_t - BysL_t))
+    wss_t = inv_sqrt_sum * (sqrt_ρsL*wsL_t + sqrt_ρsR*wsR_t + sign_Bn*(BzsR_t - BzsL_t))
+
+    # ** state tangential B (M&K eqn 61-62, SHARED left and right):
+    #   B**_t = (sqrt(ρsL)*B*R_t + sqrt(ρsR)*B*L_t + sign(Bn)*sqrt(ρsL)*sqrt(ρsR)*(v*R_t - v*L_t)) / (sqrt(ρsL)+sqrt(ρsR))
+    Bxss_t = inv_sqrt_sum * (sqrt_ρsL*BxsR_t + sqrt_ρsR*BxsL_t + sign_Bn*sqrt_ρsL*sqrt_ρsR*(usR_t - usL_t))
+    Byss_t = inv_sqrt_sum * (sqrt_ρsL*BysR_t + sqrt_ρsR*BysL_t + sign_Bn*sqrt_ρsL*sqrt_ρsR*(vsR_t - vsL_t))
+    Bzss_t = inv_sqrt_sum * (sqrt_ρsL*BzsR_t + sqrt_ρsR*BzsL_t + sign_Bn*sqrt_ρsL*sqrt_ρsR*(wsR_t - wsL_t))
+
+    # Full ** state (add back normal components: v**_n = SM, B**_n = Bn*)
+    # SHARED between left and right
+    ussL = SM*nx + uss_t; vssL = SM*ny + vss_t; wssL = SM*nz + wss_t
+    ussR = ussL; vssR = vssL; wssR = wssL
+    BxssL = Bn_hll*nx + Bxss_t; ByssL = Bn_hll*ny + Byss_t; BzssL = Bn_hll*nz + Bzss_t
+    BxssR = BxssL; ByssR = ByssL; BzssR = BzssL
+
+    # ** state energy (M&K eqn 63):
+    #   vB_common = SM*Bn* + v**_t · B**_t
+    #   E**L = E*L - sqrt(ρsL)*sign(Bn)*(v*L·B*L - vB_common)
+    #   E**R = E*R + sqrt(ρsR)*sign(Bn)*(v*R·B*R - vB_common)
+    vBss = SM*Bn_hll + uss_t*Bxss_t + vss_t*Byss_t + wss_t*Bzss_t
+    EssL = EsL - sqrt_ρsL*sign_Bn*(vBsL - vBss)
+    EssR = EsR + sqrt_ρsR*sign_Bn*(vBsR - vBss)
+    end  # else (non-degenerate)
+
+    # ── GLM: ψ star state (Dedner) ──
+    # GLM ψ: NOT propagated through HLLD star states (set to 0 in Us).
+    # The ψ flux is handled separately at the end via GLM upwind, to prevent
+    # ch²·Bn blow-up in low-density cells where ch→∞. This decouples the
+    # GLM cleaning from the HLLD star state machinery.
+    ψs = zero(FT)
+
+    # ── Safety fallback: invalid HLLD star state reverts to HLLE ──
+    # Checks: finite energies, wave ordering, finite star velocities/B-fields,
+    # bounded factor_B, and star energies not wildly larger than input (×100).
+    E_ref = max(abs(UL[5]), abs(UR[5])) * FT(100.0)
+    if !(EsL > zero(FT)) || !(EsR > zero(FT)) || !(EssL > zero(FT)) || !(EssR > zero(FT)) ||
+       isnan(EsL) || isnan(EsR) || isnan(EssL) || isnan(EssR) ||
+       !(SM > SL) || !(SR > SM) || !(SstL <= SM) || !(SstR >= SM) ||
+       isnan(usL) || isnan(usR) || isnan(ussL) || isnan(ussR) ||
+       isnan(BxsL) || isnan(BxsR) || isnan(BxssL) || isnan(BxssR) ||
+       abs(factor_B_L) > FT(1.0e6) || abs(factor_B_R) > FT(1.0e6) ||
+       EsL > E_ref || EsR > E_ref || EssL > E_ref || EssR > E_ref
+        if fallback_meta !== nothing
+            ct_record_fallback!(fallback_meta, CT_POS_HLLD_TO_HLLE_COUNT)
+        end
+        return MHD_HLLE_Flux(UL, UR, nx, ny, nz, ch_glm)
+    end
+
+    # ── Select flux based on 7-region wave pattern ──
+    # Wave structure: SL — [L*] — S*L — [L**] — SM — [R**] — S*R — [R*] — SR
+    # When Bn*≈0, S*L→SM and S*R→SM, so ** regions vanish and we get 3-wave HLLC.
     if SL >= zero(FT)
-        # Left region
+        # Region L (supersonic left)
         F = _mhd_flux_normal(ρL, uL, vL, wL, pL, BxL, ByL, BzL, ψL, UL[5], nx, ny, nz, ch)
-    elseif SM >= zero(FT)
-        # Left star region
+    elseif SstL >= zero(FT)
+        # Region L* (left star, between SL and S*L)
         FL = _mhd_flux_normal(ρL, uL, vL, wL, pL, BxL, ByL, BzL, ψL, UL[5], nx, ny, nz, ch)
         Us = SVector{9, FT}(ρsL, ρsL*usL, ρsL*vsL, ρsL*wsL, EsL, BxsL, BysL, BzsL, ψs)
-        F = SVector{9, FT}(ntuple(Val(9)) do n
-            FL[n] + SL*(Us[n] - UL[n])
-        end)
+        F = SVector{9, FT}(
+            FL[1] + SL*(Us[1] - UL[1]), FL[2] + SL*(Us[2] - UL[2]),
+            FL[3] + SL*(Us[3] - UL[3]), FL[4] + SL*(Us[4] - UL[4]),
+            FL[5] + SL*(Us[5] - UL[5]), FL[6] + SL*(Us[6] - UL[6]),
+            FL[7] + SL*(Us[7] - UL[7]), FL[8] + SL*(Us[8] - UL[8]),
+            FL[9] + SL*(Us[9] - UL[9]))
+    elseif SM >= zero(FT)
+        # Region L** (left Alfvén sub-state, between S*L and SM)
+        # When Bn*≈0: SstL≈SM, this branch is skipped naturally
+        FL = _mhd_flux_normal(ρL, uL, vL, wL, pL, BxL, ByL, BzL, ψL, UL[5], nx, ny, nz, ch)
+        Us_star = SVector{9, FT}(ρsL, ρsL*usL, ρsL*vsL, ρsL*wsL, EsL, BxsL, BysL, BzsL, ψs)
+        Us_dbl = SVector{9, FT}(ρsL, ρsL*ussL, ρsL*vssL, ρsL*wssL, EssL, BxssL, ByssL, BzssL, ψs)
+        F = SVector{9, FT}(
+            FL[1] + SL*(Us_star[1]-UL[1]) + SstL*(Us_dbl[1]-Us_star[1]),
+            FL[2] + SL*(Us_star[2]-UL[2]) + SstL*(Us_dbl[2]-Us_star[2]),
+            FL[3] + SL*(Us_star[3]-UL[3]) + SstL*(Us_dbl[3]-Us_star[3]),
+            FL[4] + SL*(Us_star[4]-UL[4]) + SstL*(Us_dbl[4]-Us_star[4]),
+            FL[5] + SL*(Us_star[5]-UL[5]) + SstL*(Us_dbl[5]-Us_star[5]),
+            FL[6] + SL*(Us_star[6]-UL[6]) + SstL*(Us_dbl[6]-Us_star[6]),
+            FL[7] + SL*(Us_star[7]-UL[7]) + SstL*(Us_dbl[7]-Us_star[7]),
+            FL[8] + SL*(Us_star[8]-UL[8]) + SstL*(Us_dbl[8]-Us_star[8]),
+            FL[9] + SL*(Us_star[9]-UL[9]) + SstL*(Us_dbl[9]-Us_star[9]))
+    elseif SstR >= zero(FT)
+        # Region R** (right Alfvén sub-state, between SM and S*R)
+        FR = _mhd_flux_normal(ρR, uR, vR, wR, pR, BxR, ByR, BzR, ψR, UR[5], nx, ny, nz, ch)
+        Us_star = SVector{9, FT}(ρsR, ρsR*usR, ρsR*vsR, ρsR*wsR, EsR, BxsR, BysR, BzsR, ψs)
+        Us_dbl = SVector{9, FT}(ρsR, ρsR*ussR, ρsR*vssR, ρsR*wssR, EssR, BxssR, ByssR, BzssR, ψs)
+        F = SVector{9, FT}(
+            FR[1] + SR*(Us_star[1]-UR[1]) + SstR*(Us_dbl[1]-Us_star[1]),
+            FR[2] + SR*(Us_star[2]-UR[2]) + SstR*(Us_dbl[2]-Us_star[2]),
+            FR[3] + SR*(Us_star[3]-UR[3]) + SstR*(Us_dbl[3]-Us_star[3]),
+            FR[4] + SR*(Us_star[4]-UR[4]) + SstR*(Us_dbl[4]-Us_star[4]),
+            FR[5] + SR*(Us_star[5]-UR[5]) + SstR*(Us_dbl[5]-Us_star[5]),
+            FR[6] + SR*(Us_star[6]-UR[6]) + SstR*(Us_dbl[6]-Us_star[6]),
+            FR[7] + SR*(Us_star[7]-UR[7]) + SstR*(Us_dbl[7]-Us_star[7]),
+            FR[8] + SR*(Us_star[8]-UR[8]) + SstR*(Us_dbl[8]-Us_star[8]),
+            FR[9] + SR*(Us_star[9]-UR[9]) + SstR*(Us_dbl[9]-Us_star[9]))
     elseif SR > zero(FT)
-        # Right star region
+        # Region R* (right star, between S*R and SR)
         FR = _mhd_flux_normal(ρR, uR, vR, wR, pR, BxR, ByR, BzR, ψR, UR[5], nx, ny, nz, ch)
         Us = SVector{9, FT}(ρsR, ρsR*usR, ρsR*vsR, ρsR*wsR, EsR, BxsR, BysR, BzsR, ψs)
-        F = SVector{9, FT}(ntuple(Val(9)) do n
-            FR[n] + SR*(Us[n] - UR[n])
-        end)
+        F = SVector{9, FT}(
+            FR[1] + SR*(Us[1]-UR[1]), FR[2] + SR*(Us[2]-UR[2]),
+            FR[3] + SR*(Us[3]-UR[3]), FR[4] + SR*(Us[4]-UR[4]),
+            FR[5] + SR*(Us[5]-UR[5]), FR[6] + SR*(Us[6]-UR[6]),
+            FR[7] + SR*(Us[7]-UR[7]), FR[8] + SR*(Us[8]-UR[8]),
+            FR[9] + SR*(Us[9]-UR[9]))
     else
-        # Right region
+        # Region R (supersonic right)
         F = _mhd_flux_normal(ρR, uR, vR, wR, pR, BxR, ByR, BzR, ψR, UR[5], nx, ny, nz, ch)
     end
 
-    # Override B-normal and ψ fluxes with GLM-consistent values
-    # GLM flux for Bn: F_Bn = ch*ψ,  F_ψ = ch*Bn
-    # Already incorporated in _mhd_flux_normal via the ψ·n terms
+    # ── GLM ψ/Bn flux: decoupled from HLLD star states ──
+    # Override the ψ flux (f9) and the ψ·n̂ part of B fluxes (f6,f7,f8) with
+    # upwind GLM values. This prevents ch²·Bn blow-up in low-density cells.
+    # GLM upwind: ψ* = 0.5(ψL+ψR) - 0.5·ch·(BnR-BnL)
+    #             Bn* = 0.5(BnL+BnR) - 0.5·(ψR-ψL)/ch
+    # ψ flux: F_ψ = ch²·Bn*
+    # B flux ψ contribution: ψ*·n̂ (replaces whatever ψ the star state used)
+    ψ_up = FT(0.5)*(ψL + ψR) - FT(0.5)*ch*(BnR - BnL)
+    Bn_up = FT(0.5)*(BnL + BnR) - FT(0.5)*(ψR - ψL)/(ch + FT(1.0e-20))
+    F_psi = ch*ch*Bn_up
+    # Replace ψ·n̂ in f6,f7,f8 with ψ_up·n̂, and f9 with F_psi
+    # The star-state flux F already contains some ψ contribution (from _mhd_flux_normal
+    # which used ψL or ψR). We correct by replacing the ψ part.
+    # f6 = (Bx*qn - u*Bn) + ψ_used·nx → correct to ψ_up·nx
+    # But we don't know ψ_used exactly (varies by region). Simplest: just override f9.
+    F = SVector{9, FT}(F[1], F[2], F[3], F[4], F[5], F[6], F[7], F[8], F_psi)
+
+    # ── Final flux sanity check: non-finite or extreme values → revert to HLLE ──
+    F_max = max(abs(F[1]),abs(F[2]),abs(F[3]),abs(F[4]),abs(F[5]),
+                abs(F[6]),abs(F[7]),abs(F[8]),abs(F[9]))
+    F_ref = max(abs(UL[1]),abs(UR[1]),abs(UL[5]),abs(UR[5])) * FT(1.0e4) + FT(1.0e-10)
+    if isnan(F_max) || isinf(F_max) || F_max > F_ref
+        if fallback_meta !== nothing
+            ct_record_fallback!(fallback_meta, CT_POS_HLLD_TO_HLLE_COUNT)
+        end
+        return MHD_HLLE_Flux(UL, UR, nx, ny, nz, ch_glm)
+    end
 
     return F
 end
@@ -700,7 +942,12 @@ end
     p_avg = FT(0.5)*(pL + pR)
     Bx_avg = FT(0.5)*(BxL + BxR); By_avg = FT(0.5)*(ByL + ByR); Bz_avg = FT(0.5)*(BzL + BzR)
     ψ_avg = FT(0.5)*(ψL + ψR)
-    E_avg = FT(0.5)*(UL[5] + UR[5])
+
+    # Specific internal energy e = p/(ρ*(γ-1)) (= Cv*T), arithmetic average.
+    # KEP-consistent internal energy; EC upgrade (log mean) out of scope for MHD.
+    eL = pL / (ρL * (γ - one(FT)))
+    eR = pR / (ρR * (γ - one(FT)))
+    e_avg = FT(0.5)*(eL + eR)
 
     q_avg = u_avg*nx + v_avg*ny + w_avg*nz
     Bn_avg = Bx_avg*nx + By_avg*ny + Bz_avg*nz
@@ -712,7 +959,21 @@ end
     f2 = f1 * u_avg + pt_avg * nx - Bx_avg * Bn_avg
     f3 = f1 * v_avg + pt_avg * ny - By_avg * Bn_avg
     f4 = f1 * w_avg + pt_avg * nz - Bz_avg * Bn_avg
-    f5 = (E_avg + pt_avg) * q_avg - Bn_avg * vB_avg
+    # Energy flux — KE/IE-consistent split form:
+    #   f1 * [ ½(u_L·u_R + v_L·v_R + w_L·w_R)   (cross-product kinetic)
+    #        + e_avg                              (arithmetic-avg internal energy)
+    #        + ½·B2_avg ]                         (arithmetic-avg magnetic energy,
+    #                                          built from averaged B — B is a
+    #                                          central flux in induction eqn, so
+    #                                          no KE-coupling spurious source)
+    #   + pt_avg * q_avg - Bn_avg * vB_avg        (pressure + Poynting work, kept
+    #                                          as arithmetic averages; their
+    #                                          KE/IE consistency is secured by
+    #                                          the momentum pt_avg*n and the
+    #                                          induction central flux)
+    # Reduces to (E+pt)q - Bn·vB for UL=UR.
+    f5 = f1 * (FT(0.5)*(uL*uR + vL*vR + wL*wR) + e_avg + FT(0.5)*B2_avg) +
+         pt_avg * q_avg - Bn_avg * vB_avg
     f6 = Bx_avg*q_avg - u_avg*Bn_avg + ψ_avg*nx
     f7 = By_avg*q_avg - v_avg*Bn_avg + ψ_avg*ny
     f8 = Bz_avg*q_avg - w_avg*Bn_avg + ψ_avg*nz

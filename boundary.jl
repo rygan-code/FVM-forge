@@ -1,7 +1,276 @@
 # =============================================================================
+# DSRFG Synthetic Turbulence Inflow Support
+# Folded from dsrfg_inflow.jl.
+# =============================================================================
+using Random
+using Adapt
+include("mhd_boundary_state.jl")
+
+struct DSRFGParams{V, FT}
+    enabled::Bool
+    N::Int32              # Number of Fourier modes
+    Lt::FT                # Integral length scale
+    TI::FT                # Target turbulence intensity at centerline
+    C_sra::FT             # Strong Reynolds Analogy scaling factor
+    u_bulk::FT            # Bulk velocity
+    R0::FT                # Pipe radius
+    # GPU Vectors of size N
+    kx::V
+    ky::V
+    kz::V
+    px::V
+    py::V
+    pz::V
+    qx::V
+    qy::V
+    qz::V
+    omega::V
+end
+
+# GPU adaptation so that CuArray/ROCArray are converted to CuDeviceArray/ROCDeviceArray inside the struct
+Adapt.adapt_structure(to, params::DSRFGParams) = DSRFGParams(
+    params.enabled,
+    params.N,
+    params.Lt,
+    params.TI,
+    params.C_sra,
+    params.u_bulk,
+    params.R0,
+    adapt(to, params.kx),
+    adapt(to, params.ky),
+    adapt(to, params.kz),
+    adapt(to, params.px),
+    adapt(to, params.py),
+    adapt(to, params.pz),
+    adapt(to, params.qx),
+    adapt(to, params.qy),
+    adapt(to, params.qz),
+    adapt(to, params.omega)
+)
+
+
+"""
+    create_dummy_dsrfg_params(FT)
+
+Create a dummy DSRFGParams struct with size 0 vectors of the correct GPU Vector type.
+This ensures type stability in the GPU kernel even when DSRFG is disabled.
+"""
+function create_dummy_dsrfg_params(FT::Type)
+    V = GPUVector{FT}
+    kx = V(zeros(FT, 0))
+    ky = V(zeros(FT, 0))
+    kz = V(zeros(FT, 0))
+    px = V(zeros(FT, 0))
+    py = V(zeros(FT, 0))
+    pz = V(zeros(FT, 0))
+    qx = V(zeros(FT, 0))
+    qy = V(zeros(FT, 0))
+    qz = V(zeros(FT, 0))
+    omega = V(zeros(FT, 0))
+    
+    return DSRFGParams{V, FT}(
+        false, Int32(0), zero(FT), zero(FT), zero(FT), zero(FT), zero(FT),
+        kx, ky, kz, px, py, pz, qx, qy, qz, omega
+    )
+end
+
+"""
+    init_dsrfg_params(N, Lt, TI, C_sra, u_bulk, Re, R0; seed=42)
+
+Initialize DSRFG parameters on the CPU using the Modified von Kármán spectrum,
+apply the divergence-free orthogonal projection, and upload to the GPU.
+"""
+function init_dsrfg_params(N::Int, Lt::FT, TI::FT, C_sra::FT, u_bulk::FT, Re::FT, R0::FT; seed::Int=42) where {FT}
+    # Wavenumber range limits (based on integral scale Lt)
+    k_e = FT(9.0 * π) / (FT(55.0) * Lt)
+    k_min = FT(0.5) * k_e
+    k_max = FT(200.0) * k_e
+    
+    dk = (k_max - k_min) / FT(N)
+    u_rms = TI * u_bulk
+    
+    # Pre-allocate CPU arrays
+    h_kx = zeros(FT, N)
+    h_ky = zeros(FT, N)
+    h_kz = zeros(FT, N)
+    h_px = zeros(FT, N)
+    h_py = zeros(FT, N)
+    h_pz = zeros(FT, N)
+    h_qx = zeros(FT, N)
+    h_qy = zeros(FT, N)
+    h_qz = zeros(FT, N)
+    h_omega = zeros(FT, N)
+    
+    # Set seed for reproducibility
+    rng = Random.MersenneTwister(seed)
+    
+    for n in 1:N
+        k_n = k_min + (FT(n) - FT(0.5)) * dk
+        
+        # 1. Wavenumber unit vector direction
+        theta = acos(FT(2.0) * rand(rng, FT) - FT(1.0))
+        phi = FT(2.0 * π) * rand(rng, FT)
+        
+        kn_x = k_n * sin(theta) * cos(phi)
+        kn_y = k_n * sin(theta) * sin(phi)
+        kn_z = k_n * cos(theta)
+        
+        h_kx[n] = kn_x
+        h_ky[n] = kn_y
+        h_kz[n] = kn_z
+        
+        # 2. Amplitude based on Modified von Kármán spectrum
+        ratio = k_n / k_e
+        # Integral of ratio^4 / (1 + ratio^2)^(17/6) from 0 to Inf is ~0.82688
+        E_kn = FT(1.5) * (u_rms^2 / k_e) * (ratio^4 / (1.0 + ratio^2)^(17/6)) / FT(0.82688)
+        sigma_n = sqrt(E_kn * dk)
+        
+        # 3. Divergence-free projection (p_n and q_n orthogonal to k_n)
+        d_x = rand(rng, FT) - FT(0.5)
+        d_y = rand(rng, FT) - FT(0.5)
+        d_z = rand(rng, FT) - FT(0.5)
+        
+        # Normalize wavenumber direction
+        kx_u = kn_x / k_n
+        ky_u = kn_y / k_n
+        kz_u = kn_z / k_n
+        
+        # Cross product: p_vec = d x k_u
+        px_val = d_y * kz_u - d_z * ky_u
+        py_val = d_z * kx_u - d_x * kz_u
+        pz_val = d_x * ky_u - d_y * kx_u
+        
+        p_mag = sqrt(px_val^2 + py_val^2 + pz_val^2)
+        if p_mag < FT(1e-12)
+            px_val, py_val, pz_val = -ky_u, kx_u, zero(FT)
+            p_mag = sqrt(px_val^2 + py_val^2)
+        end
+        px_val = (px_val / p_mag) * sigma_n
+        py_val = (py_val / p_mag) * sigma_n
+        pz_val = (pz_val / p_mag) * sigma_n
+        
+        h_px[n] = px_val
+        h_py[n] = py_val
+        h_pz[n] = pz_val
+        
+        # Cross product: q_vec = k_u x p_vec
+        qx_val = ky_u * pz_val - kz_u * py_val
+        qy_val = kz_u * px_val - kx_u * pz_val
+        qz_val = kx_u * py_val - ky_u * px_val
+        
+        h_qx[n] = qx_val
+        h_qy[n] = qy_val
+        h_qz[n] = qz_val
+        
+        # 4. Temporal frequency
+        U_conv = FT(0.8) * u_bulk
+        omega_conv = k_n * U_conv
+        h_omega[n] = omega_conv + randn(rng, FT) * k_n * u_rms
+    end
+    
+    # 5. Upload to GPU
+    V = GPUVector{FT}
+    kx = V(h_kx)
+    ky = V(h_ky)
+    kz = V(h_kz)
+    px = V(h_px)
+    py = V(h_py)
+    pz = V(h_pz)
+    qx = V(h_qx)
+    qy = V(h_qy)
+    qz = V(h_qz)
+    omega = V(h_omega)
+    
+    return DSRFGParams{V, FT}(
+        true, Int32(N), Lt, TI, C_sra, u_bulk, R0,
+        kx, ky, kz, px, py, pz, qx, qy, qz, omega
+    )
+end
+
+"""
+    dsrfg_fluctuation(xi, yi, zi, t, params)
+
+GPU device function to calculate DSRFG velocity fluctuations at coordinate (xi, yi, zi) and time t.
+Returns (u_pr, v_pr, w_pr) scaled by the radial envelope.
+"""
+@inline function dsrfg_fluctuation(xi::FT, yi::FT, zi::FT, t::FT, params::DSRFGParams{V, FT}) where {FT, V}
+    u_pr = zero(FT)
+    v_pr = zero(FT)
+    w_pr = zero(FT)
+    
+    if !params.enabled
+        return u_pr, v_pr, w_pr
+    end
+    
+    N = params.N
+    @inbounds for n in 1:N
+        # arg = k_x * x + k_y * y + k_z * z + ω * t
+        arg = params.kx[n] * xi + params.ky[n] * yi + params.kz[n] * zi + params.omega[n] * t
+        cos_val = cos(arg)
+        sin_val = sin(arg)
+        
+        u_pr += params.px[n] * cos_val + params.qx[n] * sin_val
+        v_pr += params.py[n] * cos_val + params.qy[n] * sin_val
+        w_pr += params.pz[n] * cos_val + params.qz[n] * sin_val
+    end
+    
+    factor = sqrt(FT(2.0) / FT(N))
+    u_pr *= factor
+    v_pr *= factor
+    w_pr *= factor
+    
+    # Smooth radial envelope to force fluctuations to zero at the wall (r=R0)
+    # peaks at r/R0 = 0.5 with value 1.125 to mimic real wall turbulence intensities
+    r2 = yi*yi + zi*zi
+    r2_norm = r2 / (params.R0 * params.R0)
+    env = max(one(FT) - r2_norm, zero(FT)) * (one(FT) + FT(2.0) * r2_norm)
+    
+    u_pr *= env
+    v_pr *= env
+    w_pr *= env
+    
+    return u_pr, v_pr, w_pr
+end
+
+
+# =============================================================================
 # Multi-block boundary conditions — Data-driven BC dispatch (FVM)
 # BC types defined in bc_types.jl, stored per-face in block_connectivity.h5
 # =============================================================================
+
+# =============================================================================
+# Multi-block boundary conditions — Data-driven BC dispatch (FVM)
+# BC types defined in bc_types.jl, stored per-face in block_connectivity.h5
+# =============================================================================
+
+# ─── Differential-rotation wall-BC parameters (module-load-time capture) ───
+#
+# These constants are evaluated WHEN this file is first included (transitively
+# from `solver.jl`). The hosting run script MUST therefore define
+#   Main.diffrot_enabled, Main.x_rot_start, Main.x_rot_end,
+#   Main.Omega_x_min,     Main.Omega_x_max
+# BEFORE `include("solver.jl")`. If any of them is missing at load time it is
+# silently substituted with 0 / false, which makes the wall BC apply Ω = 0 with
+# no other warning. See `run_pipe_cebl_diffrot.jl` for the canonical ordering.
+const diffrot_enabled_bc::Bool = isdefined(Main, :diffrot_enabled) ? Main.diffrot_enabled : false
+const x_rot_start_bc::Float64 = isdefined(Main, :x_rot_start) ? Main.x_rot_start : 0.0
+const x_rot_end_bc::Float64 = isdefined(Main, :x_rot_end) ? Main.x_rot_end : 0.0
+const Omega_x_min_bc::Float64 = isdefined(Main, :Omega_x_min) ? Main.Omega_x_min : 0.0
+const Omega_x_max_bc::Float64 = isdefined(Main, :Omega_x_max) ? Main.Omega_x_max : 0.0
+
+@inline function get_wall_rotation(x_loc::T) where T
+    if !diffrot_enabled_bc
+        return zero(T)
+    end
+    if x_loc <= T(x_rot_start_bc)
+        return T(Omega_x_min_bc)
+    elseif x_loc >= T(x_rot_end_bc)
+        return T(Omega_x_max_bc)
+    else
+        frac = (x_loc - T(x_rot_start_bc)) / T(x_rot_end_bc - x_rot_start_bc)
+        return T(Omega_x_min_bc) + frac * T(Omega_x_max_bc - Omega_x_min_bc)
+    end
+end
 
 # ─── Wall perturbation dispatcher ───
 # wall_perturbation_type: 0 = pipe (cylindrical multi-mode), 1 = flat plate (blowing/suction strip)
@@ -169,7 +438,7 @@ end
 # dir: 1=ξ, 2=η, 3=ζ   side: 0=lo, 1=hi
 # =============================================================================
 function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
-                    n_x, n_y, n_z, x, y, z,
+                    n_x, n_y, n_z, Area, Vol, dt_bc, x, y, z,
                     nxp, nyp, nzp, bcp, tt, dsrfg_params)
 
     if bc_type == Int32(BC_INTERBLOCK) || bc_type == Int32(BC_PERIODIC)
@@ -220,16 +489,22 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
     # _U_bnd(n): U at boundary cell
     # _U_int(n): U at mirror interior cell
 
-    # ── Isothermal Wall ──
-    if bc_type == Int32(BC_ISOTHERMAL_WALL) || bc_type == Int32(BC_MHD_INSULATING_WALL)
+    # ── Isothermal Wall / Differential Rotation Wall ──
+    if bc_type == Int32(BC_ISOTHERMAL_WALL) || bc_type == Int32(BC_MHD_INSULATING_WALL) || bc_type == Int32(BC_DIFFROT_WALL)
         Tw_val = bcp[1]  # BCP_TW
         if Tw_val <= zero(FT); Tw_val = Tw; end
         if dir == Int32(1)
+            x_face = FT(0.5) * (x[i, j, k] + x[idx_int, j, k])
+            y_face = FT(0.5) * (y[i, j, k] + y[idx_int, j, k])
+            z_face = FT(0.5) * (z[i, j, k] + z[idx_int, j, k])
+            Omega_w = bc_type == Int32(BC_DIFFROT_WALL) ? get_wall_rotation(x_face) : zero(FT)
+            u_rot = zero(FT); v_rot = -Omega_w * z_face; w_rot = Omega_w * y_face
+            
             u_turb, v_turb, w_turb = _wall_perturbation(idx_wall, j, k, Int32(0), x, y, z, tt, nxp)
             @inbounds begin
-                u = -Q[idx_int, j, k, 2] + FT(2.0)*u_turb
-                v = -Q[idx_int, j, k, 3] + FT(2.0)*v_turb
-                w = -Q[idx_int, j, k, 4] + FT(2.0)*w_turb
+                u = -Q[idx_int, j, k, 2] + FT(2.0)*(u_turb + u_rot)
+                v = -Q[idx_int, j, k, 3] + FT(2.0)*(v_turb + v_rot)
+                w = -Q[idx_int, j, k, 4] + FT(2.0)*(w_turb + w_rot)
                 T = FT(2.0)*Tw_val - Q[idx_int, j, k, 6]
                 T = max(T, FT(0.1)*Tw_val)  # clamp to avoid negative T when T_int >> 2*Tw
                 p = Q[idx_int, j, k, 5]
@@ -239,11 +514,17 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
                 U[i,j,k,5]=p/(γ-one(FT))+FT(0.5)*ρ*(u^2+v^2+w^2)
             end
         elseif dir == Int32(2)
+            x_face = FT(0.5) * (x[i, j, k] + x[i, idx_int, k])
+            y_face = FT(0.5) * (y[i, j, k] + y[i, idx_int, k])
+            z_face = FT(0.5) * (z[i, j, k] + z[i, idx_int, k])
+            Omega_w = bc_type == Int32(BC_DIFFROT_WALL) ? get_wall_rotation(x_face) : zero(FT)
+            u_rot = zero(FT); v_rot = -Omega_w * z_face; w_rot = Omega_w * y_face
+            
             u_turb, v_turb, w_turb = _wall_perturbation(i, idx_wall, k, Int32(0), x, y, z, tt, nxp)
             @inbounds begin
-                u = -Q[i, idx_int, k, 2] + FT(2.0)*u_turb
-                v = -Q[i, idx_int, k, 3] + FT(2.0)*v_turb
-                w = -Q[i, idx_int, k, 4] + FT(2.0)*w_turb
+                u = -Q[i, idx_int, k, 2] + FT(2.0)*(u_turb + u_rot)
+                v = -Q[i, idx_int, k, 3] + FT(2.0)*(v_turb + v_rot)
+                w = -Q[i, idx_int, k, 4] + FT(2.0)*(w_turb + w_rot)
                 T = FT(2.0)*Tw_val - Q[i, idx_int, k, 6]
                 T = max(T, FT(0.1)*Tw_val)
                 p = Q[i, idx_int, k, 5]
@@ -253,11 +534,17 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
                 U[i,j,k,5]=p/(γ-one(FT))+FT(0.5)*ρ*(u^2+v^2+w^2)
             end
         else # ζ
+            x_face = FT(0.5) * (x[i, j, k] + x[i, j, idx_int])
+            y_face = FT(0.5) * (y[i, j, k] + y[i, j, idx_int])
+            z_face = FT(0.5) * (z[i, j, k] + z[i, j, idx_int])
+            Omega_w = bc_type == Int32(BC_DIFFROT_WALL) ? get_wall_rotation(x_face) : zero(FT)
+            u_rot = zero(FT); v_rot = -Omega_w * z_face; w_rot = Omega_w * y_face
+            
             u_turb, v_turb, w_turb = _wall_perturbation(i, j, idx_wall, Int32(0), x, y, z, tt, nxp)
             @inbounds begin
-                u = -Q[i, j, idx_int, 2] + FT(2.0)*u_turb
-                v = -Q[i, j, idx_int, 3] + FT(2.0)*v_turb
-                w = -Q[i, j, idx_int, 4] + FT(2.0)*w_turb
+                u = -Q[i, j, idx_int, 2] + FT(2.0)*(u_turb + u_rot)
+                v = -Q[i, j, idx_int, 3] + FT(2.0)*(v_turb + v_rot)
+                w = -Q[i, j, idx_int, 4] + FT(2.0)*(w_turb + w_rot)
                 T = FT(2.0)*Tw_val - Q[i, j, idx_int, 6]
                 T = max(T, FT(0.1)*Tw_val)
                 p = Q[i, j, idx_int, 5]
@@ -336,12 +623,21 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
     # ── Supersonic Inflow — all variables fixed ──
     elseif bc_type == Int32(BC_SUPERSONIC_INFLOW)
         @inbounds begin
-            ρ1 = bcp[3]; u1 = bcp[4]; v1 = bcp[5]; w1 = bcp[6]; p1 = bcp[7]
-            T1 = p1/(ρ1*Rg)
-            Q[i,j,k,1]=ρ1; Q[i,j,k,2]=u1; Q[i,j,k,3]=v1; Q[i,j,k,4]=w1; Q[i,j,k,5]=p1; Q[i,j,k,6]=T1
+            p1 = bcp[BCP_P_INF]
+            ρ1 = bcp[BCP_RHO_INF]
+            u1 = bcp[BCP_U_INF]
+            v1 = bcp[BCP_V_INF]
+            w1 = bcp[BCP_W_INF]
+            
+            Q[i,j,k,1]=ρ1; Q[i,j,k,2]=u1; Q[i,j,k,3]=v1; Q[i,j,k,4]=w1; Q[i,j,k,5]=p1; Q[i,j,k,6]=p1/(Rg*ρ1)
             U[i,j,k,1]=ρ1; U[i,j,k,2]=ρ1*u1; U[i,j,k,3]=ρ1*v1; U[i,j,k,4]=ρ1*w1
             U[i,j,k,5]=p1/(γ-one(FT))+FT(0.5)*ρ1*(u1^2+v1^2+w1^2)
         end
+
+    # ── CEBL Dynamic Inflow ──
+    elseif bc_type == Int32(BC_CEBL_INFLOW)
+        # Directly return since ghost cells are pre-populated by GPU direct memory copy
+        return
 
     # ── Transition Inflow — Spatially and temporally varying inflow ──
     elseif bc_type == Int32(BC_TRANSITION_INFLOW)
@@ -537,28 +833,43 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
             U[i,j,k,5]=p_back/(γ-one(FT))+FT(0.5)*ρ*(u^2+v^2+w^2)
         end
 
-    # ── NSCBC Outflow — Poinsot & Lele 1992, full LODI formulation ──
-    # Outgoing waves: computed from interior gradients (one-sided 2nd order)
-    # Incoming wave L1: pressure relaxation toward target
-    # Supersonic (Ma_n>1): all waves exit → zero gradient
+    # ── NSCBC Outflow — metric-aligned, dt-scaled LODI with local weak anchor ──
+    # Outgoing waves: computed from physical-normal gradients (one-sided 2nd order)
+    # Incoming wave L1: weak relaxation toward block outlet area-averaged p (p_anchor,
+    #   bcp[BCP_OUTLET_PAVG]=[15]) — NOT a fixed inlet/back-pressure. When p_anchor<=0
+    #   (uninitialized) we fall back to pure non-reflecting (L1=0).
+    # Supersonic outflow (Ma_n>=1): all characteristics exit → zero gradient.
+    # Backflow (u_n<=0): soft inflow — strengthened L1 anchor toward p_anchor, tangential
+    #   relaxed to boundary value (NOT a reflective zero-gradient wall).
     elseif bc_type == Int32(BC_NSCBC_OUTFLOW)
         @inbounds begin
-            # Read boundary cell primitives
+            # Read boundary cell primitives and face geometry for this direction.
             if dir == Int32(1)
                 ρ_b=Q[idx_bnd,j,k,1]; u_b=Q[idx_bnd,j,k,2]; v_b=Q[idx_bnd,j,k,3]; w_b=Q[idx_bnd,j,k,4]; p_b=Q[idx_bnd,j,k,5]
-                u_n = u_b  # normal velocity for ξ
+                nx0=n_x[idx_wall,j,k]; ny0=n_y[idx_wall,j,k]; nz0=n_z[idx_wall,j,k]
+                A_b=Area[idx_wall,j,k]; J_b=Vol[idx_bnd,j,k]
             elseif dir == Int32(2)
                 ρ_b=Q[i,idx_bnd,k,1]; u_b=Q[i,idx_bnd,k,2]; v_b=Q[i,idx_bnd,k,3]; w_b=Q[i,idx_bnd,k,4]; p_b=Q[i,idx_bnd,k,5]
-                u_n = v_b  # normal velocity for η
+                nx0=n_x[i,idx_wall,k]; ny0=n_y[i,idx_wall,k]; nz0=n_z[i,idx_wall,k]
+                A_b=Area[i,idx_wall,k]; J_b=Vol[i,idx_bnd,k]
             else
                 ρ_b=Q[i,j,idx_bnd,1]; u_b=Q[i,j,idx_bnd,2]; v_b=Q[i,j,idx_bnd,3]; w_b=Q[i,j,idx_bnd,4]; p_b=Q[i,j,idx_bnd,5]
-                u_n = w_b  # normal velocity for ζ
+                nx0=n_x[i,j,idx_wall]; ny0=n_y[i,j,idx_wall]; nz0=n_z[i,j,idx_wall]
+                A_b=Area[i,j,idx_wall]; J_b=Vol[i,j,idx_bnd]
             end
-            c = sqrt(γ * p_b / (ρ_b + FT(1.0e-30)))
+
+            # Outward normal: metric normals point along +computational direction.
+            s_out = side == Int32(1) ? one(FT) : -one(FT)
+            nx = s_out*nx0; ny = s_out*ny0; nz = s_out*nz0
+            nmag = sqrt(nx*nx + ny*ny + nz*nz + FT(1.0e-30))
+            nx /= nmag; ny /= nmag; nz /= nmag
+
+            c = sqrt(γ * max(p_b, FT(1.0e-30)) / max(ρ_b, FT(1.0e-30)))
+            u_n = u_b*nx + v_b*ny + w_b*nz
             Ma_n = abs(u_n) / (c + FT(1.0e-30))
 
-            if Ma_n > one(FT)
-                # Supersonic: all characteristics exit → zero gradient
+            # Supersonic outflow: all characteristics exit → zero gradient.
+            if (Ma_n >= one(FT)) && (u_n > zero(FT))
                 if dir == Int32(1)
                     for n = 1:Nprim; Q[i,j,k,n] = Q[idx_bnd,j,k,n]; end
                     for n = 1:Ncons; U[i,j,k,n] = U[idx_bnd,j,k,n]; end
@@ -570,98 +881,220 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
                     for n = 1:Ncons; U[i,j,k,n] = U[i,j,idx_bnd,n]; end
                 end
             else
-                # ── Subsonic NSCBC: full LODI wave decomposition ──
-                p_target = bcp[2]; sigma = bcp[8]; L_ref = bcp[9]
-                if sigma <= zero(FT); sigma = FT(0.25); end
-                if L_ref <= zero(FT); L_ref = one(FT); end
+                # ── Subsonic / backflow: metric-aligned LODI with dt scaling ──
+                # Build orthonormal tangential basis (l, m) from outward normal.
+                ax = abs(nx) < FT(0.9) ? one(FT) : zero(FT)
+                ay = abs(nx) < FT(0.9) ? zero(FT) : one(FT)
+                az = zero(FT)
+                lx = ay*nz - az*ny; ly = az*nx - ax*nz; lz = ax*ny - ay*nx
+                lmag = sqrt(lx*lx + ly*ly + lz*lz + FT(1.0e-30))
+                lx /= lmag; ly /= lmag; lz /= lmag
+                mx = ny*lz - nz*ly; my = nz*lx - nx*lz; mz = nx*ly - ny*lx
 
-                # One-sided derivatives (2nd order) at boundary cell
-                # hi side: df = 1.5*f_b - 2*f_{b-1} + 0.5*f_{b-2}
-                # lo side: df = -(1.5*f_b - 2*f_{b+1} + 0.5*f_{b+2})
+                u_l = u_b*lx + v_b*ly + w_b*lz
+                u_m = u_b*mx + v_b*my + w_b*mz
+
+                # One-sided 2nd-order differences in index space at the boundary cell.
                 if dir == Int32(1)
-                    if side == Int32(1)  # ξ+
-                        i1 = idx_bnd-1; i2 = idx_bnd-2
-                        dρ = FT(1.5e0)*ρ_b - FT(2.0)*Q[i1,j,k,1] + FT(0.5)*Q[i2,j,k,1]
-                        du = FT(1.5e0)*u_b - FT(2.0)*Q[i1,j,k,2] + FT(0.5)*Q[i2,j,k,2]
-                        dv = FT(1.5e0)*v_b - FT(2.0)*Q[i1,j,k,3] + FT(0.5)*Q[i2,j,k,3]
-                        dw = FT(1.5e0)*w_b - FT(2.0)*Q[i1,j,k,4] + FT(0.5)*Q[i2,j,k,4]
-                        dp = FT(1.5e0)*p_b - FT(2.0)*Q[i1,j,k,5] + FT(0.5)*Q[i2,j,k,5]
-                    else  # ξ-
-                        i1 = idx_bnd+1; i2 = idx_bnd+2
-                        dρ = -(FT(1.5e0)*ρ_b - FT(2.0)*Q[i1,j,k,1] + FT(0.5)*Q[i2,j,k,1])
-                        du = -(FT(1.5e0)*u_b - FT(2.0)*Q[i1,j,k,2] + FT(0.5)*Q[i2,j,k,2])
-                        dv = -(FT(1.5e0)*v_b - FT(2.0)*Q[i1,j,k,3] + FT(0.5)*Q[i2,j,k,3])
-                        dw = -(FT(1.5e0)*w_b - FT(2.0)*Q[i1,j,k,4] + FT(0.5)*Q[i2,j,k,4])
-                        dp = -(FT(1.5e0)*p_b - FT(2.0)*Q[i1,j,k,5] + FT(0.5)*Q[i2,j,k,5])
-                    end
-                    du_n = du   # ∂u/∂ξ (normal velocity derivative)
-                    L3 = u_n * dv; L4 = u_n * dw  # shear waves (tangential)
+                    if side == Int32(1); i1 = idx_bnd-1; i2 = idx_bnd-2; s_der = one(FT)
+                    else;                 i1 = idx_bnd+1; i2 = idx_bnd+2; s_der = -one(FT); end
+                    dρ = s_der*(FT(1.5)*ρ_b - FT(2.0)*Q[i1,j,k,1] + FT(0.5)*Q[i2,j,k,1])
+                    du = s_der*(FT(1.5)*u_b - FT(2.0)*Q[i1,j,k,2] + FT(0.5)*Q[i2,j,k,2])
+                    dv = s_der*(FT(1.5)*v_b - FT(2.0)*Q[i1,j,k,3] + FT(0.5)*Q[i2,j,k,3])
+                    dw = s_der*(FT(1.5)*w_b - FT(2.0)*Q[i1,j,k,4] + FT(0.5)*Q[i2,j,k,4])
+                    dp = s_der*(FT(1.5)*p_b - FT(2.0)*Q[i1,j,k,5] + FT(0.5)*Q[i2,j,k,5])
                 elseif dir == Int32(2)
-                    if side == Int32(1)  # η+
-                        j1 = idx_bnd-1; j2 = idx_bnd-2
-                        dρ = FT(1.5e0)*ρ_b - FT(2.0)*Q[i,j1,k,1] + FT(0.5)*Q[i,j2,k,1]
-                        du = FT(1.5e0)*u_b - FT(2.0)*Q[i,j1,k,2] + FT(0.5)*Q[i,j2,k,2]
-                        dv = FT(1.5e0)*v_b - FT(2.0)*Q[i,j1,k,3] + FT(0.5)*Q[i,j2,k,3]
-                        dw = FT(1.5e0)*w_b - FT(2.0)*Q[i,j1,k,4] + FT(0.5)*Q[i,j2,k,4]
-                        dp = FT(1.5e0)*p_b - FT(2.0)*Q[i,j1,k,5] + FT(0.5)*Q[i,j2,k,5]
-                    else  # η-
-                        j1 = idx_bnd+1; j2 = idx_bnd+2
-                        dρ = -(FT(1.5e0)*ρ_b - FT(2.0)*Q[i,j1,k,1] + FT(0.5)*Q[i,j2,k,1])
-                        du = -(FT(1.5e0)*u_b - FT(2.0)*Q[i,j1,k,2] + FT(0.5)*Q[i,j2,k,2])
-                        dv = -(FT(1.5e0)*v_b - FT(2.0)*Q[i,j1,k,3] + FT(0.5)*Q[i,j2,k,3])
-                        dw = -(FT(1.5e0)*w_b - FT(2.0)*Q[i,j1,k,4] + FT(0.5)*Q[i,j2,k,4])
-                        dp = -(FT(1.5e0)*p_b - FT(2.0)*Q[i,j1,k,5] + FT(0.5)*Q[i,j2,k,5])
-                    end
-                    du_n = dv   # ∂v/∂η (normal velocity derivative)
-                    L3 = u_n * du; L4 = u_n * dw  # shear waves (tangential)
-                else  # ζ
-                    if side == Int32(1)  # ζ+
-                        k1 = idx_bnd-1; k2 = idx_bnd-2
-                        dρ = FT(1.5e0)*ρ_b - FT(2.0)*Q[i,j,k1,1] + FT(0.5)*Q[i,j,k2,1]
-                        du = FT(1.5e0)*u_b - FT(2.0)*Q[i,j,k1,2] + FT(0.5)*Q[i,j,k2,2]
-                        dv = FT(1.5e0)*v_b - FT(2.0)*Q[i,j,k1,3] + FT(0.5)*Q[i,j,k2,3]
-                        dw = FT(1.5e0)*w_b - FT(2.0)*Q[i,j,k1,4] + FT(0.5)*Q[i,j,k2,4]
-                        dp = FT(1.5e0)*p_b - FT(2.0)*Q[i,j,k1,5] + FT(0.5)*Q[i,j,k2,5]
-                    else  # ζ-
-                        k1 = idx_bnd+1; k2 = idx_bnd+2
-                        dρ = -(FT(1.5e0)*ρ_b - FT(2.0)*Q[i,j,k1,1] + FT(0.5)*Q[i,j,k2,1])
-                        du = -(FT(1.5e0)*u_b - FT(2.0)*Q[i,j,k1,2] + FT(0.5)*Q[i,j,k2,2])
-                        dv = -(FT(1.5e0)*v_b - FT(2.0)*Q[i,j,k1,3] + FT(0.5)*Q[i,j,k2,3])
-                        dw = -(FT(1.5e0)*w_b - FT(2.0)*Q[i,j,k1,4] + FT(0.5)*Q[i,j,k2,4])
-                        dp = -(FT(1.5e0)*p_b - FT(2.0)*Q[i,j,k1,5] + FT(0.5)*Q[i,j,k2,5])
-                    end
-                    du_n = dw   # ∂w/∂ζ (normal velocity derivative)
-                    L3 = u_n * du; L4 = u_n * dv  # shear waves (tangential)
+                    if side == Int32(1); j1 = idx_bnd-1; j2 = idx_bnd-2; s_der = one(FT)
+                    else;                 j1 = idx_bnd+1; j2 = idx_bnd+2; s_der = -one(FT); end
+                    dρ = s_der*(FT(1.5)*ρ_b - FT(2.0)*Q[i,j1,k,1] + FT(0.5)*Q[i,j2,k,1])
+                    du = s_der*(FT(1.5)*u_b - FT(2.0)*Q[i,j1,k,2] + FT(0.5)*Q[i,j2,k,2])
+                    dv = s_der*(FT(1.5)*v_b - FT(2.0)*Q[i,j1,k,3] + FT(0.5)*Q[i,j2,k,3])
+                    dw = s_der*(FT(1.5)*w_b - FT(2.0)*Q[i,j1,k,4] + FT(0.5)*Q[i,j2,k,4])
+                    dp = s_der*(FT(1.5)*p_b - FT(2.0)*Q[i,j1,k,5] + FT(0.5)*Q[i,j2,k,5])
+                else
+                    if side == Int32(1); k1 = idx_bnd-1; k2 = idx_bnd-2; s_der = one(FT)
+                    else;                 k1 = idx_bnd+1; k2 = idx_bnd+2; s_der = -one(FT); end
+                    dρ = s_der*(FT(1.5)*ρ_b - FT(2.0)*Q[i,j,k1,1] + FT(0.5)*Q[i,j,k2,1])
+                    du = s_der*(FT(1.5)*u_b - FT(2.0)*Q[i,j,k1,2] + FT(0.5)*Q[i,j,k2,2])
+                    dv = s_der*(FT(1.5)*v_b - FT(2.0)*Q[i,j,k1,3] + FT(0.5)*Q[i,j,k2,3])
+                    dw = s_der*(FT(1.5)*w_b - FT(2.0)*Q[i,j,k1,4] + FT(0.5)*Q[i,j,k2,4])
+                    dp = s_der*(FT(1.5)*p_b - FT(2.0)*Q[i,j,k1,5] + FT(0.5)*Q[i,j,k2,5])
                 end
 
-                # Wave amplitudes
-                L5 = (u_n + c) * (dp + ρ_b * c * du_n)  # outgoing acoustic
-                L2 = u_n * (c^2 * dρ - dp)               # entropy
-                # L1: incoming acoustic — pressure relaxation (Poinsot & Lele)
-                L1 = sigma * c * (one(FT) - Ma_n^2) / L_ref * (p_b - p_target)
+                # Physical normal derivatives. Vol stores J = 1/cell_volume.
+                Δn = one(FT) / (max(J_b, FT(1.0e-30)) * max(A_b, FT(1.0e-30)))
+                inv_Δn = one(FT) / max(Δn, FT(1.0e-30))
+                dρdn = dρ * inv_Δn
+                dudn = du * inv_Δn; dvdn = dv * inv_Δn; dwdn = dw * inv_Δn
+                dpdn = dp * inv_Δn
+                du_ndn = dudn*nx + dvdn*ny + dwdn*nz
+                du_ldn = dudn*lx + dvdn*ly + dwdn*lz
+                du_mdn = dudn*mx + dvdn*my + dwdn*mz
 
-                # LODI update relations
-                d1 = (L2 + FT(0.5)*(L5+L1)) / (c^2 + FT(1.0e-30))
-                d2 = FT(0.5)*(L5-L1) / (ρ_b*c + FT(1.0e-30))
-                d3 = L3
-                d4 = L4
-                d5 = FT(0.5)*(L5+L1)
+                sigma = bcp[8]; L_ref = bcp[9]
+                if sigma <= zero(FT); sigma = FT(0.3); end
+                if L_ref <= zero(FT); L_ref = inv_Δn; end  # sensible default = 1/Δn (cell-length scale, avoids dimensionless L_ref=1)
 
-                # Set ghost = boundary value modified by LODI
-                ρ_g = ρ_b - d1; p_g = p_b - d5
-                ρ_g = max(ρ_g, FT(1.0e-10)); p_g = max(p_g, FT(1.0e-10))
-                if dir == Int32(1)  # ξ: normal=u, tangential=v,w
-                    u_g = u_b - d2; v_g = v_b - d3; w_g = w_b - d4
-                elseif dir == Int32(2)  # η: normal=v, tangential=u,w
-                    v_g = v_b - d2; u_g = u_b - d3; w_g = w_b - d4
-                else  # ζ: normal=w, tangential=u,v
-                    w_g = w_b - d2; u_g = u_b - d3; v_g = v_b - d4
+                L5 = (u_n + c) * (dpdn + ρ_b * c * du_ndn)   # outgoing acoustic
+                L2 = u_n * (c*c * dρdn - dpdn)               # entropy
+                L3 = u_n * du_ldn                            # shear (l)
+                L4 = u_n * du_mdn                            # shear (m)
+
+                # L1: incoming acoustic. Weak anchor toward block outlet area-averaged
+                # p_anchor (bcp[BCP_OUTLET_PAVG]=[15]). When p_anchor<=0 (uninitialized),
+                # pure non-reflecting L1=0. Backflow (u_n<=0) strengthens the anchor.
+                p_anchor = bcp[BCP_OUTLET_PAVG]
+                if p_anchor > zero(FT)
+                    backflow = u_n <= zero(FT)
+                    if backflow
+                        # HEURISTIC soft inflow (NOT derived from LODI):
+                        # Poinsot-Lele §III.D gives a strictly LODI-consistent backflow treatment
+                        # via the L5 incoming acoustic wave (u_n+c<0 reverses roles). Here we use a
+                        # practical engineering approximation instead — strengthen the L1 pressure
+                        # anchor (no (1-Ma²) damping) and damp the tangential wave amplitudes —
+                        # which empirically pushes the flow back toward outflow without letting
+                        # disturbance reflect as a hard wall zero-gradient would.
+                        L1 = FT(1.0) * c * (p_b - p_anchor)
+                        # damp tangential perturbations to suppress reflective feedback
+                        L3 = -abs(u_n) * du_ldn
+                        L4 = -abs(u_n) * du_mdn
+                    else
+                        L1 = sigma * c * (one(FT) - Ma_n*Ma_n) / L_ref * (p_b - p_anchor)
+                    end
+                else
+                    L1 = zero(FT)
                 end
+
+                # LODI primitive rates (time derivatives)
+                ρ_rate = -(L2 + FT(0.5)*(L5 + L1)) / (c*c + FT(1.0e-30))
+                un_rate = -FT(0.5)*(L5 - L1) / (ρ_b*c + FT(1.0e-30))
+                ul_rate = -L3
+                um_rate = -L4
+                p_rate = -FT(0.5)*(L5 + L1)
+
+                # Limit single ghost update for robustness.
+                rel_lim = FT(0.20); vel_lim = FT(0.25) * c
+                dρ_step = max(-rel_lim*ρ_b, min(rel_lim*ρ_b, dt_bc*ρ_rate))
+                dp_step = max(-rel_lim*p_b, min(rel_lim*p_b, dt_bc*p_rate))
+                dun_step = max(-vel_lim, min(vel_lim, dt_bc*un_rate))
+                dul_step = max(-vel_lim, min(vel_lim, dt_bc*ul_rate))
+                dum_step = max(-vel_lim, min(vel_lim, dt_bc*um_rate))
+
+                ρ_g = max(ρ_b + dρ_step, max(FT(1.0e-10), FT(0.05)*ρ_b))
+                p_g = max(p_b + dp_step, max(FT(1.0e-10), FT(0.05)*p_b))
+                un_g = u_n + dun_step
+                ul_g = u_l + dul_step
+                um_g = u_m + dum_step
+
+                u_g = un_g*nx + ul_g*lx + um_g*mx
+                v_g = un_g*ny + ul_g*ly + um_g*my
+                w_g = un_g*nz + ul_g*lz + um_g*mz
                 T_g = p_g / (ρ_g * Rg + FT(1.0e-30))
+
                 Q[i,j,k,1]=ρ_g; Q[i,j,k,2]=u_g; Q[i,j,k,3]=v_g; Q[i,j,k,4]=w_g; Q[i,j,k,5]=p_g; Q[i,j,k,6]=T_g
                 U[i,j,k,1]=ρ_g; U[i,j,k,2]=ρ_g*u_g; U[i,j,k,3]=ρ_g*v_g; U[i,j,k,4]=ρ_g*w_g
                 U[i,j,k,5]=p_g/(γ-one(FT))+FT(0.5)*ρ_g*(u_g^2+v_g^2+w_g^2)
             end
+        end
+
+    # ── Riemann invariant outflow (self-consistent with internal Riemann solver) ──
+    # Ghost state is reconstructed from extrapated Riemann invariants R±, entropy S,
+    # and tangential ul,um. Because the ghost is built FROM invariants the internal
+    # WENO/Riemann solver naturally re-derives the same wave structure on the boundary
+    # face — no double characteristic decomposition mismatch (the slow-drift root cause
+    # of the ghost-cell NSCBC + internal Riemann solver combination).
+    #
+    # First version (this branch): pure extrapolation, R⁻ also extrapolated (fully
+    # non-reflecting, NO back-pressure anchor). The optional α slot BCP_RIEMANN_ALPHA
+    # may later relax R⁻ toward an outlet-area-averaged target — but defaults to 0.
+    elseif bc_type == Int32(BC_RIEMANN_OUTFLOW)
+        @inbounds begin
+            # Read boundary cell primitives and outward face normal.
+            if dir == Int32(1)
+                ρ_b=Q[idx_bnd,j,k,1]; u_b=Q[idx_bnd,j,k,2]; v_b=Q[idx_bnd,j,k,3]; w_b=Q[idx_bnd,j,k,4]; p_b=Q[idx_bnd,j,k,5]
+                nx0=n_x[idx_wall,j,k]; ny0=n_y[idx_wall,j,k]; nz0=n_z[idx_wall,j,k]
+            elseif dir == Int32(2)
+                ρ_b=Q[i,idx_bnd,k,1]; u_b=Q[i,idx_bnd,k,2]; v_b=Q[i,idx_bnd,k,3]; w_b=Q[i,idx_bnd,k,4]; p_b=Q[i,idx_bnd,k,5]
+                nx0=n_x[i,idx_wall,k]; ny0=n_y[i,idx_wall,k]; nz0=n_z[i,idx_wall,k]
+            else
+                ρ_b=Q[i,j,idx_bnd,1]; u_b=Q[i,j,idx_bnd,2]; v_b=Q[i,j,idx_bnd,3]; w_b=Q[i,j,idx_bnd,4]; p_b=Q[i,j,idx_bnd,5]
+                nx0=n_x[i,j,idx_wall]; ny0=n_y[i,j,idx_wall]; nz0=n_z[i,j,idx_wall]
+            end
+
+            # Outward normal (mirror convention of NSCBC branch).
+            s_out = side == Int32(1) ? one(FT) : -one(FT)
+            nx = s_out*nx0; ny = s_out*ny0; nz = s_out*nz0
+            nmag = sqrt(nx*nx + ny*ny + nz*nz + FT(1.0e-30))
+            nx /= nmag; ny /= nmag; nz /= nmag
+
+            # Orthonormal tangential basis (l, m) from outward normal.
+            ax = abs(nx) < FT(0.9) ? one(FT) : zero(FT)
+            ay = abs(nx) < FT(0.9) ? zero(FT) : one(FT)
+            az = zero(FT)
+            lx = ay*nz - az*ny; ly = az*nx - ax*nz; lz = ax*ny - ay*nx
+            lmag = sqrt(lx*lx + ly*ly + lz*lz + FT(1.0e-30))
+            lx /= lmag; ly /= lmag; lz /= lmag
+            mx = ny*lz - nz*ly; my = nz*lx - nx*lz; mz = nx*ly - ny*lx
+
+            # Boundary-cell invariants (zeroth-order extrapolation = ghost = boundary).
+            ρ_b = max(ρ_b, FT(1.0e-30)); p_b = max(p_b, FT(1.0e-30))
+            c_b = sqrt(γ * p_b / ρ_b)
+            u_n = u_b*nx + v_b*ny + w_b*nz
+            u_l = u_b*lx + v_b*ly + w_b*lz
+            u_m = u_b*mx + v_b*my + w_b*mz
+            Kgm = γ - one(FT)
+            inv_Kgm = one(FT) / max(Kgm, FT(1.0e-30))
+            S_b = p_b / (ρ_b^γ)            # entropy S = p/ρ^γ
+            Rp_b = u_n + FT(2.0)*c_b*inv_Kgm    # outgoing acoustic invariant
+            Rm_b = u_n - FT(2.0)*c_b*inv_Kgm    # incoming acoustic invariant
+
+            # Ghost invariants. First version: pure extrapolation (no anchor).
+            Rp_g = Rp_b
+            S_g = S_b
+            ul_g = u_l
+            um_g = u_m
+
+            # Optional soft R⁻ anchor (disabled by default; α=0 passes through).
+            alpha = bcp[BCP_RIEMANN_ALPHA]
+            if alpha > zero(FT)
+                p_anchor = bcp[BCP_OUTLET_PAVG]
+                if p_anchor > zero(FT)
+                    # Target inflow invariant from outlet mean state.
+                    # ρ_target = (p_anchor / S_g)^(1/γ)  -- use extrapolated entropy S_g
+                    # c_target = sqrt(γ p_target/ρ_target); Rm_target = u_n - 2 c_target/(γ-1)
+                    Sg = max(S_g, FT(1.0e-30))
+                    ρ_target = exp((log(max(p_anchor, FT(1.0e-30))) - log(Sg)) / γ)
+                    ρ_target = max(ρ_target, FT(1.0e-10))
+                    c_target = sqrt(γ * max(p_anchor, FT(1.0e-30)) / max(ρ_target, FT(1.0e-30)))
+                    Rm_target = u_n - FT(2.0)*c_target*inv_Kgm
+                    Rm_g = (one(FT) - alpha) * Rm_b + alpha * Rm_target
+                else
+                    Rm_g = Rm_b
+                end
+            else
+                Rm_g = Rm_b
+            end
+
+            # Reconstruct primitive ghost state from invariants.
+            u_n_g = FT(0.5) * (Rp_g + Rm_g)
+            c_g = FT(0.25) * (Rp_g - Rm_g) * Kgm
+            c_g = max(c_g, FT(1.0e-30))
+            # From S = p/ρ^γ and p = ρ c^2 / γ ⇒ ρ^γ = p/s / (γS) ⇒ ρ=(c²/(γS))^(1/(γ-1))
+            c2_over_γS = (c_g * c_g) / (γ * max(S_g, FT(1.0e-30)))
+            ρ_g = exp(log(max(c2_over_γS, FT(1.0e-30))) * inv_Kgm)
+            ρ_g = max(ρ_g, FT(1.0e-10))
+            p_g = ρ_g * c_g * c_g / γ
+            p_g = max(p_g, FT(1.0e-10))
+
+            # Tangential stays extrapolated. Reconstruct Cartesian velocity.
+            u_g = u_n_g*nx + ul_g*lx + um_g*mx
+            v_g = u_n_g*ny + ul_g*ly + um_g*my
+            w_g = u_n_g*nz + ul_g*lz + um_g*mz
+            T_g = p_g / (ρ_g * Rg + FT(1.0e-30))
+
+            Q[i,j,k,1]=ρ_g; Q[i,j,k,2]=u_g; Q[i,j,k,3]=v_g; Q[i,j,k,4]=w_g; Q[i,j,k,5]=p_g; Q[i,j,k,6]=T_g
+            U[i,j,k,1]=ρ_g; U[i,j,k,2]=ρ_g*u_g; U[i,j,k,3]=ρ_g*v_g; U[i,j,k,4]=ρ_g*w_g
+            U[i,j,k,5]=p_g/(γ-one(FT))+FT(0.5)*ρ_g*(u_g^2+v_g^2+w_g^2)
         end
 
     # ── Farfield — Riemann invariant based ──
@@ -690,86 +1123,35 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
             U[i,j,k,5]=pg/(γ-one(FT))+FT(0.5)*ρg*(ug^2+vg^2+wg^2)
         end
 
-    # ── AC No-Slip Wall — velocity reflection, pressure Neumann ──
-    # For AC: Q = [p, u, v, w], U = Q (identity)
-    # Ghost: p_ghost = p_mirror (Neumann), vel_ghost = -vel_mirror (no-slip)
-    elseif bc_type == Int32(BC_AC_WALL)
-        if dir == Int32(1)
-            @inbounds begin
-                Q[i,j,k,1] = Q[idx_int,j,k,1]   # pressure: Neumann
-                Q[i,j,k,2] = -Q[idx_int,j,k,2]   # u: no-slip
-                Q[i,j,k,3] = -Q[idx_int,j,k,3]   # v: no-slip
-                Q[i,j,k,4] = -Q[idx_int,j,k,4]   # w: no-slip
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        elseif dir == Int32(2)
-            @inbounds begin
-                Q[i,j,k,1] = Q[i,idx_int,k,1]
-                Q[i,j,k,2] = -Q[i,idx_int,k,2]
-                Q[i,j,k,3] = -Q[i,idx_int,k,3]
-                Q[i,j,k,4] = -Q[i,idx_int,k,4]
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        else
-            @inbounds begin
-                Q[i,j,k,1] = Q[i,j,idx_int,1]
-                Q[i,j,k,2] = -Q[i,j,idx_int,2]
-                Q[i,j,k,3] = -Q[i,j,idx_int,3]
-                Q[i,j,k,4] = -Q[i,j,idx_int,4]
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        end
-
-    # ── AC Lid Wall — prescribed velocity, pressure Neumann ──
-    # Ghost: p_ghost = p_mirror, vel_ghost = 2*vel_lid - vel_mirror
-    elseif bc_type == Int32(BC_AC_LID)
-        u_lid = bcp[BCP_AC_U_LID]; v_lid = bcp[BCP_AC_V_LID]; w_lid = bcp[BCP_AC_W_LID]
-        if dir == Int32(1)
-            @inbounds begin
-                Q[i,j,k,1] = Q[idx_int,j,k,1]
-                Q[i,j,k,2] = FT(2.0)*u_lid - Q[idx_int,j,k,2]
-                Q[i,j,k,3] = FT(2.0)*v_lid - Q[idx_int,j,k,3]
-                Q[i,j,k,4] = FT(2.0)*w_lid - Q[idx_int,j,k,4]
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        elseif dir == Int32(2)
-            @inbounds begin
-                Q[i,j,k,1] = Q[i,idx_int,k,1]
-                Q[i,j,k,2] = FT(2.0)*u_lid - Q[i,idx_int,k,2]
-                Q[i,j,k,3] = FT(2.0)*v_lid - Q[i,idx_int,k,3]
-                Q[i,j,k,4] = FT(2.0)*w_lid - Q[i,idx_int,k,4]
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        else
-            @inbounds begin
-                Q[i,j,k,1] = Q[i,j,idx_int,1]
-                Q[i,j,k,2] = FT(2.0)*u_lid - Q[i,j,idx_int,2]
-                Q[i,j,k,3] = FT(2.0)*v_lid - Q[i,j,idx_int,3]
-                Q[i,j,k,4] = FT(2.0)*w_lid - Q[i,j,idx_int,4]
-                for n = 1:Ncons; U[i,j,k,n] = Q[i,j,k,n]; end
-            end
-        end
-
     end
 
     # ── MHD extension: set B-field and ψ for ghost cells ──
     # Applied AFTER the hydrodynamic BC above has set ρ, u, v, w, p, T
     if equation_type == :MHD
         if bc_type == Int32(BC_ISOTHERMAL_WALL) || bc_type == Int32(BC_ADIABATIC_WALL) || bc_type == Int32(BC_MHD_WALL) || bc_type == Int32(BC_SLIP_WALL) || bc_type == Int32(BC_SYMMETRY)
-            # Perfectly conducting wall: copy B from mirror, ψ anti-symmetric
+            # Perfectly conducting wall: Bn anti-symmetric, Bt symmetric.
             if dir == Int32(1)
                 @inbounds begin
-                    Q[i,j,k,7]=Q[idx_int,j,k,7]; Q[i,j,k,8]=Q[idx_int,j,k,8]; Q[i,j,k,9]=Q[idx_int,j,k,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[idx_int,j,k,7],Q[idx_int,j,k,8],Q[idx_int,j,k,9],
+                        n_x[idx_wall,j,k],n_y[idx_wall,j,k],n_z[idx_wall,j,k],false)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[idx_int,j,k,10]
                 end
             elseif dir == Int32(2)
                 @inbounds begin
-                    Q[i,j,k,7]=Q[i,idx_int,k,7]; Q[i,j,k,8]=Q[i,idx_int,k,8]; Q[i,j,k,9]=Q[i,idx_int,k,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[i,idx_int,k,7],Q[i,idx_int,k,8],Q[i,idx_int,k,9],
+                        n_x[i,idx_wall,k],n_y[i,idx_wall,k],n_z[i,idx_wall,k],false)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[i,idx_int,k,10]
                 end
             else
                 @inbounds begin
-                    Q[i,j,k,7]=Q[i,j,idx_int,7]; Q[i,j,k,8]=Q[i,j,idx_int,8]; Q[i,j,k,9]=Q[i,j,idx_int,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[i,j,idx_int,7],Q[i,j,idx_int,8],Q[i,j,idx_int,9],
+                        n_x[i,j,idx_wall],n_y[i,j,idx_wall],n_z[i,j,idx_wall],false)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[i,j,idx_int,10]
                 end
             end
@@ -781,24 +1163,29 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
                 U[i,j,k,5]=Q[i,j,k,5]/(γ-one(FT))+FT(0.5)*Q[i,j,k,1]*(Q[i,j,k,2]^2+Q[i,j,k,3]^2+Q[i,j,k,4]^2)+FT(0.5)*B2
             end
         elseif bc_type == Int32(BC_MHD_INSULATING_WALL)
-            # Insulating wall: tangential B-field is zero (anti-symmetric), normal B-field is symmetric
+            # Local insulating model: Bt anti-symmetric, Bn symmetric.
             if dir == Int32(1)
                 @inbounds begin
-                    Q[i,j,k,7]=Q[idx_int,j,k,7]
-                    Q[i,j,k,8]=-Q[idx_int,j,k,8]; Q[i,j,k,9]=-Q[idx_int,j,k,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[idx_int,j,k,7],Q[idx_int,j,k,8],Q[idx_int,j,k,9],
+                        n_x[idx_wall,j,k],n_y[idx_wall,j,k],n_z[idx_wall,j,k],true)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[idx_int,j,k,10]
                 end
             elseif dir == Int32(2)
                 @inbounds begin
-                    Q[i,j,k,7]=-Q[i,idx_int,k,7]
-                    Q[i,j,k,8]=Q[i,idx_int,k,8]
-                    Q[i,j,k,9]=-Q[i,idx_int,k,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[i,idx_int,k,7],Q[i,idx_int,k,8],Q[i,idx_int,k,9],
+                        n_x[i,idx_wall,k],n_y[i,idx_wall,k],n_z[i,idx_wall,k],true)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[i,idx_int,k,10]
                 end
             else
                 @inbounds begin
-                    Q[i,j,k,7]=-Q[i,j,idx_int,7]; Q[i,j,k,8]=-Q[i,j,idx_int,8]
-                    Q[i,j,k,9]=Q[i,j,idx_int,9]
+                    bx,by,bz=mhd_reflect_wall_field(
+                        Q[i,j,idx_int,7],Q[i,j,idx_int,8],Q[i,j,idx_int,9],
+                        n_x[i,j,idx_wall],n_y[i,j,idx_wall],n_z[i,j,idx_wall],true)
+                    Q[i,j,k,7]=bx; Q[i,j,k,8]=by; Q[i,j,k,9]=bz
                     Q[i,j,k,10]=-Q[i,j,idx_int,10]
                 end
             end
@@ -829,7 +1216,7 @@ end
 # =============================================================================
 # ξ-direction BCs — GPU kernel
 # =============================================================================
-function fill_x(Q, U, rx, n_x, n_y, n_z, x, y, z,
+function fill_x(Q, U, rx, n_x, n_y, n_z, Area, Vol, dt_bc, x, y, z,
                 bc_x_lo, bc_x_hi, bcp_x_lo, bcp_x_hi,
                 nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -840,11 +1227,11 @@ function fill_x(Q, U, rx, n_x, n_y, n_z, x, y, z,
     # ξ- ghost cells
     if rx == 0 && i <= NG
         _apply_bc!(Q, U, i, j, k, bc_x_lo, Int32(1), Int32(0),
-                   n_x, n_y, n_z, x, y, z, nxp, nyp, nzp, bcp_x_lo, tt, dsrfg_params)
+                   n_x, n_y, n_z, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_x_lo, tt, dsrfg_params)
     # ξ+ ghost cells
     elseif rx == Nprocs_block[1]-1 && i > nxp+NG
         _apply_bc!(Q, U, i, j, k, bc_x_hi, Int32(1), Int32(1),
-                   n_x, n_y, n_z, x, y, z, nxp, nyp, nzp, bcp_x_hi, tt, dsrfg_params)
+                   n_x, n_y, n_z, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_x_hi, tt, dsrfg_params)
     end
     return
 end
@@ -852,7 +1239,7 @@ end
 # =============================================================================
 # η-direction BCs — GPU kernel
 # =============================================================================
-function fill_y(Q, U, rx, ry, rz, n_x_j, n_y_j, n_z_j, x, y, z,
+function fill_y(Q, U, rx, ry, rz, n_x_j, n_y_j, n_z_j, Area, Vol, dt_bc, x, y, z,
                 bc_y_lo, bc_y_hi, bcp_y_lo, bcp_y_hi,
                 nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -863,11 +1250,11 @@ function fill_y(Q, U, rx, ry, rz, n_x_j, n_y_j, n_z_j, x, y, z,
     # η- ghost
     if ry == 0 && j <= NG
         _apply_bc!(Q, U, i, j, k, bc_y_lo, Int32(2), Int32(0),
-                   n_x_j, n_y_j, n_z_j, x, y, z, nxp, nyp, nzp, bcp_y_lo, tt, dsrfg_params)
+                   n_x_j, n_y_j, n_z_j, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_y_lo, tt, dsrfg_params)
     # η+ ghost
     elseif ry == Nprocs_block[2]-1 && j > nyp+NG
         _apply_bc!(Q, U, i, j, k, bc_y_hi, Int32(2), Int32(1),
-                   n_x_j, n_y_j, n_z_j, x, y, z, nxp, nyp, nzp, bcp_y_hi, tt, dsrfg_params)
+                   n_x_j, n_y_j, n_z_j, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_y_hi, tt, dsrfg_params)
     end
     return
 end
@@ -875,7 +1262,7 @@ end
 # =============================================================================
 # ζ-direction BCs — GPU kernel
 # =============================================================================
-function fill_z(Q, U, rx, ry, rz, n_x_k, n_y_k, n_z_k, x, y, z,
+function fill_z(Q, U, rx, ry, rz, n_x_k, n_y_k, n_z_k, Area, Vol, dt_bc, x, y, z,
                 bc_z_lo, bc_z_hi, bcp_z_lo, bcp_z_hi,
                 nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -886,11 +1273,11 @@ function fill_z(Q, U, rx, ry, rz, n_x_k, n_y_k, n_z_k, x, y, z,
     # ζ- ghost
     if rz == 0 && k <= NG
         _apply_bc!(Q, U, i, j, k, bc_z_lo, Int32(3), Int32(0),
-                   n_x_k, n_y_k, n_z_k, x, y, z, nxp, nyp, nzp, bcp_z_lo, tt, dsrfg_params)
+                   n_x_k, n_y_k, n_z_k, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_z_lo, tt, dsrfg_params)
     # ζ+ ghost
     elseif rz == Nprocs_block[3]-1 && k > nzp+NG
         _apply_bc!(Q, U, i, j, k, bc_z_hi, Int32(3), Int32(1),
-                   n_x_k, n_y_k, n_z_k, x, y, z, nxp, nyp, nzp, bcp_z_hi, tt, dsrfg_params)
+                   n_x_k, n_y_k, n_z_k, Area, Vol, dt_bc, x, y, z, nxp, nyp, nzp, bcp_z_hi, tt, dsrfg_params)
     end
     return
 end
@@ -902,6 +1289,7 @@ function fillGhost(Q, U, rx, ry, rz,
                    n_x_i, n_y_i, n_z_i,
                    n_x_j, n_y_j, n_z_j,
                    n_x_k, n_y_k, n_z_k,
+                   Area_i, Area_j, Area_k, Vol, dt_bc,
                    x, y, z, block_id, nxp, nyp, nzp, Nprocs_block, tt, face_bc, bc_params,
                    dsrfg_params)
     nb = (cld(nxp+2*NG, nthreads[1]), cld(nyp+2*NG, nthreads[2]), cld(nzp+2*NG, nthreads[3]))
@@ -921,11 +1309,11 @@ function fillGhost(Q, U, rx, ry, rz,
     bcp_z_lo = _get_bcp(5); bcp_z_hi = _get_bcp(6)
 
     @gpu_launch threads=nthreads blocks=nb fill_x(Q, U, rx, n_x_i, n_y_i, n_z_i,
-        x, y, z, bc_x_lo, bc_x_hi, bcp_x_lo, bcp_x_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
+        Area_i, Vol, dt_bc, x, y, z, bc_x_lo, bc_x_hi, bcp_x_lo, bcp_x_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
     @gpu_launch threads=nthreads blocks=nb fill_y(Q, U, rx, ry, rz, n_x_j, n_y_j, n_z_j,
-        x, y, z, bc_y_lo, bc_y_hi, bcp_y_lo, bcp_y_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
+        Area_j, Vol, dt_bc, x, y, z, bc_y_lo, bc_y_hi, bcp_y_lo, bcp_y_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
     @gpu_launch threads=nthreads blocks=nb fill_z(Q, U, rx, ry, rz, n_x_k, n_y_k, n_z_k,
-        x, y, z, bc_z_lo, bc_z_hi, bcp_z_lo, bcp_z_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
+        Area_k, Vol, dt_bc, x, y, z, bc_z_lo, bc_z_hi, bcp_z_lo, bcp_z_hi, nxp, nyp, nzp, Nprocs_block, tt, dsrfg_params)
 end
 
 

@@ -37,6 +37,7 @@ using CUDA
 const equation_type = :MHD
 const resistive::Bool = false   # Ideal MHD (no magnetic diffusion)
 const cr_glm::FT = FT(0.18e0) # GLM damping ratio
+const ct_mode::Bool = true     # Enable Constrained Transport (staggered B)
 
 # Project root for includes (two levels up from Benchmark/BRIO_WU/)
 const _project_root = joinpath(@__DIR__, "..", "..")
@@ -155,7 +156,7 @@ const gg_blend::FT = zero(FT)
 # ─── FVM Config ───
 const eigen_reconstruction::Bool = false  # Must be false for MHD (no 9×9 eigensystem)
 const character::Bool = false
-const splitMethodID::Int32 = 1     # 1=Rusanov (safe default for MHD debugging)
+const splitMethodID::Int32 = 1     # 1=Rusanov (test CT with face-Bn)
 const hybrid_ϕ1::FT = FT(0.01e0) # Low threshold: use WENO aggressively for shock tube
 const hybrid_ϕ2::FT = one(FT)
 const hybrid_ϕ3::FT = FT(10.0)

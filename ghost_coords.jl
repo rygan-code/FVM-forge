@@ -8,7 +8,7 @@
 #   - Edge ghosts: product formula from face ghost values
 #   - Corner ghosts: triple product from face ghost values
 #
-# NOTE: Ghost cell Q/U VALUES are filled separately by interp_ghost! (MPI)
+# NOTE: Ghost cell Q/U VALUES are filled by copy_ghost_face! (direct MPI copy)
 #       and fillGhost (boundary conditions). The coordinates here only need
 #       to produce smooth, reasonable metrics — not exact coincidence.
 # =============================================================================
@@ -56,8 +56,89 @@ function expand_coords_with_ghost(x_real, y_real, z_real,
     
     # Step 4: Corner ghost nodes (8 corners) — triple product
     _fill_corner_ghosts!(x, y, z, Nx, Ny, Nz, NG)
+
+    # Product extrapolation is not exact for coupled curvilinear mappings.
+    # Overwrite fully periodic edge/corner nodes by mapping to the equivalent
+    # physical node and applying the domain translation in each ghost axis.
+    _overwrite_periodic_edge_corner_ghosts!(
+        x, y, z, Nx, Ny, Nz, NG, face_bc, bid,
+    )
     
     return FT.(x), FT.(y), FT.(z)
+end
+
+@inline function _periodic_node_ghost_side(index, ncell, ng)
+    if index <= ng
+        return -1
+    elseif index >= ncell + ng + 2
+        return 1
+    end
+    return 0
+end
+
+@inline function _periodic_node_source_index(index, ncell, ghost_side)
+    if ghost_side < 0
+        return index + ncell
+    elseif ghost_side > 0
+        return index - ncell
+    end
+    return index
+end
+
+function _overwrite_periodic_edge_corner_ghosts!(
+    x, y, z, Nx, Ny, Nz, NG, face_bc, bid,
+)
+    _bc(fid) = haskey(face_bc, (bid, fid)) ?
+        face_bc[(bid, fid)] : BC_ISOTHERMAL_WALL
+    periodic_face = (
+        _bc(1) == BC_PERIODIC, _bc(2) == BC_PERIODIC,
+        _bc(3) == BC_PERIODIC, _bc(4) == BC_PERIODIC,
+        _bc(5) == BC_PERIODIC, _bc(6) == BC_PERIODIC,
+    )
+    ilo, ihi = NG + 1, Nx + NG + 1
+    jlo, jhi = NG + 1, Ny + NG + 1
+    klo, khi = NG + 1, Nz + NG + 1
+
+    for k in axes(x, 3), j in axes(x, 2), i in axes(x, 1)
+        side_i = _periodic_node_ghost_side(i, Nx, NG)
+        side_j = _periodic_node_ghost_side(j, Ny, NG)
+        side_k = _periodic_node_ghost_side(k, Nz, NG)
+        ghost_count = (side_i != 0) + (side_j != 0) + (side_k != 0)
+        ghost_count < 2 && continue
+
+        i_periodic = side_i == 0 || periodic_face[side_i < 0 ? 1 : 2]
+        j_periodic = side_j == 0 || periodic_face[side_j < 0 ? 3 : 4]
+        k_periodic = side_k == 0 || periodic_face[side_k < 0 ? 5 : 6]
+        i_periodic && j_periodic && k_periodic || continue
+
+        source_i = _periodic_node_source_index(i, Nx, side_i)
+        source_j = _periodic_node_source_index(j, Ny, side_j)
+        source_k = _periodic_node_source_index(k, Nz, side_k)
+
+        shift_x = zero(eltype(x))
+        shift_y = zero(eltype(y))
+        shift_z = zero(eltype(z))
+        if side_i != 0
+            shift_x += side_i * (x[ihi,source_j,source_k] - x[ilo,source_j,source_k])
+            shift_y += side_i * (y[ihi,source_j,source_k] - y[ilo,source_j,source_k])
+            shift_z += side_i * (z[ihi,source_j,source_k] - z[ilo,source_j,source_k])
+        end
+        if side_j != 0
+            shift_x += side_j * (x[source_i,jhi,source_k] - x[source_i,jlo,source_k])
+            shift_y += side_j * (y[source_i,jhi,source_k] - y[source_i,jlo,source_k])
+            shift_z += side_j * (z[source_i,jhi,source_k] - z[source_i,jlo,source_k])
+        end
+        if side_k != 0
+            shift_x += side_k * (x[source_i,source_j,khi] - x[source_i,source_j,klo])
+            shift_y += side_k * (y[source_i,source_j,khi] - y[source_i,source_j,klo])
+            shift_z += side_k * (z[source_i,source_j,khi] - z[source_i,source_j,klo])
+        end
+
+        x[i,j,k] = x[source_i,source_j,source_k] + shift_x
+        y[i,j,k] = y[source_i,source_j,source_k] + shift_y
+        z[i,j,k] = z[source_i,source_j,source_k] + shift_z
+    end
+    return
 end
 
 # =============================================================================
@@ -429,7 +510,70 @@ end
     return area, s*n_x/area, s*n_y/area, s*n_z/area
 end
 
-function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int)
+@inline function _periodic_metric_source_index(
+    index, ncell, ng, periodic, is_normal,
+)
+    periodic || return index
+    high_ghost_start = ncell + ng + (is_normal ? 2 : 1)
+    if index <= ng
+        return index + ncell
+    elseif index >= high_ghost_start
+        return index - ncell
+    end
+    return index
+end
+
+function _fill_periodic_metric_ghosts!(
+    metric, Nx, Ny, Nz, NG, periodic, normal_dir,
+)
+    for k in axes(metric, 3), j in axes(metric, 2), i in axes(metric, 1)
+        source_i = _periodic_metric_source_index(
+            i, Nx, NG, periodic[1], normal_dir == 1,
+        )
+        source_j = _periodic_metric_source_index(
+            j, Ny, NG, periodic[2], normal_dir == 2,
+        )
+        source_k = _periodic_metric_source_index(
+            k, Nz, NG, periodic[3], normal_dir == 3,
+        )
+        if source_i != i || source_j != j || source_k != k
+            metric[i,j,k] = metric[source_i,source_j,source_k]
+        end
+    end
+    return metric
+end
+
+function _enforce_periodic_metric_ghosts!(
+    Ai, nxi, nyi, nzi,
+    Aj, nxj, nyj, nzj,
+    Ak, nxk, nyk, nzk, V,
+    Nx, Ny, Nz, NG, periodic,
+)
+    for metric in (Ai, nxi, nyi, nzi)
+        _fill_periodic_metric_ghosts!(
+            metric, Nx, Ny, Nz, NG, periodic, 1,
+        )
+    end
+    for metric in (Aj, nxj, nyj, nzj)
+        _fill_periodic_metric_ghosts!(
+            metric, Nx, Ny, Nz, NG, periodic, 2,
+        )
+    end
+    for metric in (Ak, nxk, nyk, nzk)
+        _fill_periodic_metric_ghosts!(
+            metric, Nx, Ny, Nz, NG, periodic, 3,
+        )
+    end
+    _fill_periodic_metric_ghosts!(
+        V, Nx, Ny, Nz, NG, periodic, 0,
+    )
+    return
+end
+
+function compute_fvm_metrics_runtime(
+    x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    periodic=(false, false, false),
+)
     Nx_nodes_tot = Nx + 2NG + 1
     Ny_nodes_tot = Ny + 2NG + 1
     Nz_nodes_tot = Nz + 2NG + 1
@@ -469,76 +613,154 @@ function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int
     
     # ── CMD6 Midpoint Derivative Operators ──
     @inline function deriv_i(arr, i, j, k, N)
-        im2 = clamp(i-2, 1, N)
-        im1 = clamp(i-1, 1, N)
-        i0  = clamp(i,   1, N)
-        ip1 = clamp(i+1, 1, N)
-        ip2 = clamp(i+2, 1, N)
-        ip3 = clamp(i+3, 1, N)
-        return (75.0 * (arr[ip1, j, k] - arr[i0, j, k]) / 64.0) - 
-               (25.0 * (arr[ip2, j, k] - arr[im1, j, k]) / 384.0) + 
-               (3.0 * (arr[ip3, j, k] - arr[im2, j, k]) / 640.0)
+        if i <= 2 || i >= N - 1
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            return arr[ip1, j, k] - arr[i0, j, k]
+        elseif i <= 4 || i >= N - 3
+            im1 = clamp(i-1, 1, N)
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            ip2 = clamp(i+2, 1, N)
+            return (9.0 * (arr[ip1, j, k] - arr[i0, j, k]) / 8.0) - 
+                   (1.0 * (arr[ip2, j, k] - arr[im1, j, k]) / 24.0)
+        else
+            im2 = clamp(i-2, 1, N)
+            im1 = clamp(i-1, 1, N)
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            ip2 = clamp(i+2, 1, N)
+            ip3 = clamp(i+3, 1, N)
+            return (75.0 * (arr[ip1, j, k] - arr[i0, j, k]) / 64.0) - 
+                   (25.0 * (arr[ip2, j, k] - arr[im1, j, k]) / 384.0) + 
+                   (3.0 * (arr[ip3, j, k] - arr[im2, j, k]) / 640.0)
+        end
     end
 
     @inline function deriv_j(arr, i, j, k, N)
-        jm2 = clamp(j-2, 1, N)
-        jm1 = clamp(j-1, 1, N)
-        j0  = clamp(j,   1, N)
-        jp1 = clamp(j+1, 1, N)
-        jp2 = clamp(j+2, 1, N)
-        jp3 = clamp(j+3, 1, N)
-        return (75.0 * (arr[i, jp1, k] - arr[i, j0, k]) / 64.0) - 
-               (25.0 * (arr[i, jp2, k] - arr[i, jm1, k]) / 384.0) + 
-               (3.0 * (arr[i, jp3, k] - arr[i, jm2, k]) / 640.0)
+        if j <= 2 || j >= N - 1
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            return arr[i, jp1, k] - arr[i, j0, k]
+        elseif j <= 4 || j >= N - 3
+            jm1 = clamp(j-1, 1, N)
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            jp2 = clamp(j+2, 1, N)
+            return (9.0 * (arr[i, jp1, k] - arr[i, j0, k]) / 8.0) - 
+                   (1.0 * (arr[i, jp2, k] - arr[i, jm1, k]) / 24.0)
+        else
+            jm2 = clamp(j-2, 1, N)
+            jm1 = clamp(j-1, 1, N)
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            jp2 = clamp(j+2, 1, N)
+            jp3 = clamp(j+3, 1, N)
+            return (75.0 * (arr[i, jp1, k] - arr[i, j0, k]) / 64.0) - 
+                   (25.0 * (arr[i, jp2, k] - arr[i, jm1, k]) / 384.0) + 
+                   (3.0 * (arr[i, jp3, k] - arr[i, jm2, k]) / 640.0)
+        end
     end
 
     @inline function deriv_k(arr, i, j, k, N)
-        km2 = clamp(k-2, 1, N)
-        km1 = clamp(k-1, 1, N)
-        k0  = clamp(k,   1, N)
-        kp1 = clamp(k+1, 1, N)
-        kp2 = clamp(k+2, 1, N)
-        kp3 = clamp(k+3, 1, N)
-        return (75.0 * (arr[i, j, kp1] - arr[i, j, k0]) / 64.0) - 
-               (25.0 * (arr[i, j, kp2] - arr[i, j, km1]) / 384.0) + 
-               (3.0 * (arr[i, j, kp3] - arr[i, j, km2]) / 640.0)
+        if k <= 2 || k >= N - 1
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            return arr[i, j, kp1] - arr[i, j, k0]
+        elseif k <= 4 || k >= N - 3
+            km1 = clamp(k-1, 1, N)
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            kp2 = clamp(k+2, 1, N)
+            return (9.0 * (arr[i, j, kp1] - arr[i, j, k0]) / 8.0) - 
+                   (1.0 * (arr[i, j, kp2] - arr[i, j, km1]) / 24.0)
+        else
+            km2 = clamp(k-2, 1, N)
+            km1 = clamp(k-1, 1, N)
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            kp2 = clamp(k+2, 1, N)
+            kp3 = clamp(k+3, 1, N)
+            return (75.0 * (arr[i, j, kp1] - arr[i, j, k0]) / 64.0) - 
+                   (25.0 * (arr[i, j, kp2] - arr[i, j, km1]) / 384.0) + 
+                   (3.0 * (arr[i, j, kp3] - arr[i, j, km2]) / 640.0)
+        end
     end
 
     # ── CMD6 Midpoint Interpolation Operators ──
     @inline function interp_i(arr, i, j, k, N)
-        im2 = clamp(i-2, 1, N)
-        im1 = clamp(i-1, 1, N)
-        i0  = clamp(i,   1, N)
-        ip1 = clamp(i+1, 1, N)
-        ip2 = clamp(i+2, 1, N)
-        ip3 = clamp(i+3, 1, N)
-        return (75.0 * (arr[ip1, j, k] + arr[i0, j, k]) / 128.0) - 
-               (25.0 * (arr[ip2, j, k] + arr[im1, j, k]) / 256.0) + 
-               (3.0 * (arr[ip3, j, k] + arr[im2, j, k]) / 256.0)
+        if i <= 2 || i >= N - 1
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            return 0.5 * (arr[ip1, j, k] + arr[i0, j, k])
+        elseif i <= 4 || i >= N - 3
+            im1 = clamp(i-1, 1, N)
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            ip2 = clamp(i+2, 1, N)
+            return (9.0 * (arr[ip1, j, k] + arr[i0, j, k]) / 16.0) - 
+                   (1.0 * (arr[ip2, j, k] + arr[im1, j, k]) / 16.0)
+        else
+            im2 = clamp(i-2, 1, N)
+            im1 = clamp(i-1, 1, N)
+            i0  = clamp(i,   1, N)
+            ip1 = clamp(i+1, 1, N)
+            ip2 = clamp(i+2, 1, N)
+            ip3 = clamp(i+3, 1, N)
+            return (75.0 * (arr[ip1, j, k] + arr[i0, j, k]) / 128.0) - 
+                   (25.0 * (arr[ip2, j, k] + arr[im1, j, k]) / 256.0) + 
+                   (3.0 * (arr[ip3, j, k] + arr[im2, j, k]) / 256.0)
+        end
     end
 
     @inline function interp_j(arr, i, j, k, N)
-        jm2 = clamp(j-2, 1, N)
-        jm1 = clamp(j-1, 1, N)
-        j0  = clamp(j,   1, N)
-        jp1 = clamp(j+1, 1, N)
-        jp2 = clamp(j+2, 1, N)
-        jp3 = clamp(j+3, 1, N)
-        return (75.0 * (arr[i, jp1, k] + arr[i, j0, k]) / 128.0) - 
-               (25.0 * (arr[i, jp2, k] + arr[i, jm1, k]) / 256.0) + 
-               (3.0 * (arr[i, jp3, k] + arr[i, jm2, k]) / 256.0)
+        if j <= 2 || j >= N - 1
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            return 0.5 * (arr[i, jp1, k] + arr[i, j0, k])
+        elseif j <= 4 || j >= N - 3
+            jm1 = clamp(j-1, 1, N)
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            jp2 = clamp(j+2, 1, N)
+            return (9.0 * (arr[i, jp1, k] + arr[i, j0, k]) / 16.0) - 
+                   (1.0 * (arr[i, jp2, k] + arr[i, jm1, k]) / 16.0)
+        else
+            jm2 = clamp(j-2, 1, N)
+            jm1 = clamp(j-1, 1, N)
+            j0  = clamp(j,   1, N)
+            jp1 = clamp(j+1, 1, N)
+            jp2 = clamp(j+2, 1, N)
+            jp3 = clamp(j+3, 1, N)
+            return (75.0 * (arr[i, jp1, k] + arr[i, j0, k]) / 128.0) - 
+                   (25.0 * (arr[i, jp2, k] + arr[i, jm1, k]) / 256.0) + 
+                   (3.0 * (arr[i, jp3, k] + arr[i, jm2, k]) / 256.0)
+        end
     end
 
     @inline function interp_k(arr, i, j, k, N)
-        km2 = clamp(k-2, 1, N)
-        km1 = clamp(k-1, 1, N)
-        k0  = clamp(k,   1, N)
-        kp1 = clamp(k+1, 1, N)
-        kp2 = clamp(k+2, 1, N)
-        kp3 = clamp(k+3, 1, N)
-        return (75.0 * (arr[i, j, kp1] + arr[i, j, k0]) / 128.0) - 
-               (25.0 * (arr[i, j, kp2] + arr[i, j, km1]) / 256.0) + 
-               (3.0 * (arr[i, j, kp3] + arr[i, j, km2]) / 256.0)
+        if k <= 2 || k >= N - 1
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            return 0.5 * (arr[i, j, kp1] + arr[i, j, k0])
+        elseif k <= 4 || k >= N - 3
+            km1 = clamp(k-1, 1, N)
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            kp2 = clamp(k+2, 1, N)
+            return (9.0 * (arr[i, j, kp1] + arr[i, j, k0]) / 16.0) - 
+                   (1.0 * (arr[i, j, kp2] + arr[i, j, km1]) / 16.0)
+        else
+            km2 = clamp(k-2, 1, N)
+            km1 = clamp(k-1, 1, N)
+            k0  = clamp(k,   1, N)
+            kp1 = clamp(k+1, 1, N)
+            kp2 = clamp(k+2, 1, N)
+            kp3 = clamp(k+3, 1, N)
+            return (75.0 * (arr[i, j, kp1] + arr[i, j, k0]) / 128.0) - 
+                   (25.0 * (arr[i, j, kp2] + arr[i, j, km1]) / 256.0) + 
+                   (3.0 * (arr[i, j, kp3] + arr[i, j, km2]) / 256.0)
+        end
     end
 
     # ── CMD6 Face Interpolation Helpers ──
@@ -669,6 +891,12 @@ function compute_fvm_metrics_runtime(x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int
         V[i,j,k] = one(FT) / (abs(vol) + FT(1e-30))
     end
     
+    _enforce_periodic_metric_ghosts!(
+        Ai, nxi, nyi, nzi,
+        Aj, nxj, nyj, nzj,
+        Ak, nxk, nyk, nzk, V,
+        Nx, Ny, Nz, NG, periodic,
+    )
     return Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V
 end
 
@@ -701,27 +929,41 @@ Cache filename includes block AND rank position AND local grid size to prevent r
 """
 function load_or_compute_metrics(bid::Int, rx::Int, ry::Int, rz::Int,
                                   x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
-                                  cache_metrics::Bool=true)
+                                  cache_metrics::Bool=true,
+                                  periodic=(false, false, false))
     _mesh_base_mc = isdefined(Main, :mesh_dir) ? mesh_dir : "MESH"
-    cache_path = joinpath(_mesh_base_mc, "metrics_cache_b$(bid)_r$(rx)_$(ry)_$(rz)_dims$(Nx)x$(Ny)x$(Nz).h5")
+    periodic_key = join(Int(flag) for flag in periodic)
+    cache_path = joinpath(
+        _mesh_base_mc,
+        "metrics_cache_b$(bid)_r$(rx)_$(ry)_$(rz)_dims$(Nx)x$(Ny)x$(Nz)_p$(periodic_key).h5",
+    )
     mesh_path  = joinpath(_mesh_base_mc, "mesh_b$bid.h5")
+    metric_sources = (
+        @__FILE__,
+        joinpath(@__DIR__, "mpi.jl"),
+        joinpath(@__DIR__, "ct_sync.jl"),
+    )
     
     # Check if valid cache exists
-    if cache_metrics && isfile(cache_path) && mtime(cache_path) > mtime(mesh_path)
+    cache_newer_than_inputs = isfile(cache_path) &&
+        mtime(cache_path) > mtime(mesh_path) &&
+        all(source -> isfile(source) && mtime(cache_path) > mtime(source),
+            metric_sources)
+    if cache_metrics && cache_newer_than_inputs
         println("    Loading cached metrics from $cache_path")
-        return load_metrics_from_h5(cache_path)
+        metrics = load_metrics_from_h5(cache_path)
+        _enforce_periodic_metric_ghosts!(
+            metrics..., Nx, Ny, Nz, NG, periodic,
+        )
+        return cache_path, false, metrics...
     end
     
     # Compute at runtime
     println("    Computing metrics at runtime for block $bid rank ($rx,$ry,$rz)...")
     Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V = 
-        compute_fvm_metrics_runtime(x, y, z, Nx, Ny, Nz, NG)
+        compute_fvm_metrics_runtime(
+            x, y, z, Nx, Ny, Nz, NG; periodic=periodic,
+        )
     
-    # Save cache for next run
-    if cache_metrics
-        println("    Saving metrics cache to $cache_path")
-        save_metrics_to_h5(cache_path, Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V)
-    end
-    
-    return Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V
+    return cache_path, true, Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V
 end

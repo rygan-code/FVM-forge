@@ -6,38 +6,67 @@ using StaticArrays
 using Printf
 
 """
-    estimate_gpu_memory_per_rank(Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim)
+    estimate_gpu_memory_per_rank(
+        Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim;
+        ct_weno7=false, bytes_per_float=4,
+    )
 
 Estimate GPU memory usage (in bytes) for a single rank handling a subdomain
 of block (Nx, Ny, Nz) partitioned into (px, py, pz).
 
 Memory components:
   - Block arrays: Q(Nprim), U(Ncons), Un(Nprim), ϕ(1), Vol(1), LTS_dt(1),
-    x/y/z(3), Area_i/j/k(3), nx/ny/nz per i/j/k(9), Ωx/Ωy/Ωz(3) = 26 scalar fields
+    x/y/z(3), Area_i/j/k(3), nx/ny/nz per i/j/k(9) = 23 scalar fields
   - MPI buffers (GPU-side): 6 send+recv × NG slabs × Nprim
   - Shared flux buffers: Fx/Fy/Fz/Fvx/Fvy/Fvz(6) × Ncons + dU_forced(Ncons)
 """
-function estimate_gpu_memory_per_rank(Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim)
+function _validate_bytes_per_float(bytes_per_float)
+    if !(bytes_per_float isa Integer) || bytes_per_float isa Bool ||
+       !(bytes_per_float in (4, 8))
+        throw(ArgumentError(
+            "bytes_per_float must be 4 (Float32) or 8 (Float64), " *
+            "got $bytes_per_float",
+        ))
+    end
+    return Int(bytes_per_float)
+end
+
+@inline function _auto_partition_ct_weno7_default(config::Module=@__MODULE__)
+    return isdefined(config, :ct_emf_scheme) &&
+           isdefined(config, :CT_EMF_WENO7_SG07) &&
+           getfield(config, :ct_emf_scheme) ==
+               getfield(config, :CT_EMF_WENO7_SG07)
+end
+
+@inline function _auto_partition_bytes_per_float_default(
+    config::Module=@__MODULE__,
+)
+    return isdefined(config, :FT) ? sizeof(getfield(config, :FT)) : 4
+end
+
+function estimate_gpu_memory_per_rank(
+    Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim;
+    ct_weno7=false, bytes_per_float=4,
+)::Int
+    float_bytes = _validate_bytes_per_float(bytes_per_float)
     # Local subdomain size (including ghost cells)
     nx_local = cld(Nx, px) + 2*NG
     ny_local = cld(Ny, py) + 2*NG
     nz_local = cld(Nz, pz) + 2*NG
     
     ncells = nx_local * ny_local * nz_local
-    sizeof_f32 = 4  # Float32 = 4 bytes
-    
     # 4D arrays: Q(Nprim) + U(Ncons) + Un(Nprim) = Nprim + Ncons + Nprim
-    mem_4d = ncells * (Nprim + Ncons + Nprim) * sizeof_f32
+    mem_4d = ncells * (Nprim + Ncons + Nprim) * float_bytes
     
-    # 3D arrays: ϕ, Vol, LTS_dt, x, y, z, Areai/j/k, nxi/nyi/nzi * 3, Ωx/Ωy/Ωz
-    # = 1 + 1 + 1 + 3 + 3 + 9 + 3 = 21 scalar fields
-    mem_3d = ncells * 21 * sizeof_f32
+    # 3D arrays: ϕ, Vol, LTS_dt, x, y, z, Areai/j/k, nxi/nyi/nzi * 3
+    # = 1 + 1 + 1 + 3 + 3 + 9 = 18 scalar fields
+    mem_3d = ncells * 18 * float_bytes
     
     # MPI GPU buffers (send + recv, 2 per direction, 3 directions, GPU side only)
     # x-slabs: NG × ny_local × nz_local × Nprim × 2(send+recv)
     # y-slabs: nx_local × NG × nz_local × Nprim × 2
     # z-slabs: nx_local × ny_local × NG × Nprim × 2
-    mem_mpi = 2 * sizeof_f32 * Nprim * (
+    mem_mpi = 2 * float_bytes * Nprim * (
         NG * ny_local * nz_local +
         nx_local * NG * nz_local +
         nx_local * ny_local * NG
@@ -46,7 +75,7 @@ function estimate_gpu_memory_per_rank(Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim)
     # Shared flux buffers (allocated once, sized to max local block)
     # 6 flux arrays × (nx+1) × ny × nz × Ncons + dU_forced
     nx_r = cld(Nx, px); ny_r = cld(Ny, py); nz_r = cld(Nz, pz)
-    mem_flux = sizeof_f32 * Ncons * (
+    mem_flux = float_bytes * Ncons * (
         (nx_r+1)*ny_r*nz_r +  # Fx
         nx_r*(ny_r+1)*nz_r +  # Fy
         nx_r*ny_r*(nz_r+1) +  # Fz
@@ -56,7 +85,21 @@ function estimate_gpu_memory_per_rank(Nx, Ny, Nz, px, py, pz, NG, Ncons, Nprim)
         nx_r*ny_r*nz_r         # dU_forced
     )
     
-    return mem_4d + mem_3d + mem_mpi + mem_flux
+    mem_weno7 = if ct_weno7
+        face_cache_values = 4 * (
+            (nx_r+1)*(ny_r+2NG)*(nz_r+2NG) +
+            (nx_r+2NG)*(ny_r+1)*(nz_r+2NG) +
+            (nx_r+2NG)*(ny_r+2NG)*(nz_r+1)
+        )
+        point_scratch_values =
+            (nx_r+2NG+1)*(ny_r+2NG+1)*(nz_r+2NG+1)
+        float_bytes*(face_cache_values + point_scratch_values + 1) +
+            sizeof(Int32)*8
+    else
+        0
+    end
+
+    return Int(mem_4d + mem_3d + mem_mpi + mem_flux + mem_weno7)
 end
 
 """
@@ -123,7 +166,13 @@ Algorithm:
 2. For each block, find optimal (px, py, pz) factorization
 3. Estimate GPU memory per rank and warn if exceeding threshold
 """
-function auto_partition(Nx_b, Ny_b, Nz_b, N_gpus; NG=4, Ncons=5, Nprim=6, verbose=true, gpu_vram_gb=16.0)
+function auto_partition(
+    Nx_b, Ny_b, Nz_b, N_gpus;
+    NG=4, Ncons=5, Nprim=6, verbose=true, gpu_vram_gb=16.0,
+    ct_weno7=_auto_partition_ct_weno7_default(),
+    bytes_per_float=_auto_partition_bytes_per_float_default(),
+)
+    _validate_bytes_per_float(bytes_per_float)
     Nblocks = length(Nx_b)
     cells = [Nx_b[i] * Ny_b[i] * Nz_b[i] for i in 1:Nblocks]
     
@@ -220,7 +269,11 @@ function auto_partition(Nx_b, Ny_b, Nz_b, N_gpus; NG=4, Ncons=5, Nprim=6, verbos
         
         for i in 1:Nblocks
             px, py, pz = partitions[i]
-            mem = estimate_gpu_memory_per_rank(Nx_b[i], Ny_b[i], Nz_b[i], px, py, pz, NG, Ncons, Nprim)
+            mem = estimate_gpu_memory_per_rank(
+                Nx_b[i], Ny_b[i], Nz_b[i], px, py, pz,
+                NG, Ncons, Nprim;
+                ct_weno7=ct_weno7, bytes_per_float=bytes_per_float,
+            )
             mem_gb = mem / 1024^3
             status = mem < gpu_vram_bytes * 0.8 ? "✓" : (mem < gpu_vram_bytes ? "⚠ tight" : "✗ OOM!")
             grid_str = "$(Nx_b[i])×$(Ny_b[i])×$(Nz_b[i])"
@@ -230,8 +283,12 @@ function auto_partition(Nx_b, Ny_b, Nz_b, N_gpus; NG=4, Ncons=5, Nprim=6, verbos
         end
         
         total_mem_max = maximum(
-            estimate_gpu_memory_per_rank(Nx_b[i], Ny_b[i], Nz_b[i], 
-                partitions[i][1], partitions[i][2], partitions[i][3], NG, Ncons, Nprim)
+            estimate_gpu_memory_per_rank(
+                Nx_b[i], Ny_b[i], Nz_b[i],
+                partitions[i][1], partitions[i][2], partitions[i][3],
+                NG, Ncons, Nprim;
+                ct_weno7=ct_weno7, bytes_per_float=bytes_per_float,
+            )
             for i in 1:Nblocks
         ) / 1024^3
         println("  ├─────────────────────────────────────────────────────────────────────")

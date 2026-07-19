@@ -93,11 +93,18 @@ end
 function viscous_flux_i(Q, Fv_x,
         Areai, Areaj, Areak,
         nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
-        Vol, nxp, nyp, nzp, is_inter)
+        Vol, nxp, nyp, nzp, is_inter, resistive_only)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG || j < NG+1 || k < NG+1
+    @static if ct_mode
+        j_lo = NG; j_hi = nyp+NG+1
+        k_lo = NG; k_hi = nzp+NG+1
+    else
+        j_lo = NG+1; j_hi = nyp+NG
+        k_lo = NG+1; k_hi = nzp+NG
+    end
+    if i > nxp+NG || j > j_hi || k > k_hi || i < NG || j < j_lo || k < k_lo
         return
     end
     near_inter_j = (is_inter[3] && j <= NG + 2) || (is_inter[4] && j >= nyp + NG - 1)
@@ -123,7 +130,9 @@ function viscous_flux_i(Q, Fv_x,
         zetay = FT(0.25) * (nyk[iL,j,k]*Areak[iL,j,k] + nyk[iL,j,k+1]*Areak[iL,j,k+1] + nyk[iR,j,k]*Areak[iR,j,k] + nyk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
         zetaz = FT(0.25) * (nzk[iL,j,k]*Areak[iL,j,k] + nzk[iL,j,k+1]*Areak[iL,j,k+1] + nzk[iR,j,k]*Areak[iR,j,k] + nzk[iR,j,k+1]*Areak[iR,j,k+1]) * Vf_inv
     end
-    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    resistive_flux_active = resistive &&
+        (ct_resistive_main_explicit || resistive_only)
+    mu = viscous && !resistive_only ? get_viscosity(T_f) : zero(FT); kappa = mu * Cp / Pr
     @inbounds begin
         dudeta = zero(FT); dvdeta = zero(FT); dwdeta = zero(FT); dTdeta = zero(FT)
         dudzeta = zero(FT); dvdzeta = zero(FT); dwdzeta = zero(FT); dTdzeta = zero(FT)
@@ -159,7 +168,7 @@ function viscous_flux_i(Q, Fv_x,
             dTdzetaL=gradCell(Q[iL,j,k-3,6],Q[iL,j,k-2,6],Q[iL,j,k-1,6],Q[iL,j,k+1,6],Q[iL,j,k+2,6],Q[iL,j,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[iR,j,k-3,6],Q[iR,j,k-2,6],Q[iR,j,k-1,6],Q[iR,j,k+1,6],Q[iR,j,k+2,6],Q[iR,j,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
         end
         @static if equation_type == :MHD
-            if resistive
+            if resistive_flux_active
                 dBxdxi = gradFace(Q[i-2,j,k,7],Q[i-1,j,k,7],Q[i,j,k,7],Q[i+1,j,k,7],Q[i+2,j,k,7],Q[i+3,j,k,7], FT(1.0))
                 dBydxi = gradFace(Q[i-2,j,k,8],Q[i-1,j,k,8],Q[i,j,k,8],Q[i+1,j,k,8],Q[i+2,j,k,8],Q[i+3,j,k,8], FT(1.0))
                 dBzdxi = gradFace(Q[i-2,j,k,9],Q[i-1,j,k,9],Q[i,j,k,9],Q[i+1,j,k,9],Q[i+2,j,k,9],Q[i+3,j,k,9], FT(1.0))
@@ -190,7 +199,8 @@ function viscous_flux_i(Q, Fv_x,
     dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
     dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
     # GG correction: blend in physical-space gradients for cross-derivatives
-    local_gg_blend = (near_inter_j || near_inter_k) ? zero(FT) : gg_blend
+    tangential_halo = j < NG+1 || j > nyp+NG || k < NG+1 || k > nzp+NG
+    local_gg_blend = (near_inter_j || near_inter_k || tangential_halo) ? zero(FT) : gg_blend
     if local_gg_blend > zero(FT) && iR <= nxp+NG
         # GG at real cell iR (skip if iR is a ghost cell)
         gg = gg_cell_all(iR,j,k, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
@@ -208,7 +218,7 @@ function viscous_flux_i(Q, Fv_x,
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
             dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
             dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
@@ -225,18 +235,23 @@ function viscous_flux_i(Q, Fv_x,
     end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             fv_E += fres_E
         end
     end
+    @static if ct_mode
+        fi = i-NG+1; fj = j-NG+1; fk = k-NG+1
+    else
+        fi = i-NG+1; fj = j-NG; fk = k-NG
+    end
     @inbounds begin
-        Fv_x[i-NG+1,j-NG,k-NG,1]=FT(0e0); Fv_x[i-NG+1,j-NG,k-NG,2]=fv_rhou*area
-        Fv_x[i-NG+1,j-NG,k-NG,3]=fv_rhov*area; Fv_x[i-NG+1,j-NG,k-NG,4]=fv_rhow*area; Fv_x[i-NG+1,j-NG,k-NG,5]=fv_E*area
+        Fv_x[fi,fj,fk,1]=FT(0e0); Fv_x[fi,fj,fk,2]=fv_rhou*area
+        Fv_x[fi,fj,fk,3]=fv_rhov*area; Fv_x[fi,fj,fk,4]=fv_rhow*area; Fv_x[fi,fj,fk,5]=fv_E*area
         @static if equation_type == :MHD
-            Fv_x[i-NG+1,j-NG,k-NG,6] = resistive ? fres_Bx * area : zero(FT)
-            Fv_x[i-NG+1,j-NG,k-NG,7] = resistive ? fres_By * area : zero(FT)
-            Fv_x[i-NG+1,j-NG,k-NG,8] = resistive ? fres_Bz * area : zero(FT)
-            Fv_x[i-NG+1,j-NG,k-NG,9] = zero(FT)
+            Fv_x[fi,fj,fk,6] = resistive_flux_active ? fres_Bx * area : zero(FT)
+            Fv_x[fi,fj,fk,7] = resistive_flux_active ? fres_By * area : zero(FT)
+            Fv_x[fi,fj,fk,8] = resistive_flux_active ? fres_Bz * area : zero(FT)
+            Fv_x[fi,fj,fk,9] = zero(FT)
         end
     end
     return
@@ -246,11 +261,18 @@ end
 function viscous_flux_j(Q, Fv_y,
         Areai, Areaj, Areak,
         nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
-        Vol, nxp, nyp, nzp, is_inter)
+        Vol, nxp, nyp, nzp, is_inter, resistive_only)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG || k < NG+1
+    @static if ct_mode
+        i_lo = NG; i_hi = nxp+NG+1
+        k_lo = NG; k_hi = nzp+NG+1
+    else
+        i_lo = NG+1; i_hi = nxp+NG
+        k_lo = NG+1; k_hi = nzp+NG
+    end
+    if i > i_hi || j > nyp+NG || k > k_hi || i < i_lo || j < NG || k < k_lo
         return
     end
     near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
@@ -276,7 +298,9 @@ function viscous_flux_j(Q, Fv_y,
         zetay = FT(0.25) * (nyk[i,jL,k]*Areak[i,jL,k] + nyk[i,jL,k+1]*Areak[i,jL,k+1] + nyk[i,jR,k]*Areak[i,jR,k] + nyk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
         zetaz = FT(0.25) * (nzk[i,jL,k]*Areak[i,jL,k] + nzk[i,jL,k+1]*Areak[i,jL,k+1] + nzk[i,jR,k]*Areak[i,jR,k] + nzk[i,jR,k+1]*Areak[i,jR,k+1]) * Vf_inv
     end
-    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    resistive_flux_active = resistive &&
+        (ct_resistive_main_explicit || resistive_only)
+    mu = viscous && !resistive_only ? get_viscosity(T_f) : zero(FT); kappa = mu * Cp / Pr
     @inbounds begin
         dudxi = zero(FT); dvdxi = zero(FT); dwdxi = zero(FT); dTdxi = zero(FT)
         dudzeta = zero(FT); dvdzeta = zero(FT); dwdzeta = zero(FT); dTdzeta = zero(FT)
@@ -312,7 +336,7 @@ function viscous_flux_j(Q, Fv_y,
             dTdzetaL=gradCell(Q[i,jL,k-3,6],Q[i,jL,k-2,6],Q[i,jL,k-1,6],Q[i,jL,k+1,6],Q[i,jL,k+2,6],Q[i,jL,k+3,6],FT(1.0));dTdzetaR=gradCell(Q[i,jR,k-3,6],Q[i,jR,k-2,6],Q[i,jR,k-1,6],Q[i,jR,k+1,6],Q[i,jR,k+2,6],Q[i,jR,k+3,6],FT(1.0));dTdzeta=FT(0.5)*(dTdzetaL+dTdzetaR)
         end
         @static if equation_type == :MHD
-            if resistive
+            if resistive_flux_active
                 dBxdeta = gradFace(Q[i,j-2,k,7],Q[i,j-1,k,7],Q[i,j,k,7],Q[i,j+1,k,7],Q[i,j+2,k,7],Q[i,j+3,k,7], FT(1.0))
                 dBydeta = gradFace(Q[i,j-2,k,8],Q[i,j-1,k,8],Q[i,j,k,8],Q[i,j+1,k,8],Q[i,j+2,k,8],Q[i,j+3,k,8], FT(1.0))
                 dBzdeta = gradFace(Q[i,j-2,k,9],Q[i,j-1,k,9],Q[i,j,k,9],Q[i,j+1,k,9],Q[i,j+2,k,9],Q[i,j+3,k,9], FT(1.0))
@@ -343,7 +367,8 @@ function viscous_flux_j(Q, Fv_y,
     dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
     dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
     # GG correction for cross-derivatives (including wall faces)
-    local_gg_blend = (near_inter_i || near_inter_k) ? zero(FT) : gg_blend
+    tangential_halo = i < NG+1 || i > nxp+NG || k < NG+1 || k > nzp+NG
+    local_gg_blend = (near_inter_i || near_inter_k || tangential_halo) ? zero(FT) : gg_blend
     if local_gg_blend > zero(FT) && jR <= nyp+NG
         # GG at real cell jR (skip if jR is a ghost cell)
         gg = gg_cell_all(i,jR,k, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
@@ -359,7 +384,7 @@ function viscous_flux_j(Q, Fv_y,
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
             dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
             dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
@@ -376,18 +401,23 @@ function viscous_flux_j(Q, Fv_y,
     end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             fv_E += fres_E
         end
     end
+    @static if ct_mode
+        fi = i-NG+1; fj = j-NG+1; fk = k-NG+1
+    else
+        fi = i-NG; fj = j-NG+1; fk = k-NG
+    end
     @inbounds begin
-        Fv_y[i-NG,j-NG+1,k-NG,1]=FT(0e0); Fv_y[i-NG,j-NG+1,k-NG,2]=fv_rhou*area
-        Fv_y[i-NG,j-NG+1,k-NG,3]=fv_rhov*area; Fv_y[i-NG,j-NG+1,k-NG,4]=fv_rhow*area; Fv_y[i-NG,j-NG+1,k-NG,5]=fv_E*area
+        Fv_y[fi,fj,fk,1]=FT(0e0); Fv_y[fi,fj,fk,2]=fv_rhou*area
+        Fv_y[fi,fj,fk,3]=fv_rhov*area; Fv_y[fi,fj,fk,4]=fv_rhow*area; Fv_y[fi,fj,fk,5]=fv_E*area
         @static if equation_type == :MHD
-            Fv_y[i-NG,j-NG+1,k-NG,6] = resistive ? fres_Bx * area : zero(FT)
-            Fv_y[i-NG,j-NG+1,k-NG,7] = resistive ? fres_By * area : zero(FT)
-            Fv_y[i-NG,j-NG+1,k-NG,8] = resistive ? fres_Bz * area : zero(FT)
-            Fv_y[i-NG,j-NG+1,k-NG,9] = zero(FT)
+            Fv_y[fi,fj,fk,6] = resistive_flux_active ? fres_Bx * area : zero(FT)
+            Fv_y[fi,fj,fk,7] = resistive_flux_active ? fres_By * area : zero(FT)
+            Fv_y[fi,fj,fk,8] = resistive_flux_active ? fres_Bz * area : zero(FT)
+            Fv_y[fi,fj,fk,9] = zero(FT)
         end
     end
     return
@@ -397,11 +427,18 @@ end
 function viscous_flux_k(Q, Fv_z,
         Areai, Areaj, Areak,
         nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk,
-        Vol, nxp, nyp, nzp, is_inter)
+        Vol, nxp, nyp, nzp, is_inter, resistive_only)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp+NG || j > nyp+NG || k > nzp+NG || i < NG+1 || j < NG+1 || k < NG
+    @static if ct_mode
+        i_lo = NG; i_hi = nxp+NG+1
+        j_lo = NG; j_hi = nyp+NG+1
+    else
+        i_lo = NG+1; i_hi = nxp+NG
+        j_lo = NG+1; j_hi = nyp+NG
+    end
+    if i > i_hi || j > j_hi || k > nzp+NG || i < i_lo || j < j_lo || k < NG
         return
     end
     near_inter_i = (is_inter[1] && i <= NG + 2) || (is_inter[2] && i >= nxp + NG - 1)
@@ -427,7 +464,9 @@ function viscous_flux_k(Q, Fv_z,
         zetay = nyk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
         zetaz = nzk[i,j,k+1] * Areak[i,j,k+1] * Vf_inv
     end
-    mu = get_viscosity(T_f); kappa = mu * Cp / Pr
+    resistive_flux_active = resistive &&
+        (ct_resistive_main_explicit || resistive_only)
+    mu = viscous && !resistive_only ? get_viscosity(T_f) : zero(FT); kappa = mu * Cp / Pr
     @inbounds begin
         dudxi = zero(FT); dvdxi = zero(FT); dwdxi = zero(FT); dTdxi = zero(FT)
         dudeta = zero(FT); dvdeta = zero(FT); dwdeta = zero(FT); dTdeta = zero(FT)
@@ -463,7 +502,7 @@ function viscous_flux_k(Q, Fv_z,
             dTdetaL=gradCell(Q[i,j-3,kL,6],Q[i,j-2,kL,6],Q[i,j-1,kL,6],Q[i,j+1,kL,6],Q[i,j+2,kL,6],Q[i,j+3,kL,6],FT(1.0));dTdetaR=gradCell(Q[i,j-3,kR,6],Q[i,j-2,kR,6],Q[i,j-1,kR,6],Q[i,j+1,kR,6],Q[i,j+2,kR,6],Q[i,j+3,kR,6],FT(1.0));dTdeta=FT(0.5)*(dTdetaL+dTdetaR)
         end
         @static if equation_type == :MHD
-            if resistive
+            if resistive_flux_active
                 dBxdzeta = gradFace(Q[i,j,k-2,7],Q[i,j,k-1,7],Q[i,j,k,7],Q[i,j,k+1,7],Q[i,j,k+2,7],Q[i,j,k+3,7], FT(1.0))
                 dBydzeta = gradFace(Q[i,j,k-2,8],Q[i,j,k-1,8],Q[i,j,k,8],Q[i,j,k+1,8],Q[i,j,k+2,8],Q[i,j,k+3,8], FT(1.0))
                 dBzdzeta = gradFace(Q[i,j,k-2,9],Q[i,j,k-1,9],Q[i,j,k,9],Q[i,j,k+1,9],Q[i,j,k+2,9],Q[i,j,k+3,9], FT(1.0))
@@ -494,7 +533,8 @@ function viscous_flux_k(Q, Fv_z,
     dwdx = xix*dwdxi + etax*dwdeta + zetax*dwdzeta; dwdy = xiy*dwdxi + etay*dwdeta + zetay*dwdzeta; dwdz = xiz*dwdxi + etaz*dwdeta + zetaz*dwdzeta
     dTdx = xix*dTdxi + etax*dTdeta + zetax*dTdzeta; dTdy = xiy*dTdxi + etay*dTdeta + zetay*dTdzeta; dTdz = xiz*dTdxi + etaz*dTdeta + zetaz*dTdzeta
     # GG correction for cross-derivatives (including wall faces)
-    local_gg_blend = (near_inter_i || near_inter_j) ? zero(FT) : gg_blend
+    tangential_halo = i < NG+1 || i > nxp+NG || j < NG+1 || j > nyp+NG
+    local_gg_blend = (near_inter_i || near_inter_j || tangential_halo) ? zero(FT) : gg_blend
     if local_gg_blend > zero(FT) && kR <= nzp+NG
         # GG at real cell kR (skip if kR is a ghost cell)
         gg = gg_cell_all(i,j,kR, Q, Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,Vol)
@@ -510,7 +550,7 @@ function viscous_flux_k(Q, Fv_z,
     fv_rhou=tau_xx*fnx+tau_xy*fny+tau_xz*fnz; fv_rhov=tau_xy*fnx+tau_yy*fny+tau_yz*fnz; fv_rhow=tau_xz*fnx+tau_yz*fny+tau_zz*fnz
     qx=-kappa*dTdx; qy=-kappa*dTdy; qz=-kappa*dTdz
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             dBxdx = xix*dBxdxi + etax*dBxdeta + zetax*dBxdzeta; dBxdy = xiy*dBxdxi + etay*dBxdeta + zetay*dBxdzeta; dBxdz = xiz*dBxdxi + etaz*dBxdeta + zetaz*dBxdzeta
             dBydx = xix*dBydxi + etax*dBydeta + zetax*dBydzeta; dBydy = xiy*dBydxi + etay*dBydeta + zetay*dBydzeta; dBydz = xiz*dBydxi + etaz*dBydeta + zetaz*dBydzeta
             dBzdx = xix*dBzdxi + etax*dBzdeta + zetax*dBzdzeta; dBzdy = xiy*dBzdxi + etay*dBzdeta + zetay*dBzdzeta; dBzdz = xiz*dBzdxi + etaz*dBzdeta + zetaz*dBzdzeta
@@ -527,18 +567,23 @@ function viscous_flux_k(Q, Fv_z,
     end
     fv_E=(fv_rhou*u_f+fv_rhov*v_f+fv_rhow*w_f)-(qx*fnx+qy*fny+qz*fnz)
     @static if equation_type == :MHD
-        if resistive
+        if resistive_flux_active
             fv_E += fres_E
         end
     end
+    @static if ct_mode
+        fi = i-NG+1; fj = j-NG+1; fk = k-NG+1
+    else
+        fi = i-NG; fj = j-NG; fk = k-NG+1
+    end
     @inbounds begin
-        Fv_z[i-NG,j-NG,k-NG+1,1]=FT(0e0); Fv_z[i-NG,j-NG,k-NG+1,2]=fv_rhou*area
-        Fv_z[i-NG,j-NG,k-NG+1,3]=fv_rhov*area; Fv_z[i-NG,j-NG,k-NG+1,4]=fv_rhow*area; Fv_z[i-NG,j-NG,k-NG+1,5]=fv_E*area
+        Fv_z[fi,fj,fk,1]=FT(0e0); Fv_z[fi,fj,fk,2]=fv_rhou*area
+        Fv_z[fi,fj,fk,3]=fv_rhov*area; Fv_z[fi,fj,fk,4]=fv_rhow*area; Fv_z[fi,fj,fk,5]=fv_E*area
         @static if equation_type == :MHD
-            Fv_z[i-NG,j-NG,k-NG+1,6] = resistive ? fres_Bx * area : zero(FT)
-            Fv_z[i-NG,j-NG,k-NG+1,7] = resistive ? fres_By * area : zero(FT)
-            Fv_z[i-NG,j-NG,k-NG+1,8] = resistive ? fres_Bz * area : zero(FT)
-            Fv_z[i-NG,j-NG,k-NG+1,9] = zero(FT)
+            Fv_z[fi,fj,fk,6] = resistive_flux_active ? fres_Bx * area : zero(FT)
+            Fv_z[fi,fj,fk,7] = resistive_flux_active ? fres_By * area : zero(FT)
+            Fv_z[fi,fj,fk,8] = resistive_flux_active ? fres_Bz * area : zero(FT)
+            Fv_z[fi,fj,fk,9] = zero(FT)
         end
     end
     return

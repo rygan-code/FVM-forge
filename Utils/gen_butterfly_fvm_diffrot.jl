@@ -44,7 +44,6 @@ function main_diffrot()
     end
 
     # Build interpolation weights (uses rescaled coordinates)
-    build_interpolation_weights(blocks_data, out_dir)
 
     # Write mesh HDF5 files
     for bid in 0:4

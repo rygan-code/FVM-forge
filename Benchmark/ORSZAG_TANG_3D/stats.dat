@@ -1,0 +1,3 @@
+# 3D Orszag-Tang MHD turbulence diagnostics
+# step   time          dt            E_kin         E_th          E_mag         E_total       divB_cell_L2  divB_face_L2
+1       0.000000e+00  8.497724e-04  1.557023e-01  8.829985e+00  1.095211e+00  1.008090e+01  1.549745e-05  6.584504e-16

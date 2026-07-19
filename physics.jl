@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════
 # physics.jl — Equation system abstraction layer
 # ═══════════════════════════════════════════════════════════════════════
-# Defines the equation type (compressible / incompressible_AC / MHD)
+# Defines the equation type (compressible / MHD)
 # and derived constants (Ncons, Nprim). All downstream code uses these
 # compile-time constants for dispatch — zero runtime overhead.
 #
@@ -19,14 +19,76 @@ end
 @assert FT === Float32 || FT === Float64 "FT must be Float32 or Float64, got $FT"
 
 # ─── Equation system type ───
-# Must be defined as `const equation_type = :compressible` (or :incompressible_AC, :MHD)
+# Must be defined as `const equation_type = :compressible` (or :MHD)
 # in the run script BEFORE including this file.
 # If not defined, default to compressible:
 if !@isdefined(equation_type)
     const equation_type = :compressible
 end
 
+# ─── CT mode (must be before Ncons definition) ───
+# ct_mode = true: B stored on face centers only, U has 5 variables (no B, no ψ)
+# ct_mode = false: GLM with 9 variables (B + ψ in U)
+if !@isdefined(ct_mode); const ct_mode::Bool = false; end
+if !@isdefined(strict_ct_positivity)
+    const strict_ct_positivity::Bool = false
+end
+if !@isdefined(ct_initial_projection)
+    const ct_initial_projection::Bool = true
+end
+if !@isdefined(ct_initial_divb_tolerance)
+    const ct_initial_divb_tolerance::FT =
+        FT === Float32 ? FT(5.0e-5) : FT(1.0e-11)
+end
+
+const CT_EMF_SG07 = Int32(2)
+const CT_EMF_WENO7_SG07 = Int32(7)
+if !@isdefined(ct_emf_scheme)
+    const ct_emf_scheme::Int32 = CT_EMF_SG07
+end
+ct_emf_scheme in (CT_EMF_SG07, CT_EMF_WENO7_SG07) ||
+    error("Unknown ct_emf_scheme=$ct_emf_scheme")
+
+const CT_CHARACTERISTIC_PLM = Int32(2)
+const CT_CHARACTERISTIC_WENO7 = Int32(7)
+if !@isdefined(ct_characteristic_reconstruction)
+    # Keep PLM with SG07; selecting the WENO7 CT scheme upgrades both face
+    # states and edge EMFs unless a run config explicitly overrides this.
+    const ct_characteristic_reconstruction::Int32 =
+        ct_emf_scheme == CT_EMF_WENO7_SG07 ?
+        CT_CHARACTERISTIC_WENO7 : CT_CHARACTERISTIC_PLM
+end
+ct_characteristic_reconstruction in (
+    CT_CHARACTERISTIC_PLM, CT_CHARACTERISTIC_WENO7,
+) || error(
+    "Unknown ct_characteristic_reconstruction=" *
+    "$ct_characteristic_reconstruction",
+)
+
+const CT_CELL_B_LSQ2 = Int32(2)
+const CT_CELL_B_POINT6 = Int32(6)
+if !@isdefined(ct_cell_b_recovery)
+    const ct_cell_b_recovery::Int32 =
+        ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7 ?
+        CT_CELL_B_POINT6 : CT_CELL_B_LSQ2
+end
+ct_cell_b_recovery in (CT_CELL_B_LSQ2, CT_CELL_B_POINT6) ||
+    error("Unknown ct_cell_b_recovery=$ct_cell_b_recovery")
+
+const CT_PRIMITIVE_DIRECT = Int32(2)
+const CT_PRIMITIVE_POINT6 = Int32(6)
+if !@isdefined(ct_primitive_recovery)
+    const ct_primitive_recovery::Int32 =
+        ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7 ?
+        CT_PRIMITIVE_POINT6 : CT_PRIMITIVE_DIRECT
+end
+ct_primitive_recovery in (CT_PRIMITIVE_DIRECT, CT_PRIMITIVE_POINT6) ||
+    error("Unknown ct_primitive_recovery=$ct_primitive_recovery")
+
 # ─── Variable counts (compile-time constants) ───
+# Ncons always = 9 for MHD (B in U for reconstruction/Riemann compatibility)
+# CT mode: div only updates 1:5, B updated by CT from face B
+# GLM mode: div updates all 9
 const Ncons = if equation_type == :MHD
     9   # ρ, ρu, ρv, ρw, ρE, Bx, By, Bz, ψ
 else
@@ -39,6 +101,9 @@ else
     6   # ρ, u, v, w, p, T (compressible)
 end
 
+# CT mode: number of hydro variables updated by divergence (B updated by CT)
+const Nhydro = ct_mode ? 5 : Ncons
+
 # ─── MHD parameters ───
 # GLM divergence cleaning (Dedner et al. 2002):
 #   ψ-equation: ∂ψ/∂t + ch²·∇·B = -(ch²/cp²)·ψ
@@ -48,9 +113,52 @@ if !@isdefined(cr_glm);  const cr_glm::FT  = FT(0.18);  end   # GLM damping rati
 
 # Resistive MHD control (analogous to `viscous` for hydrodynamic viscosity)
 # resistive = false → ideal MHD (no magnetic diffusion)
-# resistive = true  → resistive MHD (η_mhd > 0, future phase)
+# resistive = true  → resistive MHD (η_mhd > 0), including CT edge EMFs
 if !@isdefined(resistive); const resistive::Bool = false; end
 if !@isdefined(η_mhd);    const η_mhd::FT  = FT(0.0); end   # Magnetic resistivity
+if resistive && !(isfinite(η_mhd) && η_mhd > zero(FT))
+    error("resistive MHD requires finite η_mhd > 0, got $η_mhd")
+end
+const CT_RESISTIVE_EXPLICIT = :explicit
+const CT_RESISTIVE_STS = :sts
+const CT_RESISTIVE_RKL2_STRANG = :rkl2_strang
+if !@isdefined(ct_resistive_integrator)
+    const ct_resistive_integrator::Symbol = CT_RESISTIVE_EXPLICIT
+end
+ct_resistive_integrator in (
+    CT_RESISTIVE_EXPLICIT, CT_RESISTIVE_STS, CT_RESISTIVE_RKL2_STRANG,
+) ||
+    error("Unknown ct_resistive_integrator=$ct_resistive_integrator")
+if !@isdefined(ct_sts_damping)
+    const ct_sts_damping::FT = FT(0.01)
+end
+if !@isdefined(ct_sts_max_stages)
+    const ct_sts_max_stages::Int = 64
+end
+if !@isdefined(ct_sts_safety)
+    const ct_sts_safety::FT = FT(0.9)
+end
+if !@isdefined(ct_rkl2_max_stages)
+    const ct_rkl2_max_stages::Int = 64
+end
+if !@isdefined(ct_rkl2_safety)
+    const ct_rkl2_safety::FT = FT(0.9)
+end
+if ct_resistive_integrator == CT_RESISTIVE_RKL2_STRANG
+    isfinite(ct_rkl2_safety) && zero(FT) < ct_rkl2_safety <= one(FT) ||
+        error("ct_rkl2_safety must lie in (0, 1], got $ct_rkl2_safety")
+    ct_rkl2_max_stages >= 2 || error(
+        "ct_rkl2_max_stages must be at least two, got $ct_rkl2_max_stages",
+    )
+end
+const ct_resistive_main_explicit::Bool =
+    ct_resistive_integrator == CT_RESISTIVE_EXPLICIT
+const ct_resistive_sts_active::Bool =
+    equation_type == :MHD && ct_mode && resistive &&
+    ct_resistive_integrator == CT_RESISTIVE_STS
+const ct_resistive_rkl2_active::Bool =
+    equation_type == :MHD && ct_mode && resistive &&
+    ct_resistive_integrator == CT_RESISTIVE_RKL2_STRANG
 
 # Vacuum permeability (normalized to 1 for ideal MHD in Gaussian units)
 const μ_0::FT = FT(1.0)

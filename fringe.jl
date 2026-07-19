@@ -59,41 +59,6 @@ function compute_fringe_lambda_kernel!(lambda, x, nxp, nyp, nzp,
     return
 end
 
-# ─── Non-uniform Ω assignment with fringe zone ───
-# Physical zone: Ω(x) = Ω_min + (Ω_max - Ω_min) × x / L_phys
-# Fringe zone:   Ω drops from Ω_max → Ω_min within rise_fraction of fringe length,
-#                then stays at Ω_min for the remainder (pure recovery region)
-function Assign_rotation_var_nonuniform(Ωx, Ωy, Ωz, x, y, z, nxp, nyp, nzp,
-        omega_min, omega_max, L_phys, L_total, rise_frac)
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp + 2*NG || j > nyp + 2*NG || k > nzp + 2*NG
-        return
-    end
-
-    @inbounds x_local = x[i, j, k]
-
-    if x_local <= L_phys
-        # Physical zone: linear growth from Ω_min to Ω_max
-        frac = x_local / L_phys
-        @inbounds Ωx[i, j, k] = omega_min + (omega_max - omega_min) * frac
-    else
-        # Fringe zone: smooth transition back to Ω_min
-        # Use rise_frac to complete the drop in the first portion of fringe
-        L_fringe = L_total - L_phys
-        delta_omega_drop = rise_frac * L_fringe  # Ω drops to Ω_min within this distance
-        eta = (x_local - L_phys) / delta_omega_drop
-        s = _fringe_smooth_step(FT(eta))
-        @inbounds Ωx[i, j, k] = omega_max + (omega_min - omega_max) * s
-    end
-
-    @inbounds Ωy[i, j, k] = zero(FT)
-    @inbounds Ωz[i, j, k] = zero(FT)
-
-    return
-end
-
 # ─── Fringe forcing kernel: apply λ(x)(U_target - U) ───
 # Called every RK sub-step, adds to dU_forced.
 # U_target is the precursor mean profile (only depends on y, z).

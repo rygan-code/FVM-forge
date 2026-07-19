@@ -371,8 +371,7 @@ end
 # =============================================================================
 # Direct-Copy Inter-Block Ghost Exchange (Conformal Grids)
 #
-# Replaces interp_ghost! (weight-based interpolation) with direct MPI copy.
-# For conformal grids: ghost cell = exact copy of neighbor's interior boundary.
+# Direct MPI copy for conformal grids: ghost cell = exact copy of neighbor's interior boundary.
 #
 # full_range=false: pack only real range in perpendicular direction → fills face ghost
 # full_range=true:  pack full range (incl. ghost) in perpendicular dir → fills j-k edge ghost
@@ -713,14 +712,26 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
                 local_u_dst_e = u_int_e - u_d_s + 1
                 local_v_dst_s = v_int_s - v_d_s + 1
                 local_v_dst_e = v_int_e - v_d_s + 1
-                u_pack_start = local_u_dst_s
-                u_pack_end   = local_u_dst_e + 2NG
+                if full_range
+                    # The full-range pass runs after ξ MPI exchange and must carry
+                    # the local ξ ghost columns across inter-block faces. This is
+                    # required at block-interface/rank-cut edges when a block is
+                    # split along ξ (e.g. 24-GPU production runs).
+                    u_pack_start = local_u_dst_s
+                    u_pack_end   = local_u_dst_e + 2NG
+                else
+                    u_pack_start = local_u_dst_s + NG
+                    u_pack_end   = local_u_dst_e + NG
+                end
                 u_pack_len   = u_pack_end - u_pack_start + 1
 
-                # Check if src block is local (on the same rank)
+                # Check if src block is local (on the same rank).  In standard
+                # rank-split mode `Block_to_rank[src]` is only the first rank of
+                # the block, not an ownership predicate for every subrank.  Only
+                # use that fallback for unsplit/multi-block-per-rank blocks.
                 src_is_local = (haskey(blocks, src_b_id) && world_rank == src_rank_global)
-                if !src_is_local && @isdefined(Block_to_rank)
-                    src_is_local = (Block_to_rank[src_b_id + 1] == world_rank)
+                if !src_is_local && @isdefined(Block_to_rank) && prod(Block_Nprocs[src_b_id + 1]) == 1
+                    src_is_local = (Block_to_rank[src_b_id + 1] == world_rank && haskey(blocks, src_b_id))
                 end
 
                 # ── Method C: Delta mode — pack only border sub-regions ──
@@ -946,3 +957,495 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
     end
 end
 
+
+# =============================================================================
+# BEGIN FOLDED METRICS SYNC
+# Multi-rank interface metric synchronization
+# Folded from metrics_sync.jl.
+# =============================================================================
+using MPI
+
+# =============================================================================
+# pack_face_metrics!
+#
+# Pack one interblock face's (Area, nx, ny, nz) into a contiguous buffer of
+# shape (u_len, v_len, 4) in *local sub-domain* indices [1..u_len, 1..v_len].
+#
+# Optional sub-range (u_s,u_e,v_s,v_e) restricts packing to a slice of the
+# locally-owned face; when omitted the full local face is packed. This is the
+# multi-rank-per-block generalization: each rank only owns a sub-domain, so it
+# only packs the (u,v) overlap region it shares with a particular neighbor
+# sub-rank (computed via _get_face_uv_extents, matching copy_ghost_face!).
+#
+# The local full-face dimensions (Nx,Ny,Nz) are the *sub-domain* cell counts
+# (nxp,nyp,nzp), and the array is padded by NG ghost cells on every side.
+# =============================================================================
+function pack_face_metrics!(fid, Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk, Nx, Ny, Nz, NG;
+                            u_s::Int=1, u_e::Int=-1, v_s::Int=1, v_e::Int=-1)
+    # Default sub-range = full local face
+    if fid == 1 || fid == 2
+        U = Ny; V = Nz
+    elseif fid == 3 || fid == 4
+        U = Nx; V = Nz
+    else  # fid == 5 || fid == 6
+        U = Nx; V = Ny
+    end
+    u_s = u_s < 1 ? 1 : u_s
+    u_e = u_e < 1 ? U : u_e
+    v_s = v_s < 1 ? 1 : v_s
+    v_e = v_e < 1 ? V : v_e
+    u_len = u_e - u_s + 1
+    v_len = v_e - v_s + 1
+    buf = zeros(Float64, u_len, v_len, 4)
+
+    if fid == 1 || fid == 2
+        i_idx = (fid == 1) ? NG + 1 : Nx + NG + 1
+        for kk in 1:v_len, jj in 1:u_len
+            j = u_s + jj - 1
+            k = v_s + kk - 1
+            buf[jj, kk, 1] = Areai[i_idx, j+NG, k+NG]
+            buf[jj, kk, 2] = nxi[i_idx, j+NG, k+NG]
+            buf[jj, kk, 3] = nyi[i_idx, j+NG, k+NG]
+            buf[jj, kk, 4] = nzi[i_idx, j+NG, k+NG]
+        end
+    elseif fid == 3 || fid == 4
+        j_idx = (fid == 3) ? NG + 1 : Ny + NG + 1
+        for kk in 1:v_len, ii in 1:u_len
+            i = u_s + ii - 1
+            k = v_s + kk - 1
+            buf[ii, kk, 1] = Areaj[i+NG, j_idx, k+NG]
+            buf[ii, kk, 2] = nxj[i+NG, j_idx, k+NG]
+            buf[ii, kk, 3] = nyj[i+NG, j_idx, k+NG]
+            buf[ii, kk, 4] = nzj[i+NG, j_idx, k+NG]
+        end
+    else  # fid == 5 || fid == 6
+        k_idx = (fid == 5) ? NG + 1 : Nz + NG + 1
+        for jj in 1:v_len, ii in 1:u_len
+            i = u_s + ii - 1
+            j = v_s + jj - 1
+            buf[ii, jj, 1] = Areak[i+NG, j+NG, k_idx]
+            buf[ii, jj, 2] = nxk[i+NG, j+NG, k_idx]
+            buf[ii, jj, 3] = nyk[i+NG, j+NG, k_idx]
+            buf[ii, jj, 4] = nzk[i+NG, j+NG, k_idx]
+        end
+    end
+    return buf
+end
+
+# =============================================================================
+# unpack_and_average_metrics!
+#
+# Unpack a received face slice into the local metrics array, applying the
+# master-block averaging rule: the block with the lower ID wins, so both sides
+# of an interblock face end up with identical (Area, n) — this is what makes
+# the numerical flux exactly conservative across block interfaces.
+#
+# (u_s,u_e,v_s,v_e) is the *local sub-domain* index range to write (the
+# overlap region this rank shares with the neighbor sub-rank that sent the
+# buffer). buf_recv is indexed [1..u_len, 1..v_len].
+#
+# reverse_tan: when true, the neighbor's tangential (v) coordinate runs
+# opposite to ours. Both sides pack their OWN local slice in ascending v, so
+# the received buffer's v ordering is reversed relative to our local v. We
+# flip the v index inside unpack (mirroring the original 1-rank-per-block
+# version's `v_nb = reverse_tan ? (v_len+1-v) : v`). u is never flipped.
+# =============================================================================
+function unpack_and_average_metrics!(fid, nb_fid, buf_recv, reverse_tan, bid, nb_bid,
+                                     Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk,
+                                     Nx, Ny, Nz, NG;
+                                     u_s::Int=1, u_e::Int=-1, v_s::Int=1, v_e::Int=-1)
+    if fid == 1 || fid == 2
+        U = Ny; V = Nz
+    elseif fid == 3 || fid == 4
+        U = Nx; V = Nz
+    else
+        U = Nx; V = Ny
+    end
+    u_s = u_s < 1 ? 1 : u_s
+    u_e = u_e < 1 ? U : u_e
+    v_s = v_s < 1 ? 1 : v_s
+    v_e = v_e < 1 ? V : v_e
+
+    u_len = u_e - u_s + 1
+    v_len = v_e - v_s + 1
+
+    # Master block owns the authoritative face values; the non-master adopts
+    # the master's values (normal flipped to point outward from itself).
+    sign_my = (fid % 2 == 1) ? -1.0 : 1.0
+    sign_nb = (nb_fid % 2 == 1) ? -1.0 : 1.0
+    flip_normal = - (sign_my * sign_nb)
+    i_am_master = bid < nb_bid
+
+    for jj in 1:u_len
+        u_loc = u_s + jj - 1
+        for kk in 1:v_len
+            v_loc = v_s + kk - 1
+            # Neighbor buffer is in ascending neighbor-v; flip to our v when
+            # the tangential directions are opposed.
+            kk_nb = reverse_tan ? (v_len + 1 - kk) : kk
+            A_nb    = buf_recv[jj, kk_nb, 1]
+            nx_nb   = buf_recv[jj, kk_nb, 2]
+            ny_nb   = buf_recv[jj, kk_nb, 3]
+            nz_nb   = buf_recv[jj, kk_nb, 4]
+
+            if i_am_master
+                # Master keeps its OWN value — the neighbor will adopt it.
+                continue
+            else
+                A_avg  = A_nb
+                nx_avg = nx_nb * flip_normal
+                ny_avg = ny_nb * flip_normal
+                nz_avg = nz_nb * flip_normal
+            end
+
+            if fid == 1 || fid == 2
+                i_idx = (fid == 1) ? NG + 1 : Nx + NG + 1
+                Areai[i_idx, u_loc+NG, v_loc+NG] = A_avg
+                nxi[i_idx, u_loc+NG, v_loc+NG] = nx_avg
+                nyi[i_idx, u_loc+NG, v_loc+NG] = ny_avg
+                nzi[i_idx, u_loc+NG, v_loc+NG] = nz_avg
+            elseif fid == 3 || fid == 4
+                j_idx = (fid == 3) ? NG + 1 : Ny + NG + 1
+                Areaj[u_loc+NG, j_idx, v_loc+NG] = A_avg
+                nxj[u_loc+NG, j_idx, v_loc+NG] = nx_avg
+                nyj[u_loc+NG, j_idx, v_loc+NG] = ny_avg
+                nzj[u_loc+NG, j_idx, v_loc+NG] = nz_avg
+            else
+                k_idx = (fid == 5) ? NG + 1 : Nz + NG + 1
+                Areak[u_loc+NG, v_loc+NG, k_idx] = A_avg
+                nxk[u_loc+NG, v_loc+NG, k_idx] = nx_avg
+                nyk[u_loc+NG, v_loc+NG, k_idx] = ny_avg
+                nzk[u_loc+NG, v_loc+NG, k_idx] = nz_avg
+            end
+        end
+    end
+end
+
+# =============================================================================
+# sync_all_interface_metrics!  (multi-rank-per-block aware)
+#
+# Synchronize interblock face metrics (Area + normal) so that both sides of
+# every block-block interface carry identical values (master-block averaging).
+# This is required for a conservative numerical flux across interfaces.
+#
+# Rank matching follows the SAME sub-domain face-overlap logic as
+# copy_ghost_face! (mpi.jl): for each interblock face of a block this rank
+# owns, compute this rank's (rx,ry,rz) within the block, skip faces the
+# sub-domain does not touch, then for each neighbor sub-rank that touches the
+# neighbor face compute the (u,v) overlap and exchange only that slice. This
+# makes the function correct under standard mode (N_ranks >= N_blocks, blocks
+# split into 3D sub-domains) as well as multi-block mode (1 rank per block).
+# =============================================================================
+const _tmp_Block_Nprocs = Ref{Any}(nothing)
+
+function sync_all_interface_metrics!(local_blocks, temp_metrics_h,
+                                     face_bc, connectivity, rank_offsets,
+                                     Block_Nprocs, Nx_b, Ny_b, Nz_b, NG)
+    _tmp_Block_Nprocs[] = Block_Nprocs
+    sync_all_interface_metrics!(local_blocks, temp_metrics_h, nothing, 0, 0,
+                                face_bc, connectivity, rank_offsets, Nx_b, Ny_b, Nz_b, NG)
+end
+
+function sync_all_interface_metrics!(local_blocks, temp_metrics_h, sync_dict, _a, _b,
+                                     face_bc, connectivity,
+                                     rank_offsets, Nx_b, Ny_b, Nz_b, NG)
+    # ─────────────────────────────────────────────────────────────────
+    # MPI interface-metric synchronization (REWRITTEN for multi-rank-per-block
+    # safety, 2026-06-23).
+    #
+    # PROBLEM with previous version (deadlocked at 15 ranks):
+    #   tag_send/tag_recv = bid*100 + fid only.  Under sub-domain decomposition
+    #   along ξ, multiple ranks share the same (bid, fid) η/ζ face — so three
+    #   ranks may issue Isend with the SAME tag to ONE neighbor rank, but that
+    #   neighbor only issues one Irecv per tag.  Two of the three sends never
+    #   match an Irecv → MPI_Waitall hangs forever.
+    #
+    # FIX: tag must encode the sub-rank identity of BOTH ends, not just the
+    # block-face pair.  Use a stable, symmetric tag = hash of the ordered tuple
+    # (sender_world_rank, receiver_world_rank, sender_bid, sender_fid).
+    # Each (rank_A → rank_B) message gets a unique tag in both ends' views.
+    #
+    # Plus: replace Isend/Irecv/Waitall with MPI.Sendrecv! when both ends
+    # post in the same loop iteration — guaranteed deadlock-free.
+    #
+    # Signature is 12-param to match HEAD/99cb362 solver.jl call site:
+    #   sync_all_interface_metrics!(collect(keys(temp_metrics_h)), sync_dict,
+    #       0, 0, 0, face_bc, connectivity, _rank_offsets_setup,
+    #       nxp, nyp, nzp, NG)
+    # The 3 zeros (positions 3-5) are legacy placeholders, ignored here.
+    # ─────────────────────────────────────────────────────────────────
+    world_rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    world_size = MPI.Comm_size(MPI.COMM_WORLD)
+
+    if world_rank == 0
+        println("Rank 0: Synchronizing interface metrics for $(length(local_blocks)) blocks...")
+        flush(stdout)
+    end
+
+    if world_rank == 0
+        println("Rank 0: Synchronizing metrics for $(length(local_blocks)) main blocks (rewritten algorithm)...")
+        flush(stdout)
+    end
+
+    # Step 1: build a GLOBAL list of all (sender_rank, receiver_rank,
+    # sender_bid, sender_fid, recv_bid, recv_fid, ...) directed exchange edges
+    # that EVERY rank can agree on. We enumerate ALL blocks (0..Nblocks-1),
+    # not just local ones, so every rank produces the same edge list.
+    #
+    # An "edge" is one directed message: rank A's face (bA, fA) sub-domain →
+    # rank B's face (bB, fB) sub-domain, where (bA,fA) and (bB,fB) are connected
+    # by `connectivity`, and the two sub-domains overlap in face coordinates.
+    #
+    # The global list is built by every rank deterministically (same iteration
+    # order, same connectivity), so each rank knows exactly which messages to
+    # send and which to receive.
+
+    # Connectivity only describes inter-block faces, so it is legitimately
+    # empty for a single block.  The mesh-size arrays are the authoritative
+    # block metadata and must define the layout even when there are no edges.
+    Nblocks_total = length(Nx_b)
+    if length(Ny_b) != Nblocks_total || length(Nz_b) != Nblocks_total
+        error(
+            "Inconsistent block metadata in metric synchronization: " *
+            "Nx_b=$(length(Nx_b)), Ny_b=$(length(Ny_b)), Nz_b=$(length(Nz_b))",
+        )
+    end
+    for ((b, f), conn) in connectivity
+        if !(0 <= b < Nblocks_total && 1 <= f <= 6 &&
+             0 <= conn.src_b < Nblocks_total && 1 <= conn.src_f <= 6)
+            error(
+                "Connectivity endpoint outside block metadata in metric synchronization: " *
+                "($b,$f) -> ($(conn.src_b),$(conn.src_f)), Nblocks=$Nblocks_total",
+            )
+        end
+    end
+
+    # Compute (px, py, pz) for each block.
+    block_layout = Dict{Int, Tuple{Int,Int,Int}}()
+    for bid in 0:(Nblocks_total-1)
+        if _tmp_Block_Nprocs[] !== nothing && bid + 1 <= length(_tmp_Block_Nprocs[])
+            val = _tmp_Block_Nprocs[][bid + 1]
+            block_layout[bid] = (Int(val[1]), Int(val[2]), Int(val[3]))
+        elseif @isdefined(Block_Nprocs) && bid + 1 <= length(Block_Nprocs)
+            val = Block_Nprocs[bid + 1]
+            block_layout[bid] = (Int(val[1]), Int(val[2]), Int(val[3]))
+        elseif isdefined(Main, :Block_Nprocs) && bid + 1 <= length(Main.Block_Nprocs)
+            val = Main.Block_Nprocs[bid + 1]
+            block_layout[bid] = (Int(val[1]), Int(val[2]), Int(val[3]))
+        elseif bid + 2 <= length(rank_offsets)
+            npx = rank_offsets[bid + 2] - rank_offsets[bid + 1]
+            block_layout[bid] = (npx, 1, 1)
+        else
+            block_layout[bid] = (1, 1, 1)
+        end
+    end
+
+    # All faces I (world_rank) am supposed to communicate over.  For each face
+    # I own, find every neighbor sub-rank that overlaps with me, and store
+    # both the (u,v) overlap on my side and the neighbor's rank id.
+    # We then iterate this list, calling Sendrecv! for each entry.
+
+    my_exchanges = Vector{NamedTuple}()
+
+    for bid in local_blocks
+        if !haskey(temp_metrics_h, bid); continue; end
+
+        px, py, pz = block_layout[bid]
+        my_local_rank = world_rank - rank_offsets[bid + 1]
+        if my_local_rank < 0 || my_local_rank >= px * py * pz; continue; end
+        rx = my_local_rank ÷ (py * pz)
+        ry = (my_local_rank ÷ pz) % py
+        rz = my_local_rank % pz
+
+        ngx, ngy, ngz = Nx_b[bid+1], Ny_b[bid+1], Nz_b[bid+1]
+        nxp = ngx ÷ px + (rx < (ngx % px) ? 1 : 0)
+        nyp = ngy ÷ py + (ry < (ngy % py) ? 1 : 0)
+        nzp = ngz ÷ pz + (rz < (ngz % pz) ? 1 : 0)
+
+        for fid in 1:6
+            if !haskey(face_bc, (bid, fid)) || face_bc[(bid, fid)] != 0; continue; end
+            if !_ms_subdomain_touches_face(fid, rx, ry, rz, px, py, pz); continue; end
+            conn = connectivity[(bid, fid)]
+            nb_bid = conn.src_b
+            nb_fid = conn.src_f
+            reverse_tan = conn.reverse_tan
+
+            u_d_s, u_d_e, v_d_s, v_d_e, V_tot_d = _ms_face_uv_extent(
+                fid, rx, ry, rz, px, py, pz, Nx_b[bid+1], Ny_b[bid+1], Nz_b[bid+1])
+
+            npx, npy, npz = block_layout[nb_bid]
+            npranks = npx * npy * npz
+            for rank_s in 0:(npranks - 1)
+                sx = rank_s ÷ (npy * npz)
+                sy = (rank_s ÷ npz) % npy
+                sz = rank_s % npz
+                if !_ms_subdomain_touches_face(nb_fid, sx, sy, sz, npx, npy, npz); continue; end
+
+                u_s_s, u_s_e, v_s_s, v_s_e, V_tot_s = _ms_face_uv_extent(
+                    nb_fid, sx, sy, sz, npx, npy, npz, Nx_b[nb_bid+1], Ny_b[nb_bid+1], Nz_b[nb_bid+1])
+
+                mapped_u_s = u_s_s; mapped_u_e = u_s_e
+                if reverse_tan
+                    mapped_v_s = V_tot_s - v_s_e + 1
+                    mapped_v_e = V_tot_s - v_s_s + 1
+                else
+                    mapped_v_s = v_s_s; mapped_v_e = v_s_e
+                end
+
+                u_int_s = max(u_d_s, mapped_u_s); u_int_e = min(u_d_e, mapped_u_e)
+                v_int_s = max(v_d_s, mapped_v_s); v_int_e = min(v_d_e, mapped_v_e)
+                if u_int_s > u_int_e || v_int_s > v_int_e; continue; end
+
+                local_u_s = u_int_s - u_d_s + 1
+                local_u_e = u_int_e - u_d_s + 1
+                local_v_s = v_int_s - v_d_s + 1
+                local_v_e = v_int_e - v_d_s + 1
+
+                nb_rank_global = rank_offsets[nb_bid + 1] + rank_s
+
+                push!(my_exchanges, (
+                    bid=bid, fid=fid, conn=conn,
+                    u_s=local_u_s, u_e=local_u_e, v_s=local_v_s, v_e=local_v_e,
+                    nxp=nxp, nyp=nyp, nzp=nzp,
+                    nb_rank=nb_rank_global, nb_bid=nb_bid, nb_fid=nb_fid,
+                ))
+            end
+        end
+    end
+
+    # Sort my exchanges by (nb_rank, bid, fid) for deterministic ordering.
+    sort!(my_exchanges, by = e -> (e.nb_rank, e.bid, e.fid, e.nb_bid, e.nb_fid))
+
+    # ─── Non-blocking 2-phase pattern ───────────────────────────────
+    # PHASE 1: Post ALL Irecv first (no blocking, just registers the receive).
+    # PHASE 2: Post ALL Isend after.
+    # PHASE 3: Waitall.
+    # PHASE 4: Unpack.
+    #
+    # Why this works: every rank pre-posts ALL its receives before sending
+    # anything, so by the time any Isend reaches the network, the matching
+    # Irecv is already waiting. No deadlock possible from ordering.
+    #
+    # Tag uniqueness: each (sender_rank, receiver_rank, sender_bid, sender_fid)
+    # is unique. Both ends compute the same tag from the symmetric tuple
+    # (min(A,B), max(A,B), bid_lo, fid_lo, bid_hi, fid_hi).
+    #
+    # Pre-allocate buffers for each exchange.
+    send_bufs = Vector{Array{Float64,3}}(undef, length(my_exchanges))
+    recv_bufs = Vector{Array{Float64,3}}(undef, length(my_exchanges))
+    tags = Vector{Int}(undef, length(my_exchanges))
+    local_peer = fill(0, length(my_exchanges))
+    for (i, ex) in enumerate(my_exchanges)
+        Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk = temp_metrics_h[ex.bid]
+        send_bufs[i] = pack_face_metrics!(ex.fid,
+            Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk,
+            ex.nxp, ex.nyp, ex.nzp, NG;
+            u_s=ex.u_s, u_e=ex.u_e, v_s=ex.v_s, v_e=ex.v_e)
+        recv_bufs[i] = similar(send_bufs[i])
+        endpoint = ex.bid*6 + ex.fid - 1
+        nb_endpoint = ex.nb_bid*6 + ex.nb_fid - 1
+        tags[i] = 7000 + min(endpoint, nb_endpoint)*(6*Nblocks_total) +
+            max(endpoint, nb_endpoint)
+    end
+    for (i, ex) in enumerate(my_exchanges)
+        if ex.nb_rank != world_rank
+            continue
+        end
+        peer = findfirst(eachindex(my_exchanges)) do candidate
+            other = my_exchanges[candidate]
+            other.bid == ex.nb_bid && other.fid == ex.nb_fid &&
+                other.nb_bid == ex.bid && other.nb_fid == ex.fid &&
+                other.nb_rank == world_rank &&
+                size(send_bufs[candidate]) == size(recv_bufs[i])
+        end
+        if peer === nothing
+            error("Missing local metric interface peer for block=$(ex.bid) face=$(ex.fid)")
+        end
+        local_peer[i] = peer
+    end
+
+    # PHASE 1: Post all Irecv first.
+    reqs = MPI.Request[]
+    for (i, ex) in enumerate(my_exchanges)
+        if ex.nb_rank != world_rank
+            push!(reqs, MPI.Irecv!(recv_bufs[i], MPI.COMM_WORLD;
+                                   source=ex.nb_rank, tag=tags[i]))
+        end
+    end
+    # PHASE 2: Post all Isend after.
+    for (i, ex) in enumerate(my_exchanges)
+        if ex.nb_rank != world_rank
+            push!(reqs, MPI.Isend(send_bufs[i], MPI.COMM_WORLD;
+                                  dest=ex.nb_rank, tag=tags[i]))
+        end
+    end
+    # PHASE 3: Wait for all.
+    if !isempty(reqs)
+        MPI.Waitall(reqs)
+    end
+
+    # PHASE 4: Unpack into local metrics arrays.
+    for (i, ex) in enumerate(my_exchanges)
+        Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk = temp_metrics_h[ex.bid]
+        source = ex.nb_rank == world_rank ? send_bufs[local_peer[i]] : recv_bufs[i]
+        unpack_and_average_metrics!(ex.fid, ex.nb_fid, source, ex.conn.reverse_tan,
+            ex.bid, ex.nb_bid, Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk,
+            ex.nxp, ex.nyp, ex.nzp, NG;
+            u_s=ex.u_s, u_e=ex.u_e, v_s=ex.v_s, v_e=ex.v_e)
+    end
+
+    MPI.Barrier(MPI.COMM_WORLD)
+    if world_rank == 0
+        println("Rank 0: Metric synchronization complete ($(length(my_exchanges)) exchanges).")
+        flush(stdout)
+    end
+end
+
+# ─── Local helpers (mirror mpi.jl's _nonuniform_extent / _get_face_uv_extents
+#     / face-touch checks, kept private here to avoid cross-module coupling). ───
+
+# 1-indexed global cell range [lo,hi] for rank r within a block of nprocs over
+# nglobal cells (non-uniform: first `rem` ranks get one extra cell). Identical
+# to mpi.jl _nonuniform_extent.
+@inline function _ms_nonuniform_extent(r, nprocs, nglobal)
+    base = nglobal ÷ nprocs
+    rem  = nglobal % nprocs
+    lo   = min(r, rem) * (base + 1) + max(0, r - rem) * base + 1
+    hi   = lo + (r < rem ? base : base - 1)
+    return lo, hi
+end
+
+# True if sub-domain (rx,ry,rz) touches face fid. Mirrors the skip-checks in
+# copy_ghost_face! (mpi.jl:622-627). Faces 1/2 are ξ± (x), 3/4 are η± (y),
+# 5/6 are ζ± (z).
+@inline function _ms_subdomain_touches_face(fid, rx, ry, rz, px, py, pz)
+    if fid == 1; return rx == 0; end
+    if fid == 2; return rx == px - 1; end
+    if fid == 3; return ry == 0; end
+    if fid == 4; return ry == py - 1; end
+    if fid == 5; return rz == 0; end
+    if fid == 6; return rz == pz - 1; end
+    return false
+end
+
+# Global (u,v) face extent for sub-domain (rx,ry,rz). u is the first in-plane
+# axis, v the second. Returns (u_lo,u_hi,v_lo,v_hi,V_tot) where V_tot is the
+# full v-length of the face (used for reverse_tan mapping). Mirrors
+# _get_face_uv_extents in mpi.jl:390 but also returns the u-total where needed.
+@inline function _ms_face_uv_extent(fid, rx, ry, rz, px, py, pz, Nx_g, Ny_g, Nz_g)
+    x_lo, x_hi = _ms_nonuniform_extent(rx, px, Nx_g)
+    y_lo, y_hi = _ms_nonuniform_extent(ry, py, Ny_g)
+    z_lo, z_hi = _ms_nonuniform_extent(rz, pz, Nz_g)
+    if fid == 3 || fid == 4   # η face: u=x, v=z
+        return x_lo, x_hi, z_lo, z_hi, Nz_g
+    elseif fid == 5 || fid == 6  # ζ face: u=x, v=y
+        return x_lo, x_hi, y_lo, y_hi, Ny_g
+    else  # ξ face (1/2): u=y, v=z — interblock ξ connections are not used by
+          # the butterfly topology, but handle them for completeness.
+        return y_lo, y_hi, z_lo, z_hi, Nz_g
+    end
+end
+
+# =============================================================================
+# END FOLDED METRICS SYNC
+# =============================================================================

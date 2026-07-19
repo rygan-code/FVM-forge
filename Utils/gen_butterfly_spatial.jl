@@ -51,7 +51,6 @@ function main_spatial()
     end
 
     # Build interpolation weights
-    build_interpolation_weights(blocks_data, out_dir)
 
     # Write mesh HDF5 files
     for bid in 0:4

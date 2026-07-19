@@ -25,7 +25,7 @@ function c2Prim(U, Q, nxp, nyp, nzp)
         @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
         @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
         @inbounds Q[i,j,k,7] = Bx; Q[i,j,k,8] = By; Q[i,j,k,9] = Bz
-        @inbounds Q[i,j,k,10] = U[i, j, k, 9]  # ψ
+        @inbounds Q[i,j,k,10] = U[i, j, k, 9]  # psi
         return
     end
 
@@ -79,6 +79,7 @@ function c2Prim_global(U, Q, nxp, nyp, nzp)
         @inbounds v = U[i, j, k, 3] * ρinv
         @inbounds w = U[i, j, k, 4] * ρinv
         @inbounds Bx = U[i, j, k, 6]; @inbounds By = U[i, j, k, 7]; @inbounds Bz = U[i, j, k, 8]
+
         B2 = Bx*Bx + By*By + Bz*Bz
         @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
         p = (γ - one(FT)) * ei
@@ -267,7 +268,7 @@ function compute_dt(dt, Q, J, S1, S2, S3,
         end
 
         @static if equation_type == :MHD
-            if resistive
+            if resistive && ct_resistive_main_explicit
                 dt_diff_res = FT(0.5) / (η_mhd * inv_d2_sum + FT(1.0e-30))
                 dt_diff = min(dt_diff, dt_diff_res)
             end
@@ -592,12 +593,34 @@ function linComb_clip_prim(U, Un, Q, NV, a::FT, b::FT, nxp, nyp, nzp)
 
     # MHD mode: linComb + c2Prim + clipping
     if equation_type == :MHD
+        @static if strict_ct_positivity && ct_mode && splitMethodID == 4
+            @inbounds state = SVector{9,FT}(
+                (
+                    U[i, j, k, 1], U[i, j, k, 2], U[i, j, k, 3],
+                    U[i, j, k, 4], U[i, j, k, 5], U[i, j, k, 6],
+                    U[i, j, k, 7], U[i, j, k, 8], U[i, j, k, 9],
+                ),
+            )
+            ρ, kinetic, magnetic, ei, p = mhd_raw_thermo(state, γ)
+            ρinv = one(FT) / ρ
+            u = state[2] * ρinv
+            v = state[3] * ρinv
+            w = state[4] * ρinv
+            T = p / (ρ * Rg)
+            @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+            @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+            @inbounds Q[i,j,k,7] = state[6]; Q[i,j,k,8] = state[7]; Q[i,j,k,9] = state[8]
+            @inbounds Q[i,j,k,10] = state[9]
+            return
+        end
+
         @inbounds ρ = max(U[i, j, k, 1], eps(FT))
         ρinv = one(FT) / ρ
         @inbounds u = U[i, j, k, 2] * ρinv
         @inbounds v = U[i, j, k, 3] * ρinv
         @inbounds w = U[i, j, k, 4] * ρinv
         @inbounds Bx = U[i,j,k,6]; @inbounds By = U[i,j,k,7]; @inbounds Bz = U[i,j,k,8]
+
         B2 = Bx*Bx + By*By + Bz*Bz
         @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
         p = (γ - one(FT)) * ei
@@ -667,12 +690,34 @@ function c2Prim_ghost(U, Q, nxp, nyp, nzp)
 
     # MHD mode
     if equation_type == :MHD
+        @static if strict_ct_positivity && ct_mode && splitMethodID == 4
+            @inbounds state = SVector{9,FT}(
+                (
+                    U[i, j, k, 1], U[i, j, k, 2], U[i, j, k, 3],
+                    U[i, j, k, 4], U[i, j, k, 5], U[i, j, k, 6],
+                    U[i, j, k, 7], U[i, j, k, 8], U[i, j, k, 9],
+                ),
+            )
+            ρ, kinetic, magnetic, ei, p = mhd_raw_thermo(state, γ)
+            ρinv = one(FT) / ρ
+            u = state[2] * ρinv
+            v = state[3] * ρinv
+            w = state[4] * ρinv
+            T = p / (ρ * Rg)
+            @inbounds Q[i,j,k,1] = ρ;  Q[i,j,k,2] = u;  Q[i,j,k,3] = v;  Q[i,j,k,4] = w
+            @inbounds Q[i,j,k,5] = p;  Q[i,j,k,6] = T
+            @inbounds Q[i,j,k,7] = state[6]; Q[i,j,k,8] = state[7]; Q[i,j,k,9] = state[8]
+            @inbounds Q[i,j,k,10] = state[9]
+            return
+        end
+
         @inbounds ρ = max(U[i, j, k, 1], eps(FT))
         ρinv = one(FT) / ρ
         @inbounds u = U[i, j, k, 2] * ρinv
         @inbounds v = U[i, j, k, 3] * ρinv
         @inbounds w = U[i, j, k, 4] * ρinv
         @inbounds Bx = U[i,j,k,6]; @inbounds By = U[i,j,k,7]; @inbounds Bz = U[i,j,k,8]
+
         B2 = Bx*Bx + By*By + Bz*Bz
         @inbounds ei = max(U[i, j, k, 5] - FT(0.5)*ρ*(u*u + v*v + w*w) - FT(0.5)*B2, eps(FT))
         p = (γ - one(FT)) * ei

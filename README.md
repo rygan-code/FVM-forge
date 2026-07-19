@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Precision-FP32%20%7C%20FP64-orange?style=flat-square" />
 </p>
 
-**FVM-Forge** 是 OpenCFD 框架下基于 MPI+GPU 异构并行的三维可压缩 Navier-Stokes 方程求解器。采用结构化多块有限体积法（FVM），支持 NVIDIA CUDA 和 AMD ROCm 双 GPU 后端，以及纯 CPU 多线程回退模式。
+**FVM-Forge** 是 OpenCFD 框架下基于 MPI+GPU 异构并行的三维可压缩流有限体积求解器。程序提供结构化多块和非结构网格两个空间后端，支持 NVIDIA CUDA、AMD ROCm 和纯 CPU 回退模式。结构后端承担完整 Navier-Stokes/MHD 生产计算；非结构后端当前完成了可压缩 Euler 基线。
 
 > 📖 完整手册请参阅 [docs/manual.md](docs/manual.md)
 
@@ -19,6 +19,7 @@
 
 - 🔥 **GPU 异构并行** — 同一套 Julia kernel 代码，通过统一抽象层自动适配 CUDA / ROCm / CPU
 - 🧱 **多块结构化网格** — 支持 O-H butterfly 管道拓扑、任意块间连接、运行时 ghost 坐标生成
+- 🔷 **非结构网格后端** — cell/face CSR、OpenFOAM polyMesh、MUSCL、MPI 和 VTU 输出
 - 🔬 **高阶精度** — WENO7/5-Z 特征分解重构 + 6 阶中心差分粘性通量
 - ⚡ **自适应混合策略** — 激波传感器驱动的 7 阶光滑/WENO/Minmod 自动切换
 - 🚀 **性能优化** — Kernel 自动调优、非阻塞 MPI 管线、批量 pack/unpack、融合 kernel
@@ -38,6 +39,10 @@ FVM-Forge/
 ├── run_pipe_piso.jl         # 入口：不可压 PISO 管道
 ├── run_brio_wu.jl           # 入口：MHD Brio-Wu 激波管
 ├── solver.jl                # 核心求解器：时间推进、块管理、同步
+├── backend_interface.jl     # 结构/非结构空间后端分派
+├── euler_flux.jl            # 两种后端共享的一阶 Euler 面通量
+├── unstruct/                # 非结构 Euler 后端
+├── run/unstructured/        # 非结构网格运行入口
 ├── gpu_backend.jl           # GPU 后端抽象层 (CUDA / ROCm / CPU)
 ├── auto_tune.jl             # GPU kernel 自动调优 (block size + VGPR)
 ├── auto_partition.jl        # 多块自动 GPU 分区
@@ -95,6 +100,12 @@ julia gen_butterfly_fvm.jl    # 生成 5-block O-H butterfly 管道网格
 ```bash
 # 24 GPU: 5 blocks, 自动分区
 mpirun -np 24 julia run_pipe.jl 10000
+```
+
+非结构 Euler 基线：
+
+```bash
+julia --project=. run/unstructured/euler_sod.jl
 ```
 
 ### 3. 可视化

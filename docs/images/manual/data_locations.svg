@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" role="img" aria-labelledby="title desc">
+  <title id="title">有限体积网格上的数据位置</title>
+  <desc id="desc">一个六面体控制体，标出节点、格心、面和边上的主要数据。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#374151"/>
+    </marker>
+    <style>
+      .edge { stroke:#374151; stroke-width:3; fill:none; }
+      .back { stroke:#9ca3af; stroke-width:2; fill:none; stroke-dasharray:7 6; }
+      .call { stroke:#374151; stroke-width:1.7; fill:none; marker-end:url(#arrow); }
+      .label { font: 19px 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif; fill:#111827; }
+      .small { font: 16px 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif; fill:#4b5563; }
+    </style>
+  </defs>
+  <rect width="960" height="560" fill="#ffffff"/>
+  <text x="40" y="44" class="label" font-weight="700">一个控制体中的四类几何位置</text>
+
+  <path d="M300 145 L610 145 L610 365 L300 365 Z" class="back"/>
+  <path d="M205 235 L515 235 L515 455 L205 455 Z" class="edge"/>
+  <path d="M205 235 L300 145 M515 235 L610 145 M515 455 L610 365 M205 455 L300 365" class="edge"/>
+
+  <path d="M515 235 L610 145 L610 365 L515 455 Z" fill="#dbeafe" fill-opacity="0.75" stroke="#2563eb" stroke-width="3"/>
+  <path d="M205 235 L515 235" stroke="#dc2626" stroke-width="8" stroke-linecap="round"/>
+
+  <g fill="#111827">
+    <circle cx="205" cy="235" r="8"/><circle cx="515" cy="235" r="8"/>
+    <circle cx="515" cy="455" r="8"/><circle cx="205" cy="455" r="8"/>
+    <circle cx="300" cy="145" r="7"/><circle cx="610" cy="145" r="7"/>
+    <circle cx="610" cy="365" r="7"/><circle cx="300" cy="365" r="7"/>
+  </g>
+
+  <circle cx="408" cy="300" r="15" fill="#16a34a" stroke="#14532d" stroke-width="3"/>
+  <rect x="553" y="285" width="24" height="24" fill="#2563eb" stroke="#1e3a8a" stroke-width="3"/>
+  <circle cx="360" cy="235" r="11" fill="#dc2626" stroke="#7f1d1d" stroke-width="3"/>
+
+  <path d="M180 185 C115 155,95 130,80 105" class="call"/>
+  <text x="42" y="82" class="label" font-weight="700">节点</text>
+  <text x="42" y="108" class="small">x, y, z 网格坐标</text>
+
+  <path d="M395 300 C315 305,245 305,150 305" class="call"/>
+  <text x="42" y="286" class="label" font-weight="700">格心</text>
+  <text x="42" y="313" class="small">U, Q, Vol, phi</text>
+  <text x="42" y="337" class="small">有限体积体平均与派生状态</text>
+
+  <path d="M575 285 C650 240,710 205,780 175" class="call"/>
+  <text x="690" y="112" class="label" font-weight="700">面</text>
+  <text x="690" y="140" class="small">面积、法向、数值通量</text>
+  <text x="690" y="164" class="small">CT: (B·n)A 面磁通</text>
+
+  <path d="M360 223 C455 155,560 90,730 70" class="call"/>
+  <text x="740" y="58" class="label" font-weight="700">边</text>
+  <text x="740" y="84" class="small">CT: ∫ E·dl</text>
+
+  <g transform="translate(675 325)">
+    <rect width="245" height="165" rx="6" fill="#f9fafb" stroke="#d1d5db"/>
+    <circle cx="22" cy="30" r="7" fill="#111827"/><text x="42" y="36" class="small">节点数据</text>
+    <circle cx="22" cy="66" r="10" fill="#16a34a"/><text x="42" y="72" class="small">格心状态</text>
+    <rect x="13" y="91" width="18" height="18" fill="#2563eb"/><text x="42" y="107" class="small">面数据</text>
+    <line x1="13" y1="136" x2="32" y2="136" stroke="#dc2626" stroke-width="7" stroke-linecap="round"/>
+    <text x="42" y="142" class="small">边线积分</text>
+  </g>
+</svg>

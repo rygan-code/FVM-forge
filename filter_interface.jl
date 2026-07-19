@@ -3,18 +3,37 @@ export interface_filter_kernel!
 # =============================================================================
 #  8th-order explicit interface filter with ADAPTIVE σ
 #
-#  σ_local = σ_max × (1 - lin_phi)
+#  Rationale (revised 2026-06):
+#    The earlier rule σ ∝ (1 - lin_phi) GATED the filter OFF wherever the
+#    reconstruction was already upwind-biased. That sounds reasonable, but at
+#    the butterfly 3-block singularity apply_geometric_smoothness_protection
+#    boosts the first 4 layers' phi to [1.0, 1.0, 0.8, 0.6] -> the filter
+#    became sigma=0 there, even though those are exactly the cells most prone
+#    to 2D odd-even (checkerboard) modes.
 #
-#  Where lin_phi ∈ [0,1] is the local upwind fraction from spectral_warmup:
-#    lin_phi ≈ 0  → pure central (low dissipation) → needs MORE filter
-#    lin_phi ≈ 0.5 → interblock taper               → needs MODERATE filter
-#    lin_phi ≈ 1  → pure upwind (high dissipation)  → needs NO filter
+#    Upwind-bias dampens long-wave error but does NOT dampen 2D high-frequency
+#    odd-even modes coming from cross-type metric mismatch / multi-block
+#    junctions. The 8th-order filter is the only mechanism that targets that
+#    spectrum, so we MUST keep it active there.
+#
+#    New rule: σ_local = σ_max × (σ_floor + (1 - σ_floor) × phi_local)
+#       phi=0 (pure central, smooth interior)  -> σ = σ_floor × σ_max
+#       phi=1 (heavily upwind, junction)        -> σ = σ_max
+#    σ_floor = 0.5 keeps a baseline filter even in nicely-smooth regions and
+#    pushes the strongest filter exactly into the singularity layers.
 #
 #  Stencil: U_new = U[i] - (σ_local/256) × Δ⁸U[i]
 #  Δ⁸U = [1, -8, 28, -56, 70, -56, 28, -8, 1] (binomial coefficients)
-#
 #  Requires NG >= 4.  Width: 9 points (-4 to +4).
 # =============================================================================
+
+# Returns a multiplier in [σ_floor, 1.0]:
+#   - σ_floor at phi=0  (pure central, low default damping is fine)
+#   - 1.0      at phi=1  (junction / cross-type, MUST damp odd-even)
+@inline function _intf_filter_weight(phi_local::T) where T
+    σ_floor = T(0.5)    # never let the filter fully shut off
+    return σ_floor + (one(T) - σ_floor) * clamp(phi_local, zero(T), one(T))
+end
 
 function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_layers::Int,
                                    sigma_max, lin_phi)
@@ -73,7 +92,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
                 jc = NG + layer
                 # Adaptive σ: high lin_phi → low σ (already has upwind dissipation)
                 @inbounds phi_local = lin_phi[jc, k_idx]
-                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                σ_local = sigma_max * _intf_filter_weight(phi_local)
                 s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
@@ -97,7 +116,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             for layer in 1:min(num_layers, 4)
                 jc = ej - layer + 1
                 @inbounds phi_local = lin_phi[jc, k_idx]
-                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                σ_local = sigma_max * _intf_filter_weight(phi_local)
                 s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
@@ -120,7 +139,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             for layer in 1:min(num_layers, 4)
                 kc = NG + layer
                 @inbounds phi_local = lin_phi[j_idx, kc]
-                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                σ_local = sigma_max * _intf_filter_weight(phi_local)
                 s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
@@ -144,7 +163,7 @@ function interface_filter_kernel!(U, Nx::Int, Ny::Int, Nz::Int, fid::Int, num_la
             for layer in 1:min(num_layers, 4)
                 kc = ek - layer + 1
                 @inbounds phi_local = lin_phi[j_idx, kc]
-                σ_local = sigma_max * max(FT(0.0), FT(1.0) - phi_local)
+                σ_local = sigma_max * _intf_filter_weight(phi_local)
                 s256 = σ_local / FT(256.0)
                 for m in 1:Ncons
                     @inbounds begin
