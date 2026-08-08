@@ -25,10 +25,10 @@ const resistive::Bool = false
 const cr_glm::FT = FT(0.18e0)
 
 const _project_root = joinpath(@__DIR__, "..", "..")
-include(joinpath(_project_root, "physics.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
 println("  ✓ physics.jl (Ncons=$Ncons, Nprim=$Nprim)")
 
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 println("  ✓ solver.jl")
 
 # Check that the key MHD functions exist

@@ -49,13 +49,12 @@ const cr_glm::FT = FT(0.18e0)   # GLM damping ratio (Dedner 2002)
 
 # Project root for includes (two levels up from Benchmark/MHD_HIT/)
 const _project_root = joinpath(@__DIR__, "..", "..")
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+const B_rms_physical::FT = FT(0.5) * SQRT_MU0_SI
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 include(joinpath(_project_root, "scripts", "diagnostics", "energy_spectrum.jl"))
 
 # ─── LES ───
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 
 # ─── Thermal state (γ = 5/3) ───
 const γ::FT = FT(5.0 / 3.0)
@@ -94,7 +93,7 @@ const gpu_vram_gb::Float64 = 16.0
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 
 const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
     N_gpus = MPI.Comm_size(MPI.COMM_WORLD)
@@ -116,7 +115,7 @@ const test_case::String = "MHDHIT"    # triggers HIT forcing on both v and B
 # Passot-Pouquet spectrum E(k) ∝ k^4 exp(-2(k/k0)^2), divergence-free v & B.
 # Forcing then sustains the cascade; the IC amplitude just sets the spin-up.
 const u_rms_init::FT = FT(1.0)    # initial RMS velocity
-const B_rms_init::FT = FT(0.5)    # initial RMS magnetic field (sub-Alfvénic)
+const B_rms_init::FT = B_rms_physical  # initial RMS magnetic field in Tesla
 const k0_init::FT    = FT(4.0)    # peak wavenumber of the IC spectrum
 const rho0_init::FT  = FT(1.0)    # uniform initial density
 const p0_init::FT    = FT(1.0)    # uniform initial pressure
@@ -147,16 +146,12 @@ const step_plt::Int64 = 200
 const chk_out::Bool = false
 const step_chk::Int64 = 1000
 const restart::String = "none"
-const inflow_restart::String = "none"
 
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
 
-const sample::Bool = false
-const sample_step::Int64 = 1000
-const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
 const filtering::Bool = false
@@ -172,7 +167,6 @@ const gg_blend::FT = zero(FT)
 
 # ─── FVM Config ───
 const eigen_reconstruction::Bool = false  # Must be false for MHD (no 9×9 eigensystem)
-const character::Bool = false
 const splitMethodID::Int32 = 1     # 1=Rusanov (robust for MHD turbulence)
 const hybrid_ϕ1::FT = FT(0.01e0)
 const hybrid_ϕ2::FT = one(FT)

@@ -7,6 +7,10 @@ using HDF5
 using WriteVTK
 using LinearAlgebra
 
+if !isdefined(@__MODULE__, :StructuredFaceFrame)
+    include(joinpath(@__DIR__, "..", "src", "core", "structured_interface_transform.jl"))
+end
+
 # ─── Global parameters ───
 const NG::Int = 4
 const Lx::Float64 = 7.5        # pipe length = 15R₀ (DNS standard)
@@ -353,6 +357,7 @@ function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad)
             flip_normal_arr[i] = 1
         end
     end
+    axis_map = structured_connectivity_axis_map(connectivity_rows, reverse_tan_arr)
     
     face_bc = zeros(Int64, 5, 6) 
     for bid in 0:4
@@ -384,6 +389,7 @@ function build_mesh(out_dir, Nx_b, Ny_b0, Nz_b0, N_rad)
         f["connectivity"] = connectivity_rows
         f["reverse_tan"] = reverse_tan_arr
         f["flip_normal"] = flip_normal_arr
+        f["axis_map"] = axis_map
         f["face_bc"] = face_bc
         f["bc_params"] = bc_params
     end

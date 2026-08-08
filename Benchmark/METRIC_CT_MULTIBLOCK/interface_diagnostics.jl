@@ -22,7 +22,8 @@ end
 
 function metric_ct_interface_residual(
     local_buffer, peer_buffer, u_len::Integer, v_len::Integer,
-    fid::Integer, nb_fid::Integer, reverse_tan::Bool,
+    fid::Integer, nb_fid::Integer, reverse_tan::Bool;
+    transform=nothing,
 )
     u_len > 0 && v_len > 0 ||
         throw(ArgumentError("interface dimensions must be positive"))
@@ -55,25 +56,43 @@ function metric_ct_interface_residual(
         @view(local_buffer[nface+nuedge+1:nface+nuedge+nvedge]),
         u_len + 1, v_len,
     )
-    peer_face = reshape(@view(peer_buffer[1:nface]), u_len, v_len)
+    source_u_len, source_v_len = if transform !== nothing &&
+        (structured_face_transform_code(transform) & 1) != 0
+        (v_len, u_len)
+    else
+        (u_len, v_len)
+    end
+    source_nface = source_u_len * source_v_len
+    source_nuedge = source_u_len * (source_v_len + 1)
+    source_nvedge = (source_u_len + 1) * source_v_len
+    peer_face = reshape(@view(peer_buffer[1:source_nface]), source_u_len, source_v_len)
     peer_u_edge = reshape(
-        @view(peer_buffer[nface+1:nface+nuedge]), u_len, v_len + 1,
+        @view(peer_buffer[source_nface+1:source_nface+source_nuedge]),
+        source_u_len, source_v_len + 1,
     )
     peer_v_edge = reshape(
-        @view(peer_buffer[nface+nuedge+1:nface+nuedge+nvedge]),
-        u_len + 1, v_len,
+        @view(peer_buffer[source_nface+source_nuedge+1:source_nface+source_nuedge+source_nvedge]),
+        source_u_len + 1, source_v_len,
     )
 
-    if reverse_tan
+    if transform !== nothing
+        peer_face, peer_u_edge, peer_v_edge = _ct_reorient_interface_sheet(
+            peer_face, peer_u_edge, peer_v_edge,
+            transform, u_len, v_len,
+        )
+    elseif reverse_tan
         peer_face = peer_face[:, end:-1:1]
         peer_u_edge = peer_u_edge[:, end:-1:1]
         peer_v_edge = peer_v_edge[:, end:-1:1]
     end
-    oriented_face = ct_interface_face_flux_sign(fid, nb_fid) .* peer_face
+    oriented_face = (transform === nothing ?
+        ct_interface_face_flux_sign(fid, nb_fid) :
+        ct_interface_face_flux_sign(fid, nb_fid, transform)) .* peer_face
     # The canonical u tangent is the global xi direction and is never reversed.
     # The v tangent follows reverse_tan and uses the solver's synchronization sign.
     oriented_u_edge = peer_u_edge
-    oriented_v_edge = ct_interface_v_edge_sign(reverse_tan) .* peer_v_edge
+    oriented_v_edge = transform === nothing ?
+        ct_interface_v_edge_sign(reverse_tan) .* peer_v_edge : peer_v_edge
 
     face_flux_abs, face_flux_rel = _metric_ct_scaled_residual(
         local_face, oriented_face,
@@ -157,7 +176,9 @@ function metric_ct_interface_diagnostics(blocks, Block_Nprocs)
         v_len = exchange.v_e - exchange.v_s + 1
         residual = metric_ct_interface_residual(
             send_buffer, recv_buffer, u_len, v_len,
-            exchange.fid, exchange.nb_fid, exchange.reverse_tan,
+            exchange.fid, exchange.nb_fid, exchange.reverse_tan;
+            transform=(exchange.transform === nothing ? nothing :
+                       structured_inverse_face_transform(exchange.transform)),
         )
         local_face_abs = max(local_face_abs, residual.face_flux_abs)
         local_face_rel = max(local_face_rel, residual.face_flux_rel)

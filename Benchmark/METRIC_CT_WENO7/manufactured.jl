@@ -7,10 +7,10 @@ if !isdefined(@__MODULE__, :weno_z)
     const weno_z = true
 end
 if !isdefined(@__MODULE__, :weno7_gauss4_integral)
-    include(joinpath(_METRIC_CT_WENO7_ROOT, "weno7.jl"))
+    include(joinpath(_METRIC_CT_WENO7_ROOT,"src","numerics","weno7_reconstruction.jl"))
 end
 if !isdefined(@__MODULE__, :ct_cmd6_edge_vector)
-    include(joinpath(_METRIC_CT_WENO7_ROOT, "ct_weno7.jl"))
+    include(joinpath(_METRIC_CT_WENO7_ROOT,"src","numerics","ct_weno7.jl"))
 end
 
 const METRIC_CT_WENO7_PERIOD = 2pi

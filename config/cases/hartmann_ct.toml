@@ -1,0 +1,14 @@
+name = "hartmann_ct"
+arguments = []
+
+[backend]
+mesh_type = "structured"
+device = "auto"
+mode = "legacy_entry"
+entry_script = "Benchmark/HARTMANN_CT/run.jl"
+
+[environment]
+HARTMANN_CT_INTEGRATOR = "rkl2_strang"
+
+[output]
+write = false

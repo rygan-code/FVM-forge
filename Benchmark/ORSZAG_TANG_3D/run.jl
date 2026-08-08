@@ -45,26 +45,33 @@ const ct_mode::Bool = _ot3d_ct_requested
 const strict_ct_positivity::Bool = ct_mode &&
     lowercase(get(ENV, "OT3D_STRICT_CT", "true")) in ("1", "true", "yes", "on")
 const splitMethodID::Int32 = ct_mode ? Int32(4) : Int32(1)
+# Required before loading the solver stack so static viscous branches resolve.
+const viscous::Bool = false
 function _ot3d_metric_ct_state(value)
     parts = split(strip(value), ',')
     length(parts) == 10 || error("OT3D_METRIC_CT_STATE must contain 10 comma-separated values")
     return ntuple(index -> parse(FT, strip(parts[index])), 10)
 end
-const metric_ct_uniform_state::NTuple{10,FT} = _ot3d_metric_ct_state(
-    get(ENV, "OT3D_METRIC_CT_STATE", "1,0.23,-0.17,0.11,1,1,0.61,-0.37,0.29,0"),
-)
-
 # Project root for includes (two levels up from Benchmark/ORSZAG_TANG_3D/)
 const _project_root = joinpath(@__DIR__, "..", "..")
 if !isdefined(@__MODULE__, :METRIC_CT_STATS_COLUMNS)
     include(joinpath(@__DIR__, "..", "METRIC_CT_WARPED", "metric_ct_diagnostics.jl"))
 end
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+const metric_ct_uniform_state::NTuple{10,FT} = if haskey(
+    ENV, "OT3D_METRIC_CT_STATE",
+)
+    # User-provided metric states are already physical SI values.
+    _ot3d_metric_ct_state(ENV["OT3D_METRIC_CT_STATE"])
+else
+    # Preserve the legacy reference state while storing B in Tesla.
+    (one(FT), FT(0.23), FT(-0.17), FT(0.11), one(FT), one(FT),
+     FT(0.61) * SQRT_MU0_SI, FT(-0.37) * SQRT_MU0_SI,
+     FT(0.29) * SQRT_MU0_SI, zero(FT))
+end
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 
 # ─── LES ───
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 
 # ─── Thermal state (γ = 5/3 for Orszag-Tang) ───
 const γ::FT = FT(5.0 / 3.0)
@@ -103,7 +110,7 @@ const gpu_vram_gb::Float64 = 16.0
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 
 const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
     N_gpus = MPI.Comm_size(MPI.COMM_WORLD)
@@ -154,16 +161,12 @@ const step_plt::Int64 = 200
 const chk_out::Bool = false
 const step_chk::Int64 = 1000
 const restart::String = "none"
-const inflow_restart::String = "none"
 
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
 
-const sample::Bool = false
-const sample_step::Int64 = 1000
-const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
 const filtering::Bool = false
@@ -173,14 +176,12 @@ const filtering_rth::FT = FT(1e-5)
 const filtering_s0::FT = FT(0.02e0)
 
 # ─── Equation (Ncons/Nprim defined in physics.jl) ───
-const viscous::Bool = false      # Inviscid ideal MHD
 const viscous_order::Int64 = 2
 const gg_blend::FT = zero(FT)
 
 # ─── FVM Config ───
 const eigen_reconstruction::Bool = ct_mode &&
     lowercase(get(ENV, "OT3D_CHARACTERISTIC", "false")) in ("1", "true", "yes", "on")
-const character::Bool = eigen_reconstruction
 const hybrid_ϕ1::FT = FT(0.01e0)
 const hybrid_ϕ2::FT = one(FT)
 const hybrid_ϕ3::FT = FT(10.0)

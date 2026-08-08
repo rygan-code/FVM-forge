@@ -20,6 +20,13 @@ function ct_weno7_validate_multiblock_topology(interfaces)
     length(unique(endpoints)) == 2 || error(
         "WENO7 multiblock acceptance contains duplicate local endpoints",
     )
+    transforms = Dict{Tuple{Int,Int},Any}()
+    for interface in interfaces
+        transform = _ct_weno7_interface_transform(interface)
+        transform === nothing && continue
+        fields_entry = _ct_weno7_interface_fields(interface)
+        transforms[(fields_entry[1], fields_entry[2])] = transform
+    end
     for interface in interfaces
         _ct_weno7_validate_interface(interface)
     end
@@ -34,6 +41,18 @@ function ct_weno7_validate_multiblock_topology(interfaces)
         reciprocal in fields || error(
             "WENO7 multiblock interface is not reciprocal: $entry",
         )
+        transform = get(transforms, (block, local_face), nothing)
+        if transform !== nothing
+            peer_transform = get(
+                transforms, (neighbor_block, neighbor_face), nothing,
+            )
+            peer_transform === nothing ||
+                peer_transform.source_for_destination ==
+                structured_inverse_face_transform(transform).source_for_destination ||
+                error(
+                    "WENO7 multiblock transforms are not reciprocal: $entry",
+                )
+        end
     end
     return nothing
 end
@@ -101,7 +120,9 @@ function ct_weno7_observe_interface_lines(blocks, plan, diagnostic_tag_base)
         )
         residual = ct_interface_line_residual(
             send_buffer, recv_buffer, u_len, v_len,
-            exchange.fid, exchange.nb_fid, exchange.reverse_tan,
+            exchange.fid, exchange.nb_fid, exchange.reverse_tan;
+            transform=exchange.transform === nothing ? nothing :
+                structured_inverse_face_transform(exchange.transform),
         )
         local_abs = max(local_abs, residual.absolute)
         local_rel = max(local_rel, residual.relative)

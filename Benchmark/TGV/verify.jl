@@ -1,80 +1,42 @@
-# Benchmark/TGV/verify.jl
-using HDF5, Statistics, Printf
+using HDF5
+using Printf
+using Statistics
 
-function verify_tgv()
-    case_dir = "Benchmark/TGV"
-    
-    # Get all available PLT files
-    plt_files = filter(f -> occursin(r"^plt-\d+\.h5$", f), readdir("./PLT"))
-    if length(plt_files) < 2
-        println("Need at least 2 PLT files in ./PLT for decay analysis.")
-        return
-    end
-    
-    # Sort files numerically
-    sorted_files = sort(plt_files, by = f -> parse(Int, match(r"plt-(\d+)\.h5", f).captures[1]))
-    
+@isdefined(benchmark_plt_steps) ||
+    include(joinpath(@__DIR__, "..", "benchmark_io.jl"))
+
+function verify_tgv(; plt_dir="PLT")
+    steps = benchmark_plt_steps(plt_dir, 0)
+    length(steps) >= 2 || return false
+    selected = unique((first(steps), steps[cld(length(steps), 2)], last(steps)))
     times = Float64[]
-    kes = Float64[]
-    
-    println("TGV Kinetic Energy Decay Analysis:")
-    println("----------------------------------")
-    
-    for fname in [sorted_files[1], sorted_files[max(1, length(sorted_files) ÷ 2)], sorted_files[end]]
-        path = joinpath("./PLT", fname)
-        if !isfile(path); continue; end
-        fid = h5open(path, "r")
-        u = read(fid["u"]); v = read(fid["v"]); w = read(fid["w"])
-        
-        t = 0.0
-        try
-            # Read 'time' attribute - handle as scalar
-            t_val = read(attrs(fid)["time"])
-            t = (t_val isa AbstractArray) ? t_val[1] : t_val
-        catch
-            # Fallback to step-based estimate if needed, but alert user
-            step = parse(Int, match(r"plt-(\d+)\.h5", fname).captures[1])
-            t = step * 0.0103 # Based on solver output observation
-            @printf("Warning: Could not read 'time' for %s, using estimated %.4f\n", fname, t)
+    energies = Float64[]
+
+    for step in selected
+        path = joinpath(plt_dir, "plt-$step-b0.h5")
+        density, u, v, w = h5open(path, "r") do file
+            read(file["rho"]), read(file["u"]),
+            read(file["v"]), read(file["w"])
         end
-        close(fid)
-        
-        ke = 0.5 * mean(u.^2 + v.^2 + w.^2)
-        push!(times, t)
-        push!(kes, ke)
-        @printf("Time: %.4f, KE: %.6e, ln(KE): %.4f\n", t, ke, log(ke))
-    end
-    
-    if length(times) < 2
-        println("✗ Error: Could not extract enough data points.")
-        return
+        all(field -> all(isfinite, field), (density, u, v, w)) || return false
+        minimum(density) > 0 || return false
+        push!(times, benchmark_output_time(plt_dir, step))
+        push!(energies, 0.5 * mean(density .* (u.^2 + v.^2 + w.^2)))
     end
 
-    dt_total = times[end] - times[1]
-    if dt_total > 0
-        decay_rate = (log(kes[1]) - log(kes[end])) / dt_total
-        @printf("\nEstimated Decay Rate: %.4f\n", decay_rate)
-        
-        if length(times) >= 3
-            expected_log_ke_mid = log(kes[1]) - decay_rate * (times[2] - times[1])
-            error_log = abs(log(kes[2]) - expected_log_ke_mid)
-            @printf("Log-Linearity Error at mid-point: %.4f\n", error_log)
-            
-            if decay_rate > 0 && error_log < 0.2
-                println("✓ Verification PASSED: Kinetic energy follows exponential decay.")
-            else
-                println("✗ Verification FAILED: Decay is non-exponential or energy is not decaying!")
-            end
-        else
-             if kes[end] < kes[1]
-                println("✓ Verification PASSED: Dissipation is leading to energy decay.")
-             else
-                println("✗ Verification FAILED: Energy is not decaying!")
-             end
-        end
-    else
-        println("✗ Error: Insufficient time interval for decay analysis.")
+    all(diff(times) .> 0) || return false
+    all(energy -> isfinite(energy) && energy > 0, energies) || return false
+    decay_rate = (log(first(energies)) - log(last(energies))) /
+        (last(times) - first(times))
+    @printf("TGV kinetic-energy decay rate: %.6e\n", decay_rate)
+    if length(times) == 3
+        expected_mid = log(first(energies)) -
+            decay_rate * (times[2] - first(times))
+        return decay_rate > 0 && abs(log(energies[2]) - expected_mid) < 0.2
     end
+    return decay_rate > 0
 end
 
-verify_tgv()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    verify_tgv() || exit(1)
+end

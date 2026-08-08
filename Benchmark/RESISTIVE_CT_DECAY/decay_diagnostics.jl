@@ -1,7 +1,29 @@
 using Printf
 
+if !@isdefined(MHD_SI_UNITS_LOADED)
+    include(joinpath(@__DIR__, "..", "..", "src", "core", "mhd_units.jl"))
+end
+
+function resistive_ct_decay_initial_amplitude(block)
+    amplitude = Float64(decay_amplitude)
+    if !(isdefined(@__MODULE__, :ct_cell_b_recovery) &&
+         ct_cell_b_recovery == CT_CELL_B_POINT6)
+        return amplitude
+    end
+
+    # The vector-potential initializer stores exact face averages. POINT6 then
+    # applies its five-point average-to-point deconvolution in the x direction.
+    # Use that same discrete transfer function as the t=0 benchmark reference.
+    theta = 2pi / block.Nx
+    face_average = sin(theta/2) / (theta/2)
+    point6_symbol = 1067/960 - (29/240)*cos(theta) +
+                    (3/320)*cos(2theta)
+    return amplitude * face_average * point6_symbol
+end
+
 function resistive_ct_decay_metrics(block, time)
     q = Array(block.Q)
+    conservative_state = hasproperty(block, :U) ? Array(block.U) : nothing
     inverse_volume = Array(block.Vol)
     x = Array(block.x)
     wave_number = 2pi / Float64(Lx)
@@ -10,6 +32,7 @@ function resistive_ct_decay_metrics(block, time)
     kinetic = 0.0
     internal = 0.0
     magnetic = 0.0
+    conservative_total = 0.0
     divb_squared = 0.0
     divb_max = 0.0
     bx_face = Array(block.Bx_face)
@@ -29,7 +52,11 @@ function resistive_ct_decay_metrics(block, time)
         volume_sum += volume
         kinetic += volume * 0.5*rho*(u*u + v*v + w*w)
         internal += volume * pressure / (Float64(γ) - 1)
-        magnetic += volume * 0.5*(bx*bx + by*by + bz*bz)
+        magnetic += volume * 0.5 * INV_MU0_SI *
+                    (bx*bx + by*by + bz*bz)
+        if conservative_state !== nothing
+            conservative_total += volume * conservative_state[ii,jj,kk,5]
+        end
         divb = inverse_volume[ii,jj,kk] * (
             bx_face[ii+1,jj,kk] - bx_face[ii,jj,kk] +
             by_face[ii,jj+1,kk] - by_face[ii,jj,kk] +
@@ -40,13 +67,16 @@ function resistive_ct_decay_metrics(block, time)
     end
 
     amplitude = amplitude_sum / volume_sum
-    exact_amplitude = Float64(decay_amplitude) * exp(
+    initial_amplitude = resistive_ct_decay_initial_amplitude(block)
+    exact_amplitude = initial_amplitude * exp(
         -Float64(η_mhd) * wave_number^2 * Float64(time),
     )
     initial_internal = volume_sum / (Float64(γ) - 1)
-    initial_magnetic = 0.5 * Float64(decay_amplitude)^2 * volume_sum
+    initial_magnetic = 0.5 * INV_MU0_SI * initial_amplitude^2 * volume_sum
     initial_total = initial_internal + initial_magnetic
-    total = kinetic + internal + magnetic
+    point_total = kinetic + internal + magnetic
+    primary_total = conservative_state === nothing ?
+        point_total : conservative_total
     magnetic_loss = initial_magnetic - magnetic
     thermal_gain = internal - initial_internal
     closure_error = abs(thermal_gain + kinetic - magnetic_loss) /
@@ -59,7 +89,10 @@ function resistive_ct_decay_metrics(block, time)
         kinetic=kinetic,
         internal=internal,
         magnetic=magnetic,
-        total_relative_error=abs(total-initial_total) / initial_total,
+        total_relative_error=abs(primary_total-initial_total) / initial_total,
+        point_total_relative_error=abs(point_total-initial_total) / initial_total,
+        conservative_total_relative_error=conservative_state === nothing ?
+            NaN : abs(conservative_total-initial_total) / initial_total,
         heating_closure_error=closure_error,
         divb_l2=sqrt(divb_squared / volume_sum),
         divb_linf=divb_max,
@@ -79,9 +112,11 @@ function verify_resistive_ct_decay(block, time; output_dir=@__DIR__)
             metrics.heating_closure_error, metrics.divb_l2, metrics.divb_linf)
     end
     @printf(
-        "RESISTIVE_CT_DECAY_RESULT time=%.8e amplitude=%.8e exact=%.8e amplitude_rel=%.8e total_rel=%.8e heating_closure=%.8e divB_L2=%.8e divB_Linf=%.8e\n",
+        "RESISTIVE_CT_DECAY_RESULT time=%.8e amplitude=%.8e exact=%.8e amplitude_rel=%.8e total_rel=%.8e point_total_rel=%.8e conservative_total_rel=%.8e heating_closure=%.8e divB_L2=%.8e divB_Linf=%.8e\n",
         time, metrics.amplitude, metrics.exact_amplitude,
         metrics.amplitude_relative_error, metrics.total_relative_error,
+        metrics.point_total_relative_error,
+        metrics.conservative_total_relative_error,
         metrics.heating_closure_error, metrics.divb_l2, metrics.divb_linf,
     )
 

@@ -17,12 +17,12 @@ const CT_EMF_WENO7_SG07 = Int32(7)
 const ct_emf_scheme = CT_EMF_WENO7_SG07
 const nthreads = (Int32(4), Int32(4), Int32(4))
 
-include(joinpath(ROOT, "gpu_backend.jl"))
-include(joinpath(ROOT, "bc_types.jl"))
-include(joinpath(ROOT, "weno7.jl"))
-include(joinpath(ROOT, "ct_state.jl"))
-include(joinpath(ROOT, "ct_weno7.jl"))
-include(joinpath(ROOT, "ct.jl"))
+include(joinpath(ROOT,"src","parallel","gpu_backend.jl"))
+include(joinpath(ROOT,"src","core","boundary_types.jl"))
+include(joinpath(ROOT,"src","numerics","weno7_reconstruction.jl"))
+include(joinpath(ROOT,"src","numerics","ct_state.jl"))
+include(joinpath(ROOT,"src","numerics","ct_weno7.jl"))
+include(joinpath(ROOT,"src","numerics","constrained_transport.jl"))
 include(joinpath(@__DIR__, "manufactured.jl"))
 include(joinpath(@__DIR__, "verify.jl"))
 

@@ -1,66 +1,71 @@
-# benchmark.jl - Unified Benchmark Management Script
-# Usage: julia benchmark.jl [list | setup | verify] [case]
+# Unified benchmark launcher.
+# Usage: julia --project=. Benchmark/benchmark.jl [list | run | verify] [case]
 
-const BENCHMARK_DIR = "Benchmark"
-const CASES = ["SOD", "TGV", "OBL", "BL", "BL_TRANSITION", "PIPEFLOW", "CAVITY"]
+const PROJECT_ROOT = abspath(joinpath(@__DIR__, ".."))
+const BENCHMARK_RUNNERS = Dict(
+    "BL" => "bl.jl",
+    "BRIO_WU" => "brio_wu.jl",
+    "HARTMANN" => "hartmann.jl",
+    "PIPEFLOW" => "pipeflow.jl",
+    "SOD" => "sod.jl",
+    "TGV" => "tgv.jl",
+)
+const BENCHMARK_VERIFIERS = Dict(
+    "BL" => :verify_bl,
+    "PIPEFLOW" => :verify_pipeflow,
+    "SOD" => :verify_sod,
+    "TGV" => :verify_tgv,
+)
+const CASES = sort!(collect(keys(BENCHMARK_RUNNERS)))
 
 function print_usage()
-    println("\nFlame3D Unified Benchmark Suite")
-    println("===============================")
-    println("Usage: julia benchmark.jl [COMMAND] [CASE]")
-    println("\nCommands:")
-    println("  list            List all available benchmarks")
-    println("  setup [CASE]    Configure the solver for a specific case (copies config to run.jl)")
-    println("  verify [CASE]   Verify the current results in ./PLT/ for a specific case")
-    println("\nExample:")
-    println("  julia benchmark.jl setup SOD")
-    println("  julia benchmark.jl verify SOD")
+    println("OpenCFD-FVM benchmark suite")
+    println("Usage: julia --project=. Benchmark/benchmark.jl [COMMAND] [CASE]")
+    println("Commands:")
+    println("  list            List runnable benchmarks")
+    println("  run [CASE]      Run the canonical benchmark entry")
+    println("  verify [CASE]   Run Benchmark/CASE/verify.jl when available")
 end
 
-function setup_case(case_name)
-    if !(case_name in CASES)
-        println("Error: Unknown case $case_name. Available: $(join(CASES, ", "))")
-        return
-    end
-    
-    src_config = joinpath(BENCHMARK_DIR, case_name, "run_config.jl")
-    dest_config = "run.jl"
-    
-    if isfile(src_config)
-        cp(src_config, dest_config, force=true)
-        println("✓ Setup COMPLETE: $case_name configuration deployed to run.jl")
-        println("  Please ensure the correct mesh file is referenced in run.jl.")
-    else
-        println("✗ Error: Config file not found at $src_config")
-    end
+function require_case(case_name)
+    normalized = uppercase(case_name)
+    normalized in CASES || throw(ArgumentError(
+        "unknown benchmark $case_name; available cases: $(join(CASES, ", "))",
+    ))
+    return normalized
+end
+
+function run_case(case_name)
+    normalized = require_case(case_name)
+    runner = joinpath(
+        PROJECT_ROOT, "run", "benchmarks", BENCHMARK_RUNNERS[normalized],
+    )
+    return Base.include(Main, runner)
 end
 
 function verify_case(case_name)
-    if !(case_name in CASES)
-        println("Error: Unknown case $case_name.")
-        return
-    end
-    
-    verify_script = joinpath(BENCHMARK_DIR, case_name, "verify.jl")
-    if isfile(verify_script)
-        println("--- Running Verification for $case_name ---")
-        include(verify_script)
-    else
-        println("✗ Error: Verification script not found at $verify_script")
-    end
+    normalized = require_case(case_name)
+    haskey(BENCHMARK_VERIFIERS, normalized) || throw(ArgumentError(
+        "benchmark $normalized does not provide a maintained verifier",
+    ))
+    verifier = joinpath(PROJECT_ROOT, "Benchmark", normalized, "verify.jl")
+    Base.include(Main, verifier)
+    passed = getfield(Main, BENCHMARK_VERIFIERS[normalized])()
+    passed || error("benchmark $normalized verification failed")
+    return true
 end
 
 if isempty(ARGS)
     print_usage()
+elseif ARGS[1] == "list"
+    println(join(CASES, "\n"))
+elseif ARGS[1] == "run" && length(ARGS) >= 2
+    case_name = ARGS[2]
+    deleteat!(ARGS, 1:2)
+    run_case(case_name)
+elseif ARGS[1] == "verify" && length(ARGS) == 2
+    verify_case(ARGS[2])
 else
-    cmd = ARGS[1]
-    if cmd == "list"
-        println("Available Benchmarks: $(join(CASES, ", "))")
-    elseif cmd == "setup" && length(ARGS) >= 2
-        setup_case(uppercase(ARGS[2]))
-    elseif cmd == "verify" && length(ARGS) >= 2
-        verify_case(uppercase(ARGS[2]))
-    else
-        print_usage()
-    end
+    print_usage()
+    exit(1)
 end

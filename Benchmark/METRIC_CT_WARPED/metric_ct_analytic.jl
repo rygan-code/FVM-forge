@@ -1,17 +1,24 @@
 using LinearAlgebra
 using StaticArrays
 
+@inline metric_ct_sqrt_mu0(::Type{T}) where {T<:AbstractFloat} =
+    sqrt(T(4.0 * pi * 1.0e-7))
+
+@inline metric_ct_alfven_default_amplitude(::Type{T}) where {T<:AbstractFloat} =
+    T(1.0e-3) * metric_ct_sqrt_mu0(T)
+
 @inline function metric_ct_alfven_primitive(
     x::T, time::T, rg::T, amplitude::T,
 ) where {T}
     phase = x - time
     by = amplitude * sin(phase)
     bz = amplitude * cos(phase)
+    background = metric_ct_sqrt_mu0(T)
     rho = one(T)
     pressure = one(T)
     return SVector{10,T}(
         rho, zero(T), -by, -bz, pressure, pressure/(rho*rg),
-        one(T), by, bz, zero(T),
+        background, by, bz, zero(T),
     )
 end
 
@@ -19,8 +26,9 @@ end
     x::T, y::T, time::T, amplitude::T,
 ) where {T}
     phase = x - time
+    background = metric_ct_sqrt_mu0(T)
     return SVector{3,T}(
-        zero(T), amplitude*sin(phase), y + amplitude*cos(phase),
+        zero(T), amplitude*sin(phase), background*y + amplitude*cos(phase),
     )
 end
 
@@ -131,7 +139,7 @@ function in_situ_ct_initial_face_flux_process(
 
         T = eltype(x)
         phi_x, phi_y, phi_z = metric_ct_face_fluxes_from_nodes(
-            x, y, z, zero(T), T(1e-3),
+            x, y, z, zero(T), metric_ct_alfven_default_amplitude(T),
         )
         i_cells = ng+1:ng+b.Nx
         j_cells = ng+1:ng+b.Ny

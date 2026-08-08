@@ -47,16 +47,20 @@ _ot_ct_scheme in ("sg07", "weno7") || error(
     "OT2D_CT_SCHEME must be sg07 or weno7, got '$_ot_ct_scheme'",
 )
 const ct_emf_scheme::Int32 = _ot_ct_scheme == "weno7" ? Int32(7) : Int32(2)
+const initial_state_mode::Symbol = Symbol(lowercase(get(
+    ENV, "OT2D_INITIAL_STATE_MODE", "quadrature6",
+)))
 
 # Project root for includes (two levels up from Benchmark/ORSZAG_TANG_2D/)
 const _project_root = joinpath(@__DIR__, "..", "..")
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+# The structured solver specializes several kernels at include time.
+# Define this compile-time physics flag before loading that stack.
+const viscous::Bool = false
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 include(joinpath(@__DIR__, "ot_diagnostics.jl"))
 
 # ─── LES ───
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 
 # ─── Thermal state (γ = 5/3 for Orszag-Tang) ───
 const γ::FT = FT(5.0 / 3.0)
@@ -97,7 +101,7 @@ const gpu_vram_gb::Float64 = 16.0
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 
 const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
     N_gpus = MPI.Comm_size(MPI.COMM_WORLD)
@@ -118,10 +122,12 @@ const test_case::String = "OrszagTang"
 const mesh::String = joinpath(_mesh_dir, "mesh_b0.h5")
 const metrics::String = joinpath(_mesh_dir, "metrics_b0.h5")
 
-const adaptive_dt::Bool = true
+const _ot_fixed_dt_raw = strip(get(ENV, "OT2D_FIXED_DT", ""))
+const adaptive_dt::Bool = isempty(_ot_fixed_dt_raw)
 const CFL::FT = haskey(ENV, "OT_CFL") ? parse(FT, ENV["OT_CFL"]) : FT(0.3e0)
 const LTS::Bool = false
-const dt::FT = FT(1.0e-3)
+const dt::FT = adaptive_dt ? FT(1.0e-3) : parse(FT, _ot_fixed_dt_raw)
+dt > zero(FT) || error("OT2D_FIXED_DT must be positive")
 const Time::FT = haskey(ENV, "OT_FINAL_TIME") ?
     parse(FT, ENV["OT_FINAL_TIME"]) : FT(4.05)
 const maxStep::Int64 = profiling ? PROFILE_STEPS : 100000
@@ -142,16 +148,12 @@ const step_plt::Int64 = 100000    # Disable regular PLT (only target-time snapsh
 const chk_out::Bool = false
 const step_chk::Int64 = 1000
 const restart::String = "none"
-const inflow_restart::String = "none"
 
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
 
-const sample::Bool = false
-const sample_step::Int64 = 1000
-const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
 const filtering::Bool = false
@@ -161,7 +163,6 @@ const filtering_rth::FT = FT(1e-5)
 const filtering_s0::FT = FT(0.02e0)
 
 # ─── Equation (Ncons/Nprim defined in physics.jl) ───
-const viscous::Bool = false      # Inviscid ideal MHD
 const viscous_order::Int64 = 2
 const gg_blend::FT = zero(FT)
 
@@ -171,7 +172,6 @@ const eigen_reconstruction::Bool = ct_mode &&
         ENV, "OT2D_CHARACTERISTIC",
         _ot_ct_scheme == "weno7" ? "true" : "false",
     )) in ("1", "true", "yes", "on")
-const character::Bool = eigen_reconstruction
 const hybrid_ϕ1::FT = FT(0.01e0)
 const hybrid_ϕ2::FT = one(FT)
 const hybrid_ϕ3::FT = FT(10.0)
@@ -202,8 +202,20 @@ const _stats_interval = strict_ct_positivity ? 1 : 20
 
 # Target snapshot times for the classic 2D Orszag-Tang validation (density field).
 # A PLT file is emitted once activeTime crosses each target.
-const _snapshot_times = FT[0.5, 1.0, 2.0, 3.0, 4.0]
+const _snapshot_times = let raw = get(
+    ENV, "OT2D_SNAPSHOT_TIMES", "0.5,1.0,2.0,3.0,4.0",
+)
+    values = strip.(split(raw, ','))
+    filter!(!isempty, values)
+    sort!(unique!(parse.(FT, values)))
+end
+all(>=(zero(FT)), _snapshot_times) || error(
+    "OT2D_SNAPSHOT_TIMES must contain non-negative times",
+)
 const _snapshot_pending = trues(length(_snapshot_times))   # false once emitted
+const _snapshot_checkpoints = lowercase(get(
+    ENV, "OT2D_SNAPSHOT_CHECKPOINTS", "false",
+)) in ("1", "true", "yes", "on")
 
 # Emit a PLT snapshot bypassing plotFile_multiblock's tt%step_plt guard.
 # Uses a large pseudo-step offset so snapshot files don't collide with regular ones.
@@ -222,6 +234,15 @@ function _emit_snapshot(tt, time, blocks, world_rank, Nblocks, block_comms)
         _write_plt_for_block(snap_id, b, block_comms[bid], Nblocks)
     end
     MPI.Barrier(MPI.COMM_WORLD)
+    if _snapshot_checkpoints
+        mkpath(structured_checkpoint_dir())
+        for bid in sort(collect(keys(blocks)))
+            b = blocks[bid]
+            b.id >= Nblocks && continue
+            _write_chk_for_block(snap_id, b, block_comms[bid])
+        end
+        MPI.Barrier(MPI.COMM_WORLD)
+    end
 end
 
 # Write header once on rank 0
@@ -349,8 +370,9 @@ function _run_ot_diagnostics(
         U5_v = @view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 5]
         Vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
         e_cons_local += mapreduce((u, v) -> Float64(u) / Float64(v), +, U5_v, Vol_v)
-        Uh = Array(@view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 1:9])
-        raw_minima = ot_raw_mhd_minima(Uh, FT(γ))
+        Uh = Array(@view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 1:5])
+        Qh = Array(@view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 7:9])
+        raw_minima = ot_raw_mhd_minima(Uh, Qh, FT(γ))
         min_rho_raw_local = min(min_rho_raw_local, raw_minima.rho)
         min_ei_raw_local = min(min_ei_raw_local, raw_minima.ei)
         min_p_raw_local = min(min_p_raw_local, raw_minima.p)

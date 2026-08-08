@@ -1,10 +1,36 @@
+name = "OpenCFDFVM"
+uuid = "8f149c4e-8204-4f65-a6ec-8b4c93acb792"
+version = "0.1.0"
+
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 DelimitedFiles = "8bb1440f-4735-579b-a4ab-409b98df4dab"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+Metis = "2679e427-3c69-5b7f-982b-ece356f1e94b"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 WriteVTK = "64499a7a-5c06-52f2-abe2-ccb03c286192"
+
+[extras]
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "Statistics"]
+
+[compat]
+Adapt = "4"
+CUDA = "5"
+HDF5 = "0.17"
+MPI = "0.20"
+Metis = "1"
+StaticArrays = "1"
+WriteVTK = "1"
+julia = "1.10"

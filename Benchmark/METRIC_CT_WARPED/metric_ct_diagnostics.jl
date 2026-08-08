@@ -189,7 +189,7 @@ function metric_ct_error_norms(blocks, state_time)
             )
             T = eltype(q)
             exact = metric_ct_alfven_primitive(
-                T(center[1]), T(state_time), T(Rg), T(1e-3),
+                T(center[1]), T(state_time), T(Rg), metric_ct_alfven_default_amplitude(T),
             )
             error_squared =
                 abs2(Float64(q[i,j,k,3] - exact[3])) +

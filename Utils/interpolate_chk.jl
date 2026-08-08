@@ -281,7 +281,7 @@ function main()
     println()
     println("═" ^ 60)
     println("  ✓ Interpolation Complete!")
-    println("  Set restart = \"$OUT_STEP\" in run_pipe.jl")
+    println("  Set restart = \"$OUT_STEP\" in run/baseline/pipe_baseline.jl")
     println("═" ^ 60)
 end
 

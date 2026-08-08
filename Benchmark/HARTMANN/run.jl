@@ -20,7 +20,7 @@ const cache_metrics::Bool = true
 const equation_type = :MHD
 const resistive::Bool = true   # Resistive MHD (magnetic diffusion enabled)
 const η_mhd::FT = FT(0.1)      # Magnetic resistivity
-const B0::FT = FT(1.0)         # Transverse magnetic field (Ha = B0 * H * sqrt(1/(eta * mu)))
+const B0_legacy::FT = FT(1.0)  # Reference value in the old mu0=1 test units
 const cr_glm::FT = FT(0.18e0)  # GLM damping ratio
 
 # Viscous parameters (mu = C_s * sqrt(T) -> 0.1 at T=1.0)
@@ -43,12 +43,11 @@ using AMDGPU
 
 # Project root for includes (two levels up from Benchmark/HARTMANN/)
 const _project_root = joinpath(@__DIR__, "..", "..")
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+const B0::FT = B0_legacy * SQRT_MU0_SI  # Stored magnetic field, Tesla
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 
 # ─── LES ───
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 
 # ─── Thermal state ───
 const γ::FT = FT(1.4)
@@ -87,7 +86,7 @@ const gpu_vram_gb::Float64 = 16.0
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 
 const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
     N_gpus = MPI.Comm_size(MPI.COMM_WORLD)
@@ -133,16 +132,12 @@ const step_plt::Int64 = 10000
 const chk_out::Bool = false
 const step_chk::Int64 = 5000
 const restart::String = "none"
-const inflow_restart::String = "none"
 
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
 
-const sample::Bool = false
-const sample_step::Int64 = 1000
-const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
 const filtering::Bool = false
@@ -157,7 +152,6 @@ const gg_blend::FT = zero(FT)
 
 # ─── FVM Config ───
 const eigen_reconstruction::Bool = false
-const character::Bool = false
 const splitMethodID::Int32 = 1     # Rusanov
 const hybrid_ϕ1::FT = FT(0.01e0)
 const hybrid_ϕ2::FT = one(FT)
@@ -185,8 +179,15 @@ rank = MPI.Comm_rank(comm)
 if rank == 0
     # Calculate analytic Hartmann number for display
     mu = C_s
+    if false
+    # SI Hartmann number (the legacy assignment below is overwritten).
+    Ha = B0 * R0 * sqrt(1.0 / (MU0_SI * 畏_mhd * mu))
     Ha = B0 * R0 * sqrt(1.0 / (η_mhd * mu))
     
+    Ha = B0 * R0 * sqrt(1.0 / (MU0_SI * 畏_mhd * mu))
+    end
+    eta_mhd_si = getfield(Main, Symbol(Char(0x754f), "_mhd"))
+    Ha = B0 * R0 * sqrt(1.0 / (MU0_SI * eta_mhd_si * mu))
     println("=" ^ 70)
     println("  Flame3D — Hartmann Flow Validation")
     println("=" ^ 70)

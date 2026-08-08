@@ -19,6 +19,8 @@
 #   # Faces: 1=ξ-, 2=ξ+, 3=η-, 4=η+, 5=ζ-, 6=ζ+
 #   [[connectivity]]
 #   blocks = [0, 3, 1, 4]
+#   # Optional signed source axes for destination (enables all 8 face modes):
+#   # axis_map = [1, -3, 2]
 #   
 #   [[connectivity]]
 #   blocks = [0, 4, 2, 3]
@@ -34,8 +36,12 @@
 using LinearAlgebra, HDF5, Printf
 import TOML
 
+if !isdefined(@__MODULE__, :StructuredFaceFrame)
+    include(joinpath(@__DIR__, "..", "src", "core", "structured_interface_transform.jl"))
+end
+
 # ─── Shared BC Constants ───
-include("../bc_types.jl")
+include(joinpath(@__DIR__, "..", "src", "core", "boundary_types.jl"))
 
 # Mapping from TOML bc_params key names to BCP slot indices
 const BCP_KEY_MAP = Dict{String, Int}(
@@ -504,6 +510,21 @@ function convert_mesh(grid_file, config_file)
         reverse_tan_arr[i] = dot(t1, t2) < 0 ? 1 : 0
     end
     println("  reverse_tan: ", reverse_tan_arr')
+    axis_map = structured_connectivity_axis_map(connectivity_rows, reverse_tan_arr)
+    for (row, connection) in enumerate(conn_list)
+        if haskey(connection, "axis_map")
+            values = Int64.(connection["axis_map"])
+            length(values) == 3 || error(
+                "connectivity row $row axis_map must contain three signed axes",
+            )
+            candidate = StructuredFaceTransform(
+                Int8(connectivity_rows[row, 2]), Int8(connectivity_rows[row, 4]),
+                Tuple(Int8.(values)),
+            )
+            structured_validate_face_transform(candidate)
+            axis_map[row, :] .= values
+        end
+    end
     
     # ─── Parse face_bc ───
     face_bc = zeros(Int64, nblocks, 6)
@@ -557,6 +578,7 @@ function convert_mesh(grid_file, config_file)
         f["Nz_b"] = Int64.(Nz_b)
         f["connectivity"] = connectivity_rows
         f["reverse_tan"] = reverse_tan_arr
+        f["axis_map"] = axis_map
         f["face_bc"] = face_bc
         f["bc_params"] = bc_params_arr
     end

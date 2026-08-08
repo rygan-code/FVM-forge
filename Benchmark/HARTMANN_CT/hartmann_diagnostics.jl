@@ -1,8 +1,12 @@
 using DelimitedFiles
 using Printf
 
+if !@isdefined(MHD_SI_UNITS_LOADED)
+    include(joinpath(@__DIR__, "..", "..", "src", "core", "mhd_units.jl"))
+end
+
 function hartmann_analytic_profiles(y, bulk_velocity, half_height, b0, mu, eta)
-    hartmann = b0 * half_height / sqrt(mu * eta)
+    hartmann = b0 * half_height / sqrt(MU0_SI * mu * eta)
     denominator = 1 - tanh(hartmann) / hartmann
     velocity_scale = bulk_velocity / denominator
     velocity = velocity_scale .* (

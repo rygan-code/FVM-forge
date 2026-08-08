@@ -23,7 +23,7 @@ const η_mhd::FT = FT(0.05)
 const ct_resistive_integrator::Symbol = Symbol(lowercase(get(
     ENV, "RESISTIVE_CT_DECAY_INTEGRATOR", "explicit",
 )))
-const decay_amplitude::FT = FT(0.1)
+const decay_amplitude_legacy::FT = FT(0.1)
 const cr_glm::FT = FT(0.18)
 
 const viscous::Bool = false
@@ -42,12 +42,11 @@ const weno_z::Bool = true
 using CUDA
 
 const _project_root = abspath(joinpath(@__DIR__, "..", ".."))
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+const decay_amplitude::FT = FT(0.1) * SQRT_MU0_SI
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 include(joinpath(@__DIR__, "decay_diagnostics.jl"))
 
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 const γ::FT = FT(1.4)
 const Rg::FT = one(FT)
 const Cp::FT = Rg * γ / (γ - one(FT))
@@ -72,7 +71,7 @@ const auto_partition_enabled::Bool = true
 const gpu_vram_gb::Float64 = 8.0
 const Block_Nprocs_manual = [SVector(1, 1, 1)]
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 const (Block_Nprocs, Block_to_rank) = auto_partition(
     Nx_b, Ny_b, Nz_b, MPI.Comm_size(MPI.COMM_WORLD);
     NG=NG, Ncons=Ncons, Nprim=Nprim,
@@ -103,14 +102,10 @@ const step_plt::Int64 = maxStep
 const chk_out::Bool = false
 const step_chk::Int64 = maxStep
 const restart::String = "none"
-const inflow_restart::String = "none"
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
-const sample::Bool = false
-const sample_step::Int64 = maxStep
-const sample_index::SVector{3,Int64} = SVector(-1, -1, -1)
 const filtering::Bool = false
 const filtering_nonlinear::Bool = false
 const filtering_interval::Int64 = 10
@@ -119,7 +114,6 @@ const filtering_s0::FT = FT(0.02)
 const viscous_order::Int64 = 2
 const gg_blend::FT = zero(FT)
 const eigen_reconstruction::Bool = true
-const character::Bool = false
 const hybrid_ϕ1::FT = FT(0.01)
 const hybrid_ϕ2::FT = one(FT)
 const hybrid_ϕ3::FT = FT(10)

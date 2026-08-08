@@ -99,6 +99,7 @@ function main_cebl_len15_coarse()
             flip_normal_arr[i] = 1
         end
     end
+    axis_map = structured_connectivity_axis_map(connectivity_rows, reverse_tan_arr)
 
     face_bc = zeros(Int64, 5, 6)
     for bid in 0:4
@@ -128,6 +129,7 @@ function main_cebl_len15_coarse()
         f["connectivity"] = connectivity_rows
         f["reverse_tan"] = reverse_tan_arr
         f["flip_normal"] = flip_normal_arr
+        f["axis_map"] = axis_map
         f["face_bc"] = face_bc
         f["bc_params"] = bc_params
     end

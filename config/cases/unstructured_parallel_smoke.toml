@@ -1,0 +1,59 @@
+name = "unstructured_parallel_smoke"
+initializer = "Sod"
+
+[backend]
+mesh_type = "unstructured"
+device = "cpu"
+mode = "native"
+
+[mesh]
+kind = "cartesian"
+cells = [24, 12, 8]
+lower = [0.0, 0.0, 0.0]
+upper = [1.0, 1.0, 1.0]
+
+[mesh.boundaries]
+xlo = "zero_gradient"
+xhi = "zero_gradient"
+ylo = "zero_gradient"
+yhi = "zero_gradient"
+zlo = "zero_gradient"
+zhi = "zero_gradient"
+
+[physics]
+equations = "compressible"
+gamma = 1.4
+gas_constant = 1.0
+prandtl = 0.72
+wall_temperature = 0.0
+viscous = false
+resistive = false
+resistivity = 0.0
+ct = false
+
+[numerics]
+order = 2
+riemann = "rusanov"
+cfl = 0.3
+positivity_mode = "strict"
+density_floor = 1.0e-8
+pressure_floor = 1.0e-8
+
+[time]
+final_time = 0.001
+max_steps = 2
+output_interval = 10
+
+[parallel]
+enabled = true
+partitioner = "metis"
+compute_imbalance = 1.05
+memory_imbalance = 1.05
+max_ghost_ratio = 0.5
+periodic_edge_multiplier = 16
+seed = 17
+gpu_aware = false
+
+[output]
+directory = "PLT/unstructured_parallel_smoke"
+write = false

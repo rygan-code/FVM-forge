@@ -104,11 +104,12 @@ function in_situ_post_process(tt, activeTime, current_dt, blocks,
     end
 
     # 确保所有 5 块都在（多 GPU 分区下每块在不同 rank）
-    # 如果本 rank 没有全部 5 块，需要 MPI 收集。
-    # 简化：假设单 rank 持有全部块（auto_partition 下可能不是）。
-    # TODO: 多 rank 支持（见下方注释）
+    # 当前实现只支持单 rank 持有全部主管块。
     if length(block_data) < 5
-        # @warn "[modal] 本 rank 只有 $(length(block_data))/5 块，跳过（需多 rank 支持）"
+        world_rank == 0 && @warn(
+            "[modal] 跳过在线模态采样：当前实现要求单 rank 持有全部 5 个主管块",
+            local_blocks=sort!(collect(keys(block_data))),
+        )
         return
     end
 

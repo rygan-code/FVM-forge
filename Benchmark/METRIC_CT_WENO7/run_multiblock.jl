@@ -2,8 +2,8 @@ using MPI
 using HDF5
 
 include(joinpath(@__DIR__, "run.jl"))
-include(joinpath(ROOT, "ct_sync.jl"))
-include(joinpath(ROOT, "ghost_coords.jl"))
+include(joinpath(ROOT,"src","parallel","ct_sync.jl"))
+include(joinpath(ROOT,"src","mesh","structured_ghost_coordinates.jl"))
 include(joinpath(@__DIR__, "interface_diagnostics.jl"))
 
 function multiblock_face_caches(resolution, block_id)
@@ -89,15 +89,20 @@ function multiblock_sync_state(edges, resolution, rank, topology)
         Bz_face=CUDA.zeros(FT, face_dims),
         Ex_edge=edges[1], Ey_edge=edges[2], Ez_edge=edges[3],
     )
-    local_entries = filter(entry -> entry[1] == rank, topology)
+    local_entries = filter(entry -> first(entry)[1] == rank, topology)
     length(local_entries) == 1 || error(
         "expected one WENO7 interface entry for block/rank $rank",
     )
-    _, fid, neighbor, neighbor_face, reverse_tan = only(local_entries)
+    key, connection = only(local_entries)
+    fid = key[2]
+    neighbor = connection.src_b
+    neighbor_face = connection.src_f
+    reverse_tan = connection.reverse_tan
     exchange = CTInterfaceExchange(
         rank, fid, neighbor, neighbor_face, neighbor, reverse_tan,
         1, resolution, 1, resolution,
         1, resolution, 1, resolution, CT_INTERFACE_TAG_BASE,
+        connection.transform,
     )
     nvalue = ct_interface_buffer_length(resolution, resolution)
     nhalo = ct_interface_halo_buffer_length(resolution, resolution)
@@ -112,15 +117,35 @@ function load_multiblock_topology(mesh_directory)
     path = joinpath(mesh_directory, "block_connectivity.h5")
     return h5open(path, "r") do file
         connectivity = read(file["connectivity"])
-        reverse_tan = vec(read(file["reverse_tan"]))
+        reverse_tan = haskey(file, "reverse_tan") ?
+            vec(read(file["reverse_tan"])) : zeros(Int64, size(connectivity, 1))
         size(connectivity, 1) == length(reverse_tan) || error(
             "connectivity/reverse_tan row count mismatch",
         )
-        [(
-            Int(connectivity[row,1]), Int(connectivity[row,2]),
-            Int(connectivity[row,3]), Int(connectivity[row,4]),
-            Bool(reverse_tan[row]),
-        ) for row in axes(connectivity, 1)]
+        axis_map = haskey(file, "axis_map") ? read(file["axis_map"]) : nothing
+        if axis_map !== nothing &&
+           (ndims(axis_map) != 2 || size(axis_map, 1) != size(connectivity, 1) ||
+            size(axis_map, 2) != 3)
+            error("malformed WENO7 axis_map metadata")
+        end
+        [begin
+            block = Int(connectivity[row, 1])
+            face = Int(connectivity[row, 2])
+            neighbor = Int(connectivity[row, 3])
+            neighbor_face = Int(connectivity[row, 4])
+            reverse = Bool(reverse_tan[row])
+            transform = axis_map === nothing ?
+                structured_legacy_face_transform(face, neighbor_face, reverse) :
+                StructuredFaceTransform(
+                    Int8(face), Int8(neighbor_face),
+                    Tuple(Int8.(axis_map[row, :])),
+                )
+            structured_validate_face_transform(transform)
+            (block, face) => (
+                src_b=neighbor, src_f=neighbor_face,
+                reverse_tan=reverse, transform=transform,
+            )
+        end for row in axes(connectivity, 1)]
     end
 end
 
@@ -158,9 +183,7 @@ function load_multiblock_coordinates(
         for bid in 0:1 for fid in 1:6
     )
     connectivity = Dict(
-        (entry[1], entry[2]) => (
-            src_b=entry[3], src_f=entry[4], reverse_tan=entry[5],
-        ) for entry in topology
+        first(entry) => last(entry) for entry in topology
     )
     global mesh_dir = mesh_directory
     return expand_coords_with_ghost(

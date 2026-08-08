@@ -1,0 +1,49 @@
+name = "unstructured_sod"
+initializer = "Sod"
+
+[backend]
+mesh_type = "unstructured"
+device = "cpu"
+mode = "native"
+
+[mesh]
+kind = "cartesian"
+cells = [200, 1, 1]
+lower = [0.0, 0.0, 0.0]
+upper = [1.0, 0.01, 0.01]
+
+[mesh.boundaries]
+xlo = "zero_gradient"
+xhi = "zero_gradient"
+ylo = "zero_gradient"
+yhi = "zero_gradient"
+zlo = "zero_gradient"
+zhi = "zero_gradient"
+
+[physics]
+equations = "compressible"
+gamma = 1.4
+gas_constant = 1.0
+prandtl = 0.72
+wall_temperature = 0.0
+viscous = false
+resistive = false
+resistivity = 0.0
+ct = false
+
+[numerics]
+order = 2
+riemann = "rusanov"
+cfl = 0.4
+positivity_mode = "strict"
+density_floor = 1.0e-8
+pressure_floor = 1.0e-8
+
+[time]
+final_time = 0.2
+max_steps = 2000
+output_interval = 100
+
+[output]
+directory = "PLT/unstructured_sod"
+write = true

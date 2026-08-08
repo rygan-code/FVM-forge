@@ -41,12 +41,10 @@ const ct_mode::Bool = true     # Enable Constrained Transport (staggered B)
 
 # Project root for includes (two levels up from Benchmark/BRIO_WU/)
 const _project_root = joinpath(@__DIR__, "..", "..")
-include(joinpath(_project_root, "physics.jl"))
-include(joinpath(_project_root, "solver.jl"))
+include(joinpath(_project_root,"src","core","equation_config.jl"))
+include(joinpath(_project_root,"src","time","structured_rk3_solver.jl"))
 
 # ─── LES ───
-const LES_smag::Bool = false
-const LES_wale::Bool = false
 
 # ─── Thermal state ───
 # IMPORTANT: Brio-Wu uses γ = 2.0!
@@ -86,7 +84,7 @@ const gpu_vram_gb::Float64 = 16.0
 const Block_Nprocs_manual = [SVector(1,1,1)]
 
 MPI.Init()
-include(joinpath(_project_root, "auto_partition.jl"))
+include(joinpath(_project_root,"src","parallel","auto_partition.jl"))
 
 const (Block_Nprocs, Block_to_rank) = if auto_partition_enabled
     N_gpus = MPI.Comm_size(MPI.COMM_WORLD)
@@ -130,16 +128,12 @@ const step_plt::Int64 = 500
 const chk_out::Bool = false
 const step_chk::Int64 = 1000
 const restart::String = "none"
-const inflow_restart::String = "none"
 
 const average::Bool = false
 const avg_step::Int64 = 10
 const avg_total::Int64 = 1000
 const avg_density_weighted::Bool = false
 
-const sample::Bool = false
-const sample_step::Int64 = 1000
-const sample_index::SVector{3, Int64} = [-1, -1, -1]
 
 # ─── Filtering ───
 const filtering::Bool = false       # Inviscid test — no filtering
@@ -155,7 +149,6 @@ const gg_blend::FT = zero(FT)
 
 # ─── FVM Config ───
 const eigen_reconstruction::Bool = false  # Must be false for MHD (no 9×9 eigensystem)
-const character::Bool = false
 const splitMethodID::Int32 = 1     # 1=Rusanov (test CT with face-Bn)
 const hybrid_ϕ1::FT = FT(0.01e0) # Low threshold: use WENO aggressively for shock tube
 const hybrid_ϕ2::FT = one(FT)

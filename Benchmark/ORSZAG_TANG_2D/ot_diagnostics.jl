@@ -23,6 +23,29 @@ function ot_raw_mhd_minima(Uh, gamma)
     return (rho=min_rho, ei=min_ei, p=min_p)
 end
 
+# CT keeps the magnetic field in Q/face-B instead of U.  This overload accepts
+# the compact hydro U slice together with the cell-centered magnetic Q slice.
+function ot_raw_mhd_minima(Uh, Qh, gamma)
+    size(Uh, 4) >= 5 || throw(ArgumentError("CT U must contain 5 components"))
+    size(Qh, 4) >= 3 || throw(ArgumentError("CT Q magnetic slice must contain 3 components"))
+    size(Uh, 1) == size(Qh, 1) || throw(DimensionMismatch("U/Q x dimensions differ"))
+    size(Uh, 2) == size(Qh, 2) || throw(DimensionMismatch("U/Q y dimensions differ"))
+    size(Uh, 3) == size(Qh, 3) || throw(DimensionMismatch("U/Q z dimensions differ"))
+    min_rho = Inf
+    min_ei = Inf
+    min_p = Inf
+    for k in axes(Uh, 3), j in axes(Uh, 2), i in axes(Uh, 1)
+        raw = mhd_raw_thermo_components(
+            Uh[i,j,k,1], Uh[i,j,k,2], Uh[i,j,k,3], Uh[i,j,k,4],
+            Uh[i,j,k,5], Qh[i,j,k,1], Qh[i,j,k,2], Qh[i,j,k,3], gamma,
+        )
+        min_rho = min(min_rho, raw[1])
+        min_ei = min(min_ei, raw[4])
+        min_p = min(min_p, raw[5])
+    end
+    return (rho=min_rho, ei=min_ei, p=min_p)
+end
+
 function ot_read_stats(path)
     lines = filter(line -> !isempty(strip(line)), readlines(path))
     header_index = findfirst(

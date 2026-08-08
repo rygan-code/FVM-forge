@@ -108,6 +108,7 @@ function main_spatial()
             flip_normal_arr[i] = 1
         end
     end
+    axis_map = structured_connectivity_axis_map(connectivity_rows, reverse_tan_arr)
 
     # ─── Boundary Conditions Array ───
     face_bc = zeros(Int64, 5, 6)
@@ -155,6 +156,7 @@ function main_spatial()
         f["connectivity"] = connectivity_rows
         f["reverse_tan"] = reverse_tan_arr
         f["flip_normal"] = flip_normal_arr
+        f["axis_map"] = axis_map
         f["face_bc"] = face_bc
         f["bc_params"] = bc_params
     end

@@ -1,5 +1,9 @@
 using HDF5
 
+if !isdefined(@__MODULE__, :StructuredFaceFrame)
+    include(joinpath(@__DIR__, "..", "..", "src", "core", "structured_interface_transform.jl"))
+end
+
 include(joinpath(@__DIR__, "mesh_quality.jl"))
 
 const METRIC_CT_MULTIBLOCK_NG = 4
@@ -53,6 +57,7 @@ function metric_ct_generate_multiblock_mesh(
     ]
     reverse_tan = topology === :reverse_tangent ? Int64[1, 1] : Int64[0, 0]
     flip_normal = Int64[0, 0]
+    axis_map = structured_connectivity_axis_map(connectivity_rows, reverse_tan)
     h5open(joinpath(out_dir, "block_connectivity.h5"), "w") do file
         file["Nblocks"] = Int64(2)
         file["Nx_b"] = Int64[nx, nx]
@@ -63,6 +68,7 @@ function metric_ct_generate_multiblock_mesh(
         file["connectivity"] = connectivity_rows
         file["reverse_tan"] = reverse_tan
         file["flip_normal"] = flip_normal
+        file["axis_map"] = axis_map
     end
 
     println("Curved two-block metric-CT mesh written to $out_dir: 2 x $(nx)x$(ny)x$(nz)")

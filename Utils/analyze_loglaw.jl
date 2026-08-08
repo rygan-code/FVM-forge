@@ -25,7 +25,7 @@
 
 using HDF5, Statistics, Printf, DelimitedFiles, CairoMakie, LaTeXStrings
 
-# ─── Physical constants (must match run_pipe.jl) ───
+# ─── Physical constants (must match run/baseline/pipe_baseline.jl) ───
 const γ  = 1.4
 const Rg = 287.0
 const C_s = 1.458e-6

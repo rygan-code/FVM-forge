@@ -1,56 +1,36 @@
-# Benchmark/SOD/verify.jl
-using HDF5, Statistics, Printf
+using HDF5
+using Printf
+using Statistics
 
-function exact_sod(x, t)
-    # Analytical values at t=0.2 for standard Sod case
-    if x < 0.2633
-        return 1.0, 0.0, 1.0  # Left state
-    elseif x < 0.4859
-        return 0.7, 0.4, 0.7  # Rarefaction wave (approx)
-    elseif x < 0.6855
-        return 0.4263, 0.9275, 0.3031 # Region 3
-    elseif x < 0.8504
-        return 0.2656, 0.9275, 0.3031 # Region 4 (Post-shock)
-    else
-        return 0.125, 0.0, 0.1 # Right state
-    end
+@isdefined(benchmark_plt_steps) ||
+    include(joinpath(@__DIR__, "..", "benchmark_io.jl"))
+
+function exact_sod_density(x)
+    x < 0.2633 && return 1.0
+    x < 0.4859 && return 0.7
+    x < 0.6855 && return 0.4263
+    x < 0.8504 && return 0.2656
+    return 0.125
 end
 
-function verify_sod()
-    case_dir = "Benchmark/SOD"
-    last_file = joinpath(case_dir, "plt-final.h5")
-    if !isfile(last_file)
-        # Fallback to PLT if final not found
-        plt_files = filter(f -> occursin(r"^plt-\d+\.h5$", f), readdir("./PLT"))
-        if isempty(plt_files); println("No PLT files found."); return; end
-        sorted_files = sort(plt_files, by = f -> parse(Int, match(r"plt-(\d+)\.h5", f).captures[1]))
-        last_file = joinpath("./PLT", sorted_files[end])
+function verify_sod(; plt_dir="PLT")
+    latest = latest_benchmark_plt_file(plt_dir, 0)
+    latest === nothing && return false
+    _, path = latest
+    density = h5open(path, "r") do file
+        read(file["rho"])
     end
-    println("Analyzing Sod: $last_file")
-
-    fid = h5open(last_file, "r")
-    rho = read(fid, "rho")[:, 4, 4]
-    p = read(fid, "p")[:, 4, 4]
-    close(fid)
-    
-    Nx = length(rho)
-    dx = 1.0/Nx
-    
-    errors = []
-    for i in 1:Nx
-        x = (i-0.5)*dx
-        rho_e, u_e, p_e = exact_sod(x, 0.2)
-        push!(errors, (rho[i]-rho_e)^2)
-    end
-    
-    l2_rho = sqrt(mean(errors))
-    @printf("L2 error in Density: %.6f\n", l2_rho)
-    
-    if l2_rho < 0.05
-        println("Verification PASSED!")
-    else
-        println("Verification FAILED (L2 error too high)!")
-    end
+    all(isfinite, density) && minimum(density) > 0 || return false
+    j = cld(size(density, 2), 2)
+    k = cld(size(density, 3), 2)
+    profile = @view density[:, j, k]
+    nx = length(profile)
+    l2_error = sqrt(mean((profile[i] - exact_sod_density((i - 0.5) / nx))^2
+                         for i in eachindex(profile)))
+    @printf("Sod density L2 error: %.6f\n", l2_error)
+    return l2_error < 0.05
 end
 
-verify_sod()
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    verify_sod() || exit(1)
+end
