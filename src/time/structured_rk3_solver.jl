@@ -5492,14 +5492,53 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     for ((dst_bid, fid), conn) in connectivity
                         dst_bid == b.id || continue
                         if fid == 1 || fid == 2
-                            @gpu_launch threads=(16, 16) blocks=(cld(b.Ny, 16), cld(b.Nz, 16)) interface_filter_kernel!(
-                                b.U, b.Nx, b.Ny, b.Nz, fid, 4, smax, b.lin_phi_i)
+                            @static if ct_mode
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Ny, 16), cld(b.Nz, 16)) ct_interface_filter_kernel!(
+                                    b.U, b.Bx_face, b.By_face, b.Bz_face,
+                                    b.Areai, b.nxi, b.nyi, b.nzi,
+                                    b.Areaj, b.nxj, b.nyj, b.nzj,
+                                    b.Areak, b.nxk, b.nyk, b.nzk,
+                                    b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_i, structured_task_gamma,
+                                    FT(density_floor), FT(pressure_floor),
+                                    b.B0x_face, b.B0y_face, b.B0z_face)
+                            else
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Ny, 16), cld(b.Nz, 16)) interface_filter_kernel!(
+                                    b.U, b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_i)
+                            end
                         elseif fid == 3 || fid == 4
-                            @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Nz, 16)) interface_filter_kernel!(
-                                b.U, b.Nx, b.Ny, b.Nz, fid, 4, smax, b.lin_phi_j)
+                            @static if ct_mode
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Nz, 16)) ct_interface_filter_kernel!(
+                                    b.U, b.Bx_face, b.By_face, b.Bz_face,
+                                    b.Areai, b.nxi, b.nyi, b.nzi,
+                                    b.Areaj, b.nxj, b.nyj, b.nzj,
+                                    b.Areak, b.nxk, b.nyk, b.nzk,
+                                    b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_j, structured_task_gamma,
+                                    FT(density_floor), FT(pressure_floor),
+                                    b.B0x_face, b.B0y_face, b.B0z_face)
+                            else
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Nz, 16)) interface_filter_kernel!(
+                                    b.U, b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_j)
+                            end
                         elseif fid == 5 || fid == 6
-                            @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Ny, 16)) interface_filter_kernel!(
-                                b.U, b.Nx, b.Ny, b.Nz, fid, 4, smax, b.lin_phi_k)
+                            @static if ct_mode
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Ny, 16)) ct_interface_filter_kernel!(
+                                    b.U, b.Bx_face, b.By_face, b.Bz_face,
+                                    b.Areai, b.nxi, b.nyi, b.nzi,
+                                    b.Areaj, b.nxj, b.nyj, b.nzj,
+                                    b.Areak, b.nxk, b.nyk, b.nzk,
+                                    b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_k, structured_task_gamma,
+                                    FT(density_floor), FT(pressure_floor),
+                                    b.B0x_face, b.B0y_face, b.B0z_face)
+                            else
+                                @gpu_launch threads=(16, 16) blocks=(cld(b.Nx, 16), cld(b.Ny, 16)) interface_filter_kernel!(
+                                    b.U, b.Nx, b.Ny, b.Nz, fid, 4,
+                                    smax, b.lin_phi_k)
+                            end
                         end
                     end
                 end

@@ -94,7 +94,9 @@ function build_structured_ghost_ct_task_graph(;
     if interface_filter
         add_structured_task!(builder, :interface_filter;
             depends=[:u_interblock_full_copy],
-            reads=[STRUCTURED_TASK_U_HALO],
+            reads=ct_mode ?
+                [STRUCTURED_TASK_U_HALO, STRUCTURED_TASK_FACE_B_HALO] :
+                [STRUCTURED_TASK_U_HALO],
             writes=[STRUCTURED_TASK_U_ACTIVE_FILTERED],
             exclusive=[:INTERFACE_FILTER_SCRATCH],
             start! = callback(:interface_filter))
