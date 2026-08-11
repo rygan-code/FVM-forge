@@ -448,43 +448,144 @@ end
             emf_b_cm + emf_b_c + emf_c_bm + emf_c_b) / 4
 end
 
-# Tangential flux arrays carry one ghost value on each side. These mappings
-# select the two face EMFs that meet at an edge without periodic wrap.
-@inline function ct_ez_face_flux_indices(edge_i, edge_j, cell_k)
-    one_i = one(edge_i)
-    one_j = one(edge_j)
-    one_k = one(cell_k)
-    return (
-        ((edge_i, edge_j, cell_k + one_k),
-         (edge_i, edge_j + one_j, cell_k + one_k)),
-        ((edge_i, edge_j, cell_k + one_k),
-         (edge_i + one_i, edge_j, cell_k + one_k)),
-    )
+"""
+    ct_generalized_junction_emf(cell_emf, face_emf, face_weight,
+                                negative_sector, positive_sector,
+                                sector_faces)
+
+Generalized SG07 UCT value for a cyclic multi-block edge junction. All EMFs
+must already use one canonical edge tangent, and each face weight must use the
+corresponding canonical face normal. `sector_faces[s]` contains the two
+physical-face indices bounding sector `s`.
+"""
+function ct_generalized_junction_emf(
+    cell_emf, face_emf, face_weight,
+    negative_sector, positive_sector, sector_faces,
+    sector_angle=nothing,
+)
+    nfaces = length(face_emf)
+    nfaces >= 3 || throw(ArgumentError(
+        "generalized CT junction requires at least three physical faces",
+    ))
+    length(cell_emf) == nfaces || throw(DimensionMismatch(
+        "junction sector and face counts must match",
+    ))
+    length(face_weight) == nfaces || throw(DimensionMismatch(
+        "junction face EMF and weight counts must match",
+    ))
+    length(negative_sector) == nfaces || throw(DimensionMismatch(
+        "junction negative-sector map has the wrong size",
+    ))
+    length(positive_sector) == nfaces || throw(DimensionMismatch(
+        "junction positive-sector map has the wrong size",
+    ))
+    length(sector_faces) == nfaces || throw(DimensionMismatch(
+        "junction sector-face incidence has the wrong size",
+    ))
+
+    T = eltype(face_emf)
+    if sector_angle === nothing
+        face_quadrature_weight = fill(inv(T(nfaces)), nfaces)
+    else
+        length(sector_angle) == nfaces || throw(DimensionMismatch(
+            "junction sector-angle count has the wrong size",
+        ))
+        all(angle -> isfinite(angle) && angle > zero(T), sector_angle) ||
+            throw(ArgumentError(
+                "generalized CT junction sector angles must be finite and positive",
+            ))
+        angle_sum = sum(sector_angle)
+        face_quadrature_weight = [
+            (sector_angle[negative_sector[face]] +
+             sector_angle[positive_sector[face]]) / (T(2)*angle_sum)
+            for face in eachindex(face_emf)
+        ]
+    end
+
+    total = zero(T)
+    for face in eachindex(face_emf)
+        negative = negative_sector[face]
+        positive = positive_sector[face]
+        negative_other = _ct_junction_other_face(
+            sector_faces[negative], face,
+        )
+        positive_other = _ct_junction_other_face(
+            sector_faces[positive], face,
+        )
+        weight = face_weight[face]
+        correction =
+            weight * (
+                face_emf[negative_other] - cell_emf[negative]
+            ) +
+            (one(weight) - weight) * (
+                face_emf[positive_other] - cell_emf[positive]
+            )
+        total += face_quadrature_weight[face] * (
+            face_emf[face] + correction
+        )
+    end
+    return total
 end
 
-@inline function ct_ey_face_flux_indices(edge_i, cell_j, edge_k)
-    one_i = one(edge_i)
-    one_j = one(cell_j)
-    one_k = one(edge_k)
-    return (
-        ((edge_i, cell_j + one_j, edge_k),
-         (edge_i, cell_j + one_j, edge_k + one_k)),
-        ((edge_i, cell_j + one_j, edge_k),
-         (edge_i + one_i, cell_j + one_j, edge_k)),
-    )
+@inline function _ct_junction_other_face(pair, face)
+    first_face, second_face = pair
+    if first_face == face
+        return second_face
+    elseif second_face == face
+        return first_face
+    end
+    throw(ArgumentError("face $face is not incident to junction sector $pair"))
 end
 
-@inline function ct_ex_face_flux_indices(cell_i, edge_j, edge_k)
-    one_i = one(cell_i)
+# Select the two face EMFs that meet at an edge without periodic wrap.  SG07
+# midpoint buffers use one tangential halo; POINT6 face-average buffers use two.
+@inline function ct_ez_face_flux_indices(
+    edge_i, edge_j, cell_k, tangential_halo,
+)
+    one_i = one(edge_i)
     one_j = one(edge_j)
-    one_k = one(edge_k)
+    halo = oftype(edge_i, tangential_halo)
     return (
-        ((cell_i + one_i, edge_j, edge_k),
-         (cell_i + one_i, edge_j, edge_k + one_k)),
-        ((cell_i + one_i, edge_j, edge_k),
-         (cell_i + one_i, edge_j + one_j, edge_k)),
+        ((edge_i, edge_j + halo - one_j, cell_k + halo),
+         (edge_i, edge_j + halo, cell_k + halo)),
+        ((edge_i + halo - one_i, edge_j, cell_k + halo),
+         (edge_i + halo, edge_j, cell_k + halo)),
     )
 end
+@inline ct_ez_face_flux_indices(edge_i, edge_j, cell_k) =
+    ct_ez_face_flux_indices(edge_i, edge_j, cell_k, one(edge_i))
+
+@inline function ct_ey_face_flux_indices(
+    edge_i, cell_j, edge_k, tangential_halo,
+)
+    one_i = one(edge_i)
+    one_k = one(edge_k)
+    halo = oftype(edge_i, tangential_halo)
+    return (
+        ((edge_i, cell_j + halo, edge_k + halo - one_k),
+         (edge_i, cell_j + halo, edge_k + halo)),
+        ((edge_i + halo - one_i, cell_j + halo, edge_k),
+         (edge_i + halo, cell_j + halo, edge_k)),
+    )
+end
+@inline ct_ey_face_flux_indices(edge_i, cell_j, edge_k) =
+    ct_ey_face_flux_indices(edge_i, cell_j, edge_k, one(edge_i))
+
+@inline function ct_ex_face_flux_indices(
+    cell_i, edge_j, edge_k, tangential_halo,
+)
+    one_j = one(edge_j)
+    one_k = one(edge_k)
+    halo = oftype(edge_j, tangential_halo)
+    return (
+        ((cell_i + halo, edge_j, edge_k + halo - one_k),
+         (cell_i + halo, edge_j, edge_k + halo)),
+        ((cell_i + halo, edge_j + halo - one_j, edge_k),
+         (cell_i + halo, edge_j + halo, edge_k)),
+    )
+end
+@inline ct_ex_face_flux_indices(cell_i, edge_j, edge_k) =
+    ct_ex_face_flux_indices(cell_i, edge_j, edge_k, one(edge_j))
 
 @inline function mhd_raw_thermo_components(
     rho, momentum_x, momentum_y, momentum_z, energy,
@@ -573,6 +674,54 @@ end
     )
 end
 
+@inline function ct_impose_magnetic_preserve_p(
+    U::SVector{N,T}, magnetic::SVector{3,T},
+) where {N,T}
+    old_magnetic2 = U[6]^2 + U[7]^2 + U[8]^2
+    new_magnetic2 = sum(abs2, magnetic)
+    energy = U[5] + T(0.5)*INV_MU0_SI*(new_magnetic2-old_magnetic2)
+    return SVector{N,T}(
+        ntuple(Val(N)) do n
+            n == 5 ? energy :
+            n == 6 ? magnetic[1] :
+            n == 7 ? magnetic[2] :
+            n == 8 ? magnetic[3] : U[n]
+        end,
+    )
+end
+
+"""Remove the analytically force-free pure-background Maxwell stress.
+
+The remaining flux still contains every `B0-b` cross term and the complete
+induction/energy flux. This is therefore a no-op when no background split is
+active, and an exact discrete equilibrium correction when `curl(B0)=0`.
+"""
+@inline function ct_remove_background_maxwell_stress(
+    flux::SVector{N,T}, background::SVector{3,T},
+    normal_x::T, normal_y::T, normal_z::T,
+) where {N,T}
+    background2 = sum(abs2, background)
+    background_normal = background[1]*normal_x +
+        background[2]*normal_y + background[3]*normal_z
+    half_background2 = T(0.5)*background2
+    stress_x = INV_MU0_SI*(
+        half_background2*normal_x-background_normal*background[1]
+    )
+    stress_y = INV_MU0_SI*(
+        half_background2*normal_y-background_normal*background[2]
+    )
+    stress_z = INV_MU0_SI*(
+        half_background2*normal_z-background_normal*background[3]
+    )
+    return SVector{N,T}(
+        ntuple(Val(N)) do n
+            n == 2 ? flux[n]-stress_x :
+            n == 3 ? flux[n]-stress_y :
+            n == 4 ? flux[n]-stress_z : flux[n]
+        end,
+    )
+end
+
 @inline function ct_average_to_point6(v::SVector{5,T}) where {T}
     return T(3)/T(640)*v[1] - T(29)/T(480)*v[2] +
            T(1067)/T(960)*v[3] - T(29)/T(480)*v[4] +
@@ -593,6 +742,469 @@ end
 @inline function _ct_average_to_point6_weight(::Type{T}, index) where {T}
     return index == 1 || index == 5 ? T(3)/T(640) :
            (index == 2 || index == 4 ? -T(29)/T(480) : T(1067)/T(960))
+end
+
+@inline function _ct_point6_fixed_coefficients(::Type{T}) where {T}
+    return SVector{5,T}(
+        T(3)/T(640), -T(29)/T(480), T(1067)/T(960),
+        -T(29)/T(480), T(3)/T(640),
+    )
+end
+
+@inline function _ct_point6_adaptive_enabled()
+    @static if @isdefined(ct_point6_adaptive_recovery)
+        return ct_point6_adaptive_recovery
+    else
+        return true
+    end
+end
+
+@inline function _ct_point6_sensor_threshold(::Type{T}) where {T}
+    @static if @isdefined(ct_point6_smoothness_threshold)
+        return T(ct_point6_smoothness_threshold)
+    else
+        return T(5.0e-1)
+    end
+end
+
+@inline function _ct_point6_ao_high_weight(::Type{T}) where {T}
+    @static if @isdefined(ct_point6_ao_high_weight)
+        return T(ct_point6_ao_high_weight)
+    else
+        return T(0.85)
+    end
+end
+
+@inline function _ct_point6_limit_iterations()
+    @static if @isdefined(ct_point6_limiter_iterations)
+        return Int(ct_point6_limiter_iterations)
+    else
+        return 16
+    end
+end
+
+@inline function _ct_point6_smooth_activation(
+    value::T, lower::T, upper::T,
+) where {T}
+    value <= lower && return zero(T)
+    value >= upper && return one(T)
+    upper > lower || return one(T)
+    coordinate = (value-lower)/(upper-lower)
+    return coordinate*coordinate*(T(3)-T(2)*coordinate)
+end
+
+@inline function ct_point6_select_direction_coefficients(
+    fixed::SVector{5,T}, ao::SVector{5,T}, sensor::T, threshold::T,
+) where {T}
+    return sensor > threshold ? (ao,true) : (fixed,false)
+end
+
+@inline function _ct_point6_homogeneous_axes()
+    @static if @isdefined(ct_point6_homogeneous_axes)
+        return ct_point6_homogeneous_axes
+    else
+        return (false,false,false)
+    end
+end
+
+@inline function _ct_point6_sensor_center(i, j, k)
+    homogeneous = _ct_point6_homogeneous_axes()
+    return (
+        homogeneous[1] ? oftype(i,NG+1) : i,
+        homogeneous[2] ? oftype(j,NG+1) : j,
+        homogeneous[3] ? oftype(k,NG+1) : k,
+    )
+end
+
+@inline function _ct_point6_beta_high(v::SVector{5,T}) where {T}
+    a1 = -(T(34)*v[2]-T(5)*v[1]-T(34)*v[4]+T(5)*v[5])/T(48)
+    a2 = -(T(22)*v[3]-T(12)*v[2]+v[1]-T(12)*v[4]+v[5])/T(16)
+    a3 = (T(2)*v[2]-v[1]-T(2)*v[4]+v[5])/T(12)
+    a4 = (T(6)*v[3]-T(4)*v[2]+v[1]-T(4)*v[4]+v[5])/T(24)
+    return a1*a1 + T(0.5)*a1*a3 + T(13)/T(3)*a2*a2 +
+           T(21)/T(5)*a2*a4 + T(3129)/T(80)*a3*a3 +
+           T(87617)/T(140)*a4*a4
+end
+
+@inline function _ct_point6_beta_low(v::SVector{5,T}) where {T}
+    beta_left = T(13)/T(12)*(v[1]-T(2)*v[2]+v[3])^2 +
+                T(0.25)*(v[1]-T(4)*v[2]+T(3)*v[3])^2
+    beta_center = T(13)/T(12)*(v[2]-T(2)*v[3]+v[4])^2 +
+                  T(0.25)*(v[2]-v[4])^2
+    beta_right = T(13)/T(12)*(v[3]-T(2)*v[4]+v[5])^2 +
+                 T(0.25)*(T(3)*v[3]-T(4)*v[4]+v[5])^2
+    return SVector{3,T}(beta_left, beta_center, beta_right)
+end
+
+@inline function ct_point6_ao_direction_coefficients(
+    stencil::NTuple{5,SVector{N,T}},
+) where {N,T}
+    beta_low = MVector{3,T}(zero(T), zero(T), zero(T))
+    beta_high = zero(T)
+    finite_stencil = true
+    component_scales = MVector{N,T}(ntuple(_ -> zero(T), Val(N)))
+    for component in 1:N
+        for index in 1:5
+            component_scales[component] = max(
+                component_scales[component],abs(stencil[index][component]),
+            )
+        end
+        finite_stencil &= isfinite(component_scales[component])
+    end
+    density_scale = component_scales[1]
+    energy_scale = N >= 5 ? component_scales[5] : density_scale
+    momentum_scale = sqrt(max(zero(T), density_scale*energy_scale))
+    roundoff_scale = sqrt(eps(T))*sqrt(sqrt(eps(T)))
+    for component in 1:N
+        values = SVector{5,T}(ntuple(
+            index -> stencil[index][component], Val(5),
+        ))
+        scale = component_scales[component]
+        reference_scale = if component == 1
+            density_scale
+        elseif 2 <= component <= 4
+            momentum_scale
+        elseif component == 5
+            energy_scale
+        else
+            scale
+        end
+        component_cutoff = roundoff_scale*reference_scale
+        activation = if component_cutoff > zero(T)
+            _ct_point6_smooth_activation(
+                scale,component_cutoff,T(2)*component_cutoff,
+            )
+        else
+            scale > zero(T) ? one(T) : zero(T)
+        end
+        if activation > zero(T)
+            normalized = values/scale
+            local_low = _ct_point6_beta_low(normalized)
+            beta_low[1] += activation*local_low[1]
+            beta_low[2] += activation*local_low[2]
+            beta_low[3] += activation*local_low[3]
+            beta_high += activation*_ct_point6_beta_high(normalized)
+        end
+    end
+
+    fixed = _ct_point6_fixed_coefficients(T)
+    left = SVector{5,T}(-T(1)/T(24), T(1)/T(12), T(23)/T(24), zero(T), zero(T))
+    center = SVector{5,T}(zero(T), -T(1)/T(24), T(13)/T(12), -T(1)/T(24), zero(T))
+    right = SVector{5,T}(zero(T), zero(T), T(23)/T(24), T(1)/T(12), -T(1)/T(24))
+    finite_stencil || return center, one(T)
+
+    gamma_high = _ct_point6_ao_high_weight(T)
+    gamma_low = (one(T)-gamma_high)/T(3)
+    tau = (
+        abs(beta_high-beta_low[1]) + abs(beta_high-beta_low[2]) +
+        abs(beta_high-beta_low[3])
+    )/T(3)
+    beta_scale = max(
+        beta_high, (beta_low[1]+beta_low[2]+beta_low[3])/T(3),
+    )
+    epsilon_beta = T(64)*eps(T)
+    sensor = tau/(beta_scale+epsilon_beta)
+
+    alpha_high = gamma_high*(
+        one(T)+(tau/(beta_high+epsilon_beta))^2
+    )
+    alpha_left = gamma_low*(
+        one(T)+(tau/(beta_low[1]+epsilon_beta))^2
+    )
+    alpha_center = gamma_low*(
+        one(T)+(tau/(beta_low[2]+epsilon_beta))^2
+    )
+    alpha_right = gamma_low*(
+        one(T)+(tau/(beta_low[3]+epsilon_beta))^2
+    )
+    alpha_sum = alpha_high+alpha_left+alpha_center+alpha_right
+    if !(isfinite(alpha_sum) && alpha_sum > zero(T))
+        return center, one(T)
+    end
+    omega_high = alpha_high/alpha_sum
+    omega_left = alpha_left/alpha_sum
+    omega_center = alpha_center/alpha_sum
+    omega_right = alpha_right/alpha_sum
+    corrected_high = (
+        fixed-gamma_low*(left+center+right)
+    )/gamma_high
+    coefficients = omega_high*corrected_high + omega_left*left +
+                   omega_center*center + omega_right*right
+    coefficient_sum = sum(coefficients)
+    if !(isfinite(coefficient_sum) && abs(coefficient_sum) > eps(T))
+        return center, one(T)
+    end
+    return coefficients/coefficient_sum, sensor
+end
+
+@inline function _ct_point6_cell_conservative(U, i, j, k)
+    T = eltype(U)
+    @static if @isdefined(Ncell_cons)
+        has_psi = Ncell_cons >= 9
+    else
+        has_psi = size(U,4) >= 9
+    end
+    @inbounds return SVector{6,T}(
+        U[i,j,k,1], U[i,j,k,2], U[i,j,k,3], U[i,j,k,4],
+        U[i,j,k,5], has_psi ? U[i,j,k,9] : zero(T),
+    )
+end
+
+@inline function _ct_point6_active_stencil(
+    U, i, j, k, ::Val{DIRECTION},
+) where {DIRECTION}
+    return ntuple(Val(5)) do index
+        offset = index-3
+        ii = DIRECTION == 1 ? i+offset : i
+        jj = DIRECTION == 2 ? j+offset : j
+        kk = DIRECTION == 3 ? k+offset : k
+        _ct_point6_cell_conservative(U, ii, jj, kk)
+    end
+end
+
+@inline function ct_point6_active_ao_coefficients(U, i, j, k)
+    fixed = _ct_point6_fixed_coefficients(eltype(U))
+    homogeneous = _ct_point6_homogeneous_axes()
+    sensor_i,sensor_j,sensor_k = _ct_point6_sensor_center(i,j,k)
+    x_coefficients, x_sensor = homogeneous[1] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_active_stencil(
+                U,sensor_i,sensor_j,sensor_k,Val(1),
+            ),
+        )
+    y_coefficients, y_sensor = homogeneous[2] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_active_stencil(
+                U,sensor_i,sensor_j,sensor_k,Val(2),
+            ),
+        )
+    z_coefficients, z_sensor = homogeneous[3] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_active_stencil(
+                U,sensor_i,sensor_j,sensor_k,Val(3),
+            ),
+        )
+    return x_coefficients, y_coefficients, z_coefficients,
+           x_sensor, y_sensor, z_sensor
+end
+
+@inline function ct_conservative_average_to_point_coefficients(
+    U, inverse_volume, i, j, k,
+    x_coefficients::SVector{5,T}, y_coefficients::SVector{5,T},
+    z_coefficients::SVector{5,T},
+) where {T}
+    point = MVector{6,T}(
+        zero(T), zero(T), zero(T), zero(T), zero(T), zero(T),
+    )
+    jacobian_point = zero(T)
+    @static if @isdefined(Ncell_cons)
+        has_psi = Ncell_cons >= 9
+    else
+        has_psi = size(U,4) >= 9
+    end
+    for x_index in 1:5
+        di = x_index-3
+        for y_index in 1:5
+            dj = y_index-3
+            for z_index in 1:5
+                dk = z_index-3
+                weight = x_coefficients[x_index]*y_coefficients[y_index]*
+                         z_coefficients[z_index]
+                ii, jj, kk = i+di, j+dj, k+dk
+                @inbounds jacobian_average = one(T)/inverse_volume[ii,jj,kk]
+                weighted_jacobian = weight*jacobian_average
+                jacobian_point += weighted_jacobian
+                @inbounds for component in 1:5
+                    point[component] += weighted_jacobian*U[ii,jj,kk,component]
+                end
+                if has_psi
+                    @inbounds point[6] += weighted_jacobian*U[ii,jj,kk,9]
+                end
+            end
+        end
+    end
+    if !(isfinite(jacobian_point) && jacobian_point > zero(T))
+        bad = T(NaN)
+        return SVector{6,T}(ntuple(_ -> bad, Val(6)))
+    end
+    return SVector{6,T}(point/jacobian_point)
+end
+
+@inline function ct_conservative_average_to_point_adaptive(
+    U, inverse_volume, i, j, k,
+)
+    T = eltype(U)
+    fixed = _ct_point6_fixed_coefficients(T)
+    if !_ct_point6_adaptive_enabled()
+        hydro = ct_conservative_average_to_point6(U,inverse_volume,i,j,k)
+        return hydro, fixed, fixed, fixed, false
+    end
+    x_ao, y_ao, z_ao, x_sensor, y_sensor, z_sensor =
+        ct_point6_active_ao_coefficients(U,i,j,k)
+    threshold = _ct_point6_sensor_threshold(T)
+    x_coefficients,x_used = ct_point6_select_direction_coefficients(
+        fixed,x_ao,x_sensor,threshold,
+    )
+    y_coefficients,y_used = ct_point6_select_direction_coefficients(
+        fixed,y_ao,y_sensor,threshold,
+    )
+    z_coefficients,z_used = ct_point6_select_direction_coefficients(
+        fixed,z_ao,z_sensor,threshold,
+    )
+    used_ao = x_used || y_used || z_used
+    if !used_ao
+        hydro = ct_conservative_average_to_point6(U,inverse_volume,i,j,k)
+        return hydro, x_ao, y_ao, z_ao, false
+    end
+    hydro = ct_conservative_average_to_point_coefficients(
+        U,inverse_volume,i,j,k,
+        x_coefficients,y_coefficients,z_coefficients,
+    )
+    return hydro, x_ao, y_ao, z_ao, true
+end
+
+@inline function _ct_point6_vector_is_finite(vector)
+    finite = true
+    for component in eachindex(vector)
+        finite &= isfinite(vector[component])
+    end
+    return finite
+end
+
+@inline function _ct_point6_required_density(
+    minimum_density::T, minimum_pressure::T,
+) where {T}
+    @static if isothermal_mhd
+        thermal_coefficient = T(Rg)*T(isothermal_temperature)
+        return max(minimum_density, minimum_pressure/thermal_coefficient)
+    else
+        return minimum_density
+    end
+end
+
+# FOFC keeps the synchronized transport coefficient in channel 1 and a local
+# Jacobi proposal in channel 2. Only channel 1 is exchanged across block/rank
+# halos and consumed by face, edge, and junction operators.
+const CT_FOFC_COMMITTED_CHANNEL = 1
+const CT_FOFC_PROPOSAL_CHANNEL = 2
+
+# A negative coefficient is inactive; an active value in [0,1] scales the
+# low-order face fluxes and edge EMFs. This leaves zero available as the exact
+# no-transport anchor required by the a posteriori convex limiter.
+@inline ct_fofc_flag_is_active(value) = value >= zero(value)
+
+@inline function ct_fofc_flag_scale(value)
+    ct_fofc_flag_is_active(value) || return one(value)
+    return clamp(value,zero(value),one(value))
+end
+
+@inline function ct_point6_state_is_admissible(
+    hydro::SVector{6,T}, magnetic::SVector{3,T}, gamma::T,
+    minimum_density::T, minimum_pressure::T,
+) where {T}
+    _ct_point6_vector_is_finite(hydro) || return false
+    _ct_point6_vector_is_finite(magnetic) || return false
+    rho = hydro[1]
+    rho >= _ct_point6_required_density(
+        minimum_density,minimum_pressure,
+    ) || return false
+    @static if isothermal_mhd
+        return true
+    else
+        gamma > one(T) || return false
+        kinetic = T(0.5)*(
+            hydro[2]^2+hydro[3]^2+hydro[4]^2
+        )/rho
+        magnetic_energy = T(0.5)*INV_MU0_SI*dot(magnetic,magnetic)
+        internal = hydro[5]-kinetic-magnetic_energy
+        return isfinite(internal) &&
+               internal >= minimum_pressure/(gamma-one(T))
+    end
+end
+
+@inline function _ct_point6_blend(low::SVector{N,T}, high::SVector{N,T}, theta::T) where {N,T}
+    return low+theta*(high-low)
+end
+
+@inline function ct_point6_convex_limit(
+    high_hydro::SVector{6,T}, high_magnetic::SVector{3,T},
+    low_hydro::SVector{6,T}, low_magnetic::SVector{3,T}, gamma::T,
+    minimum_density::T, minimum_pressure::T,
+) where {T}
+    ct_point6_state_is_admissible(
+        low_hydro,low_magnetic,gamma,minimum_density,minimum_pressure,
+    ) || return high_hydro, high_magnetic, one(T), false
+    if !_ct_point6_vector_is_finite(high_hydro) ||
+       !_ct_point6_vector_is_finite(high_magnetic)
+        return low_hydro, low_magnetic, zero(T), true
+    end
+
+    required_density = _ct_point6_required_density(
+        minimum_density,minimum_pressure,
+    )
+    theta_max = one(T)
+    if high_hydro[1] < required_density
+        denominator = low_hydro[1]-high_hydro[1]
+        if !(isfinite(denominator) && denominator > zero(T))
+            return low_hydro, low_magnetic, zero(T), true
+        end
+        theta_max = clamp(
+            (low_hydro[1]-required_density)/denominator, zero(T), one(T),
+        )
+    end
+    trial_hydro = _ct_point6_blend(low_hydro,high_hydro,theta_max)
+    trial_magnetic = _ct_point6_blend(low_magnetic,high_magnetic,theta_max)
+    if ct_point6_state_is_admissible(
+        trial_hydro,trial_magnetic,gamma,minimum_density,minimum_pressure,
+    )
+        return trial_hydro, trial_magnetic, theta_max, true
+    end
+
+    low_theta = zero(T)
+    high_theta = theta_max
+    for _ in 1:_ct_point6_limit_iterations()
+        middle = T(0.5)*(low_theta+high_theta)
+        middle_hydro = _ct_point6_blend(low_hydro,high_hydro,middle)
+        middle_magnetic = _ct_point6_blend(low_magnetic,high_magnetic,middle)
+        if ct_point6_state_is_admissible(
+            middle_hydro,middle_magnetic,gamma,
+            minimum_density,minimum_pressure,
+        )
+            low_theta = middle
+        else
+            high_theta = middle
+        end
+    end
+    limited_hydro = _ct_point6_blend(low_hydro,high_hydro,low_theta)
+    limited_magnetic = _ct_point6_blend(
+        low_magnetic,high_magnetic,low_theta,
+    )
+    return limited_hydro, limited_magnetic, low_theta, true
+end
+
+@inline function ct_point6_select_admissible_state(
+    candidate_hydro::SVector{6,T}, ao_hydro::SVector{6,T},
+    low_hydro::SVector{6,T}, high_magnetic::SVector{3,T},
+    low_magnetic::SVector{3,T}, gamma::T,
+    minimum_density::T, minimum_pressure::T, used_ao::Bool,
+) where {T}
+    if ct_point6_state_is_admissible(
+        candidate_hydro,high_magnetic,gamma,minimum_density,minimum_pressure,
+    )
+        return candidate_hydro, high_magnetic, one(T),
+               (used_ao ? Int32(1) : Int32(0))
+    end
+    if !used_ao && ct_point6_state_is_admissible(
+        ao_hydro,high_magnetic,gamma,minimum_density,minimum_pressure,
+    )
+        return ao_hydro, high_magnetic, one(T), Int32(1)
+    end
+    limited_hydro, limited_magnetic, theta, limited = ct_point6_convex_limit(
+        ao_hydro,high_magnetic,low_hydro,low_magnetic,gamma,
+        minimum_density,minimum_pressure,
+    )
+    return limited_hydro, limited_magnetic, theta,
+           (limited ? Int32(2) : Int32(3))
 end
 
 @inline function _ct_face_point_data6(

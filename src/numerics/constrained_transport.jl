@@ -15,40 +15,12 @@ if !@isdefined(STRUCTURED_FACE_QUADRATURE_LOADED)
     include(joinpath(@__DIR__, "structured_face_quadrature.jl"))
 end
 
-function validate_ct_background_split_configuration(;
-    enabled::Bool,
-    equation::Symbol,
-    ct_enabled::Bool,
-    split_method::Integer,
-    eigen_reconstruction_enabled::Bool,
-    resistive_enabled::Bool,
-)
-    enabled || return nothing
-    equation == :MHD || throw(ArgumentError(
-        "magnetic background splitting requires equation_type=:MHD",
-    ))
-    ct_enabled || throw(ArgumentError(
-        "magnetic background splitting currently requires CT",
-    ))
-    split_method == 6 || throw(ArgumentError(
-        "magnetic background splitting currently supports only " *
-        "splitMethodID=6 (HLLE), got $split_method",
-    ))
-    !eigen_reconstruction_enabled || throw(ArgumentError(
-        "magnetic background splitting does not yet support eigen reconstruction",
-    ))
-    !resistive_enabled || throw(ArgumentError(
-        "magnetic background splitting currently supports only ideal MHD",
-    ))
-    return nothing
-end
-
 function ct_init_face_b_kernel!(
     Bx_face, By_face, Bz_face, Q,
     Areai, nxi, nyi, nzi,
     Areaj, nxj, nyj, nzj,
     Areak, nxk, nyk, nzk,
-    nxp, nyp, nzp,
+    nxp, nyp, nzp, physical_face_mask,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -61,27 +33,54 @@ function ct_init_face_b_kernel!(
         # Despite their legacy names, face arrays store Phi_B = (B dot n) A.
         if i <= nxp + Int32(1) && j <= nyp && k <= nzp
             @inbounds begin
-                bx = FT(0.5) * (Q[ii, jj, kk, QBX] + Q[ii-Int32(1), jj, kk, QBX])
-                by = FT(0.5) * (Q[ii, jj, kk, QBY] + Q[ii-Int32(1), jj, kk, QBY])
-                bz = FT(0.5) * (Q[ii, jj, kk, QBZ] + Q[ii-Int32(1), jj, kk, QBZ])
+                left_i = ii - Int32(1)
+                right_i = ii
+                if i == Int32(1) &&
+                   (physical_face_mask & Int32(0x01)) != Int32(0)
+                    left_i = right_i
+                elseif i == nxp + Int32(1) &&
+                       (physical_face_mask & Int32(0x02)) != Int32(0)
+                    right_i = left_i
+                end
+                bx = FT(0.5) * (Q[right_i, jj, kk, QBX] + Q[left_i, jj, kk, QBX])
+                by = FT(0.5) * (Q[right_i, jj, kk, QBY] + Q[left_i, jj, kk, QBY])
+                bz = FT(0.5) * (Q[right_i, jj, kk, QBZ] + Q[left_i, jj, kk, QBZ])
                 Bx_face[ii, jj, kk] = Areai[ii, jj, kk] *
                     (bx*nxi[ii, jj, kk] + by*nyi[ii, jj, kk] + bz*nzi[ii, jj, kk])
             end
         end
         if i <= nxp && j <= nyp + Int32(1) && k <= nzp
             @inbounds begin
-                bx = FT(0.5) * (Q[ii, jj, kk, QBX] + Q[ii, jj-Int32(1), kk, QBX])
-                by = FT(0.5) * (Q[ii, jj, kk, QBY] + Q[ii, jj-Int32(1), kk, QBY])
-                bz = FT(0.5) * (Q[ii, jj, kk, QBZ] + Q[ii, jj-Int32(1), kk, QBZ])
+                left_j = jj - Int32(1)
+                right_j = jj
+                if j == Int32(1) &&
+                   (physical_face_mask & Int32(0x04)) != Int32(0)
+                    left_j = right_j
+                elseif j == nyp + Int32(1) &&
+                       (physical_face_mask & Int32(0x08)) != Int32(0)
+                    right_j = left_j
+                end
+                bx = FT(0.5) * (Q[ii, right_j, kk, QBX] + Q[ii, left_j, kk, QBX])
+                by = FT(0.5) * (Q[ii, right_j, kk, QBY] + Q[ii, left_j, kk, QBY])
+                bz = FT(0.5) * (Q[ii, right_j, kk, QBZ] + Q[ii, left_j, kk, QBZ])
                 By_face[ii, jj, kk] = Areaj[ii, jj, kk] *
                     (bx*nxj[ii, jj, kk] + by*nyj[ii, jj, kk] + bz*nzj[ii, jj, kk])
             end
         end
         if i <= nxp && j <= nyp && k <= nzp + Int32(1)
             @inbounds begin
-                bx = FT(0.5) * (Q[ii, jj, kk, QBX] + Q[ii, jj, kk-Int32(1), QBX])
-                by = FT(0.5) * (Q[ii, jj, kk, QBY] + Q[ii, jj, kk-Int32(1), QBY])
-                bz = FT(0.5) * (Q[ii, jj, kk, QBZ] + Q[ii, jj, kk-Int32(1), QBZ])
+                left_k = kk - Int32(1)
+                right_k = kk
+                if k == Int32(1) &&
+                   (physical_face_mask & Int32(0x10)) != Int32(0)
+                    left_k = right_k
+                elseif k == nzp + Int32(1) &&
+                       (physical_face_mask & Int32(0x20)) != Int32(0)
+                    right_k = left_k
+                end
+                bx = FT(0.5) * (Q[ii, jj, right_k, QBX] + Q[ii, jj, left_k, QBX])
+                by = FT(0.5) * (Q[ii, jj, right_k, QBY] + Q[ii, jj, left_k, QBY])
+                bz = FT(0.5) * (Q[ii, jj, right_k, QBZ] + Q[ii, jj, left_k, QBZ])
                 Bz_face[ii, jj, kk] = Areak[ii, jj, kk] *
                     (bx*nxk[ii, jj, kk] + by*nyk[ii, jj, kk] + bz*nzk[ii, jj, kk])
             end
@@ -90,7 +89,9 @@ function ct_init_face_b_kernel!(
     return
 end
 
-function ct_init_face_b!(b, nxp, nyp, nzp)
+function ct_init_face_b!(
+    b, nxp, nyp, nzp; physical_face_mask::Integer=0,
+)
     # Launch over the union of all face ranges: (nxp+1) x (nyp+1) x (nzp+1)
     nb = (cld(nxp + 1 + 2*NG, nthreads[1]), cld(nyp + 1 + 2*NG, nthreads[2]), cld(nzp + 1 + 2*NG, nthreads[3]))
     @gpu_launch threads=nthreads blocks=nb ct_init_face_b_kernel!(
@@ -98,61 +99,126 @@ function ct_init_face_b!(b, nxp, nyp, nzp)
         b.Areai, b.nxi, b.nyi, b.nzi,
         b.Areaj, b.nxj, b.nyj, b.nzj,
         b.Areak, b.nxk, b.nyk, b.nzk,
-        Int32(nxp), Int32(nyp), Int32(nzp))
+        Int32(nxp), Int32(nyp), Int32(nzp), Int32(physical_face_mask))
 end
 
-function ct_initial_face_flux_from_vector_potential!(
-    b, vector_potential; time=zero(FT),
+@inline _ct_initial_host_coordinate(array::Array) = array
+@inline _ct_initial_host_coordinate(array) = Array(array)
+
+function ct_initial_coordinate_arrays(b, coordinates=nothing)
+    source = coordinates === nothing ? b : coordinates
+    all(name -> hasproperty(source, name), (:x, :y, :z)) ||
+        throw(ArgumentError(
+            "CT initial coordinates must provide x, y and z node arrays",
+        ))
+    return (
+        _ct_initial_host_coordinate(getproperty(source, :x)),
+        _ct_initial_host_coordinate(getproperty(source, :y)),
+        _ct_initial_host_coordinate(getproperty(source, :z)),
+    )
+end
+
+function ct_initial_edge_line_integrals_from_vector_potential!(
+    b, vector_potential;
+    time=zero(FT), junction_edge_mask::Integer=0,
+    coordinates=nothing, junction_fallback::Bool=true,
 )
-    x = Array(b.x)
-    y = Array(b.y)
-    z = Array(b.z)
+    x, y, z = ct_initial_coordinate_arrays(b, coordinates)
     size(x) == size(y) == size(z) || throw(DimensionMismatch(
         "CT node-coordinate arrays must have identical sizes",
     ))
-    singularity_edges = nothing
-    if hasproperty(b, :id) && isdefined(@__MODULE__, :_SING_INFO)
-        singularity_info = getfield(@__MODULE__, :_SING_INFO)
-        if singularity_info !== nothing &&
-           b.id + 1 <= size(singularity_info.is_singularity_edge, 1)
-            candidate = ntuple(
-                edge_index -> singularity_info.is_singularity_edge[
-                    b.id + 1, edge_index,
-                ],
-                12,
-            )
-            any(candidate) && (singularity_edges = candidate)
-        end
-    end
+    singularity_edges = junction_fallback ?
+        structured_metric_singularity_edges_from_mask(junction_edge_mask) :
+        nothing
     edge_x, edge_y, edge_z = structured_scmm_edge_line_integrals(
         vector_potential, x, y, z;
-        time=FT(time),
-        active_dims=(b.Nx, b.Ny, b.Nz),
-        ng=NG,
-        singularity_edges=singularity_edges,
-        junction_layers=STRUCTURED_METRIC_JUNCTION_LAYERS,
-    )
-    phi_x, phi_y, phi_z = ct_face_fluxes_from_edge_integrals(
-        edge_x, edge_y, edge_z,
-    )
-    i_cells = NG+1:NG+b.Nx
-    j_cells = NG+1:NG+b.Ny
-    k_cells = NG+1:NG+b.Nz
-    i_faces = NG+1:NG+b.Nx+1
-    j_faces = NG+1:NG+b.Ny+1
-    k_faces = NG+1:NG+b.Nz+1
-    copyto!(
-        @view(b.Bx_face[i_faces, j_cells, k_cells]),
-        GPUArray(Array(@view(phi_x[i_faces, j_cells, k_cells]))),
+        time=FT(time), singularity_edges=singularity_edges,
+        physical_dims=(b.Nx, b.Ny, b.Nz), ng=NG,
     )
     copyto!(
-        @view(b.By_face[i_cells, j_faces, k_cells]),
-        GPUArray(Array(@view(phi_y[i_cells, j_faces, k_cells]))),
+        b.Ex_edge,
+        GPUArray(Array(@view(
+            edge_x[
+                NG+1:NG+b.Nx,
+                NG+1:NG+b.Ny+1,
+                NG+1:NG+b.Nz+1,
+            ]
+        ))),
     )
     copyto!(
-        @view(b.Bz_face[i_cells, j_cells, k_faces]),
-        GPUArray(Array(@view(phi_z[i_cells, j_cells, k_faces]))),
+        b.Ey_edge,
+        GPUArray(Array(@view(
+            edge_y[
+                NG+1:NG+b.Nx+1,
+                NG+1:NG+b.Ny,
+                NG+1:NG+b.Nz+1,
+            ]
+        ))),
     )
+    copyto!(
+        b.Ez_edge,
+        GPUArray(Array(@view(
+            edge_z[
+                NG+1:NG+b.Nx+1,
+                NG+1:NG+b.Ny+1,
+                NG+1:NG+b.Nz,
+            ]
+        ))),
+    )
+    return nothing
+end
+
+function ct_face_flux_from_edge_integrals_kernel!(
+    Bx_face, By_face, Bz_face, Ex_edge, Ey_edge, Ez_edge,
+    nxp, nyp, nzp,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    ii, jj, kk = i + NG, j + NG, k + NG
+    if i <= nxp + Int32(1) && j <= nyp && k <= nzp
+        @inbounds Bx_face[ii,jj,kk] =
+            Ey_edge[i,j,k] + Ez_edge[i,j+Int32(1),k] -
+            Ey_edge[i,j,k+Int32(1)] - Ez_edge[i,j,k]
+    end
+    if i <= nxp && j <= nyp + Int32(1) && k <= nzp
+        @inbounds By_face[ii,jj,kk] =
+            Ez_edge[i,j,k] + Ex_edge[i,j,k+Int32(1)] -
+            Ez_edge[i+Int32(1),j,k] - Ex_edge[i,j,k]
+    end
+    if i <= nxp && j <= nyp && k <= nzp + Int32(1)
+        @inbounds Bz_face[ii,jj,kk] =
+            Ex_edge[i,j,k] + Ey_edge[i+Int32(1),j,k] -
+            Ex_edge[i,j+Int32(1),k] - Ey_edge[i,j,k]
+    end
+    return nothing
+end
+
+function ct_face_flux_from_edge_integrals!(b, nxp=b.Nx, nyp=b.Ny, nzp=b.Nz)
+    nb = (
+        cld(nxp + 1, nthreads[1]),
+        cld(nyp + 1, nthreads[2]),
+        cld(nzp + 1, nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_face_flux_from_edge_integrals_kernel!(
+        b.Bx_face, b.By_face, b.Bz_face,
+        b.Ex_edge, b.Ey_edge, b.Ez_edge,
+        Int32(nxp), Int32(nyp), Int32(nzp),
+    )
+    return nothing
+end
+
+function ct_initial_face_flux_from_vector_potential!(
+    b, vector_potential;
+    time=zero(FT), junction_edge_mask::Integer=0,
+    coordinates=nothing, junction_fallback::Bool=true,
+)
+    ct_initial_edge_line_integrals_from_vector_potential!(
+        b, vector_potential;
+        time=time, junction_edge_mask=junction_edge_mask,
+        coordinates=coordinates, junction_fallback=junction_fallback,
+    )
+    ct_face_flux_from_edge_integrals!(b)
     return nothing
 end
 
@@ -201,11 +267,11 @@ end
 @inline function ct_xface_edge_data(
     flux, rho_sum, U_stage, Q_stage, Areai, nxi, nyi, nzi, Vol,
     face_index, tangent_x, tangent_y, tangent_z, dt,
+    flux_halo::Int32=Int32(1),
 )
     face_i, cell_j, cell_k = face_index
-    gi, gj, gk = ct_xface_geometry_indices(
-        face_i, cell_j, cell_k, Int32(NG),
-    )
+    ng = Int32(NG)
+    gi, gj, gk = face_i+ng, cell_j+ng-flux_halo, cell_k+ng-flux_halo
     @inbounds begin
         area = Areai[gi, gj, gk]
         normal_x = nxi[gi, gj, gk]
@@ -238,11 +304,11 @@ end
 @inline function ct_yface_edge_data(
     flux, rho_sum, U_stage, Q_stage, Areaj, nxj, nyj, nzj, Vol,
     face_index, tangent_x, tangent_y, tangent_z, dt,
+    flux_halo::Int32=Int32(1),
 )
     cell_i, face_j, cell_k = face_index
-    gi, gj, gk = ct_yface_geometry_indices(
-        cell_i, face_j, cell_k, Int32(NG),
-    )
+    ng = Int32(NG)
+    gi, gj, gk = cell_i+ng-flux_halo, face_j+ng, cell_k+ng-flux_halo
     @inbounds begin
         area = Areaj[gi, gj, gk]
         normal_x = nxj[gi, gj, gk]
@@ -275,11 +341,11 @@ end
 @inline function ct_zface_edge_data(
     flux, rho_sum, U_stage, Q_stage, Areak, nxk, nyk, nzk, Vol,
     face_index, tangent_x, tangent_y, tangent_z, dt,
+    flux_halo::Int32=Int32(1),
 )
     cell_i, cell_j, face_k = face_index
-    gi, gj, gk = ct_zface_geometry_indices(
-        cell_i, cell_j, face_k, Int32(NG),
-    )
+    ng = Int32(NG)
+    gi, gj, gk = cell_i+ng-flux_halo, cell_j+ng-flux_halo, face_k+ng
     @inbounds begin
         area = Areak[gi, gj, gk]
         normal_x = nxk[gi, gj, gk]
@@ -309,8 +375,542 @@ end
     return emf, weight
 end
 
+@inline _ct_junction_face_axis(face::Int32) = (face + Int32(1)) ÷ Int32(2)
+
+@inline function _ct_junction_dimension(axis, nxp, nyp, nzp)
+    return axis == Int32(1) ? nxp : (axis == Int32(2) ? nyp : nzp)
+end
+
+@inline function _ct_junction_face_for_axis(face1, face2, axis)
+    return _ct_junction_face_axis(face1) == axis ? face1 : face2
+end
+
+@inline function _ct_junction_boundary_node(face, extent)
+    return isodd(face) ? Int32(1) : extent + Int32(1)
+end
+
+@inline function _ct_junction_boundary_cell(face, extent)
+    return isodd(face) ? Int32(1) : extent
+end
+
+@inline function _ct_junction_inward_face_normal(
+    face,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    cell_i, cell_j, cell_k, nxp, nyp, nzp,
+)
+    normal_axis = _ct_junction_face_axis(face)
+    halo = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    if normal_axis == Int32(1)
+        face_i = _ct_junction_boundary_node(face, nxp)
+        gi, gj, gk = ct_xface_geometry_indices(
+            face_i, cell_j + halo, cell_k + halo, Int32(NG),
+        )
+        @inbounds normal_x, normal_y, normal_z =
+            nxi[gi,gj,gk], nyi[gi,gj,gk], nzi[gi,gj,gk]
+    elseif normal_axis == Int32(2)
+        face_j = _ct_junction_boundary_node(face, nyp)
+        gi, gj, gk = ct_yface_geometry_indices(
+            cell_i + halo, face_j, cell_k + halo, Int32(NG),
+        )
+        @inbounds normal_x, normal_y, normal_z =
+            nxj[gi,gj,gk], nyj[gi,gj,gk], nzj[gi,gj,gk]
+    else
+        face_k = _ct_junction_boundary_node(face, nzp)
+        gi, gj, gk = ct_zface_geometry_indices(
+            cell_i + halo, cell_j + halo, face_k, Int32(NG),
+        )
+        @inbounds normal_x, normal_y, normal_z =
+            nxk[gi,gj,gk], nyk[gi,gj,gk], nzk[gi,gj,gk]
+    end
+    # Metric normals point in the positive computational direction.  At a
+    # low/high boundary the inward physical normal therefore has sign +/-.
+    inward_sign = isodd(face) ? one(normal_x) : -one(normal_x)
+    return inward_sign*normal_x, inward_sign*normal_y,
+           inward_sign*normal_z
+end
+
+@inline function _ct_junction_sector_angle(
+    normal1_x, normal1_y, normal1_z,
+    normal2_x, normal2_y, normal2_z,
+    tangent_x, tangent_y, tangent_z,
+)
+    tangent_dot_1 = normal1_x*tangent_x + normal1_y*tangent_y +
+                    normal1_z*tangent_z
+    tangent_dot_2 = normal2_x*tangent_x + normal2_y*tangent_y +
+                    normal2_z*tangent_z
+    projected1_x = normal1_x - tangent_dot_1*tangent_x
+    projected1_y = normal1_y - tangent_dot_1*tangent_y
+    projected1_z = normal1_z - tangent_dot_1*tangent_z
+    projected2_x = normal2_x - tangent_dot_2*tangent_x
+    projected2_y = normal2_y - tangent_dot_2*tangent_y
+    projected2_z = normal2_z - tangent_dot_2*tangent_z
+    norm_product = sqrt(
+        (projected1_x^2 + projected1_y^2 + projected1_z^2) *
+        (projected2_x^2 + projected2_y^2 + projected2_z^2),
+    )
+    norm_product > eps(typeof(norm_product)) ||
+        return oftype(norm_product, NaN)
+    cosine = (projected1_x*projected2_x +
+              projected1_y*projected2_y +
+              projected1_z*projected2_z) / norm_product
+    cosine = max(-one(cosine), min(one(cosine), cosine))
+    return oftype(cosine, pi) - acos(cosine)
+end
+
+@inline function _ct_junction_face_edge_data(
+    face,
+    Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+    U_stage, Q_stage,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    Vol, cell_i, cell_j, cell_k,
+    tangent_x, tangent_y, tangent_z, dt, nxp, nyp, nzp,
+)
+    normal_axis = _ct_junction_face_axis(face)
+    halo = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    if normal_axis == Int32(1)
+        face_i = _ct_junction_boundary_node(face, nxp)
+        return ct_xface_edge_data(
+            Fx, rho_sum_x, U_stage, Q_stage,
+            Areai, nxi, nyi, nzi, Vol,
+            (face_i, cell_j + halo, cell_k + halo),
+            tangent_x, tangent_y, tangent_z, dt,
+        )
+    elseif normal_axis == Int32(2)
+        face_j = _ct_junction_boundary_node(face, nyp)
+        return ct_yface_edge_data(
+            Fy, rho_sum_y, U_stage, Q_stage,
+            Areaj, nxj, nyj, nzj, Vol,
+            (cell_i + halo, face_j, cell_k + halo),
+            tangent_x, tangent_y, tangent_z, dt,
+        )
+    end
+    face_k = _ct_junction_boundary_node(face, nzp)
+    return ct_zface_edge_data(
+        Fz, rho_sum_z, U_stage, Q_stage,
+        Areak, nxk, nyk, nzk, Vol,
+        (cell_i + halo, cell_j + halo, face_k),
+        tangent_x, tangent_y, tangent_z, dt,
+    )
+end
+
+function ct_pack_generalized_junction_payload_kernel!(
+    payload,
+    Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+    U_stage, Q_stage, fofc_flags,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    Vol, x, y, z, dt,
+    edge_axis, face1, face2,
+    edge_orientation, face1_normal_orientation,
+    face2_normal_orientation, nxp, nyp, nzp,
+)
+    segment = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    segment_extent = _ct_junction_dimension(edge_axis, nxp, nyp, nzp)
+    segment > segment_extent && return
+
+    face_x = _ct_junction_face_for_axis(face1, face2, Int32(1))
+    face_y = _ct_junction_face_for_axis(face1, face2, Int32(2))
+    face_z = _ct_junction_face_for_axis(face1, face2, Int32(3))
+    edge_i = edge_axis == Int32(1) ? segment :
+        _ct_junction_boundary_node(face_x, nxp)
+    edge_j = edge_axis == Int32(2) ? segment :
+        _ct_junction_boundary_node(face_y, nyp)
+    edge_k = edge_axis == Int32(3) ? segment :
+        _ct_junction_boundary_node(face_z, nzp)
+    cell_i = edge_axis == Int32(1) ? segment :
+        _ct_junction_boundary_cell(face_x, nxp)
+    cell_j = edge_axis == Int32(2) ? segment :
+        _ct_junction_boundary_cell(face_y, nyp)
+    cell_k = edge_axis == Int32(3) ? segment :
+        _ct_junction_boundary_cell(face_z, nzp)
+
+    ng = Int32(NG)
+    ni, nj, nk = edge_i + ng, edge_j + ng, edge_k + ng
+    next_i = edge_axis == Int32(1) ? ni + Int32(1) : ni
+    next_j = edge_axis == Int32(2) ? nj + Int32(1) : nj
+    next_k = edge_axis == Int32(3) ? nk + Int32(1) : nk
+    @inbounds tangent_x, tangent_y, tangent_z, edge_length = ct_edge_geometry(
+        x[next_i, next_j, next_k] - x[ni, nj, nk],
+        y[next_i, next_j, next_k] - y[ni, nj, nk],
+        z[next_i, next_j, next_k] - z[ni, nj, nk],
+    )
+    normal1_x, normal1_y, normal1_z = _ct_junction_inward_face_normal(
+        face1,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        cell_i, cell_j, cell_k, nxp, nyp, nzp,
+    )
+    normal2_x, normal2_y, normal2_z = _ct_junction_inward_face_normal(
+        face2,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        cell_i, cell_j, cell_k, nxp, nyp, nzp,
+    )
+    sector_angle = _ct_junction_sector_angle(
+        normal1_x, normal1_y, normal1_z,
+        normal2_x, normal2_y, normal2_z,
+        tangent_x, tangent_y, tangent_z,
+    )
+    cell_emf = ct_cell_centered_edge_emf_from_state(
+        U_stage, Q_stage,
+        cell_i + ng, cell_j + ng, cell_k + ng,
+        tangent_x, tangent_y, tangent_z,
+    )
+    face1_emf, face1_weight = _ct_junction_face_edge_data(
+        face1,
+        Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+        U_stage, Q_stage,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        Vol, cell_i, cell_j, cell_k,
+        tangent_x, tangent_y, tangent_z, dt, nxp, nyp, nzp,
+    )
+    face2_emf, face2_weight = _ct_junction_face_edge_data(
+        face2,
+        Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+        U_stage, Q_stage,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        Vol, cell_i, cell_j, cell_k,
+        tangent_x, tangent_y, tangent_z, dt, nxp, nyp, nzp,
+    )
+
+    canonical_segment = edge_orientation < 0 ?
+        segment_extent - segment + Int32(1) : segment
+    edge_sign = edge_orientation < 0 ? -one(cell_emf) : one(cell_emf)
+    @inbounds begin
+        payload[CT_JUNCTION_PAYLOAD_CELL_EMF, canonical_segment] =
+            edge_sign * cell_emf
+        payload[CT_JUNCTION_PAYLOAD_FACE1_EMF, canonical_segment] =
+            edge_sign * face1_emf
+        payload[CT_JUNCTION_PAYLOAD_FACE1_WEIGHT, canonical_segment] =
+            face1_normal_orientation < 0 ?
+            one(face1_weight) - face1_weight : face1_weight
+        payload[CT_JUNCTION_PAYLOAD_FACE2_EMF, canonical_segment] =
+            edge_sign * face2_emf
+        payload[CT_JUNCTION_PAYLOAD_FACE2_WEIGHT, canonical_segment] =
+            face2_normal_orientation < 0 ?
+            one(face2_weight) - face2_weight : face2_weight
+        payload[CT_JUNCTION_PAYLOAD_EDGE_LENGTH, canonical_segment] =
+            edge_length
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_CELL_EMF,
+                canonical_segment] = zero(cell_emf)
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_FACE1_EMF,
+                canonical_segment] = zero(cell_emf)
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_FACE2_EMF,
+                canonical_segment] = zero(cell_emf)
+        payload[CT_JUNCTION_PAYLOAD_SECTOR_ANGLE, canonical_segment] =
+            sector_angle
+        flag_value = fofc_flags === nothing ? -one(cell_emf) :
+            fofc_flags[cell_i+ng,cell_j+ng,cell_k+ng,1]
+        payload[CT_JUNCTION_PAYLOAD_FOFC_SCALE, canonical_segment] =
+            ct_fofc_flag_scale(flag_value)
+    end
+    return
+end
+
+function ct_launch_generalized_junction_payload!(
+    payload, b,
+    Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z, dt,
+    edge_axis, face1, face2, edge_orientation,
+    face1_normal_orientation, face2_normal_orientation,
+)
+    segment_count = _ct_junction_dimension(
+        Int32(edge_axis), Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+    )
+    thread_count = Int32(min(256, max(1, segment_count)))
+    threads = (thread_count, Int32(1), Int32(1))
+    blocks = (
+        Int32(cld(segment_count, thread_count)), Int32(1), Int32(1),
+    )
+    fofc_flags = hasproperty(b,:fofc_flag) ? b.fofc_flag : nothing
+    @gpu_launch threads=threads blocks=blocks ct_pack_generalized_junction_payload_kernel!(
+        payload,
+        Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+        b.U, b.Q, fofc_flags,
+        b.Areai, b.nxi, b.nyi, b.nzi,
+        b.Areaj, b.nxj, b.nyj, b.nzj,
+        b.Areak, b.nxk, b.nyk, b.nzk,
+        b.Vol, b.x, b.y, b.z, FT(dt),
+        Int32(edge_axis), Int32(face1), Int32(face2),
+        Int8(edge_orientation),
+        Int8(face1_normal_orientation), Int8(face2_normal_orientation),
+        Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+    )
+    return nothing
+end
+
 # Metric-aware SG07 operator. Face fluxes are projected onto a common physical
 # edge tangent, and the result is stored as an oriented line-integrated EMF.
+@inline function ct_junction_edge_masked(
+    mask::UInt16, axis::Int32, i, j, k, nxp, nyp, nzp,
+)
+    iszero(mask) && return false
+    first_high = false
+    second_high = false
+    if axis == Int32(1)
+        (j == Int32(1) || j == nyp + Int32(1)) || return false
+        (k == Int32(1) || k == nzp + Int32(1)) || return false
+        first_high = j == nyp + Int32(1)
+        second_high = k == nzp + Int32(1)
+    elseif axis == Int32(2)
+        (i == Int32(1) || i == nxp + Int32(1)) || return false
+        (k == Int32(1) || k == nzp + Int32(1)) || return false
+        first_high = i == nxp + Int32(1)
+        second_high = k == nzp + Int32(1)
+    else
+        (i == Int32(1) || i == nxp + Int32(1)) || return false
+        (j == Int32(1) || j == nyp + Int32(1)) || return false
+        first_high = i == nxp + Int32(1)
+        second_high = j == nyp + Int32(1)
+    end
+    bit_index = Int32(4) * (axis - Int32(1)) +
+        Int32(2) * Int32(first_high) + Int32(second_high)
+    return (mask & (UInt16(1) << bit_index)) != UInt16(0)
+end
+
+@inline ct_fofc_edge_activity(::Nothing, axis, i, j, k) = (false,one(FT))
+
+@inline function ct_fofc_edge_activity(flags, axis::Int32, i, j, k)
+    ng = Int32(NG)
+    if axis == Int32(1)
+        cells = (
+            (i,j-Int32(1),k-Int32(1)),(i,j,k-Int32(1)),
+            (i,j-Int32(1),k),(i,j,k),
+        )
+    elseif axis == Int32(2)
+        cells = (
+            (i-Int32(1),j,k-Int32(1)),(i,j,k-Int32(1)),
+            (i-Int32(1),j,k),(i,j,k),
+        )
+    else
+        cells = (
+            (i-Int32(1),j-Int32(1),k),(i,j-Int32(1),k),
+            (i-Int32(1),j,k),(i,j,k),
+        )
+    end
+    active = false
+    scale = one(FT)
+    for cell in cells
+        @inbounds value = flags[cell[1]+ng,cell[2]+ng,cell[3]+ng,1]
+        ct_fofc_flag_is_active(value) || continue
+        active = true
+        scale = min(scale,ct_fofc_flag_scale(value))
+    end
+    return active,scale
+end
+
+@inline ct_fofc_edge_flagged(::Nothing, axis, i, j, k) = false
+
+@inline function ct_fofc_edge_flagged(flags, axis, i, j, k)
+    active,_ = ct_fofc_edge_activity(flags,axis,i,j,k)
+    return active
+end
+
+@inline ct_shock_edge_flagged(
+    ::Nothing, axis::Int32, i, j, k, threshold,
+) = false
+
+@inline function ct_shock_edge_flagged(
+    sensor, axis::Int32, i, j, k, threshold,
+)
+    ng = Int32(NG)
+    if axis == Int32(1)
+        cells = (
+            (i,j-Int32(1),k-Int32(1)),(i,j,k-Int32(1)),
+            (i,j-Int32(1),k),(i,j,k),
+        )
+    elseif axis == Int32(2)
+        cells = (
+            (i-Int32(1),j,k-Int32(1)),(i,j,k-Int32(1)),
+            (i-Int32(1),j,k),(i,j,k),
+        )
+    else
+        cells = (
+            (i-Int32(1),j-Int32(1),k),(i,j-Int32(1),k),
+            (i-Int32(1),j,k),(i,j,k),
+        )
+    end
+    support_max = zero(eltype(sensor))
+    for cell in cells
+        @inbounds support_max = max(
+            support_max,
+            sensor[cell[1]+ng,cell[2]+ng,cell[3]+ng],
+        )
+    end
+    return support_max >= threshold
+end
+
+@inline function ct_edge_uses_sg07(
+    sensor, fofc_flags, shock_threshold, axis, i, j, k,
+)
+    return ct_shock_edge_flagged(
+        sensor,axis,i,j,k,shock_threshold,
+    ) || ct_fofc_edge_flagged(fofc_flags,axis,i,j,k)
+end
+
+@inline function ct_weno7_cache_edge_data(
+    cache, direction::Val{D}, si, sj, sk,
+    tangent_x, tangent_y, tangent_z,
+) where {D}
+    emf =
+        _ct_weno7_cache_component(cache,direction,si,sj,sk,1)*tangent_x +
+        _ct_weno7_cache_component(cache,direction,si,sj,sk,2)*tangent_y +
+        _ct_weno7_cache_component(cache,direction,si,sj,sk,3)*tangent_z
+    return emf,_ct_weno7_cache_weight(cache,direction,si,sj,sk)
+end
+
+function ct_compute_edge_line_emf_from_weno7_cache_kernel!(
+    Ex_edge, Ey_edge, Ez_edge, cache_i, cache_j, cache_k,
+    U_stage, Q_stage, x, y, z, nxp, nyp, nzp,
+    junction_edge_mask=UInt16(0), selective_only::Bool=true,
+    shock_sensor=nothing, shock_threshold=zero(FT),
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    ng = Int32(NG)
+
+    if i <= nxp + Int32(1) && j <= nyp + Int32(1) && k <= nzp &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(3), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_shock_edge_flagged(
+           shock_sensor,Int32(3),i,j,k,shock_threshold,
+       ))
+        si, sj, sk = i+ng, j+ng, k+ng
+        @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
+            x[si,sj,sk+Int32(1)]-x[si,sj,sk],
+            y[si,sj,sk+Int32(1)]-y[si,sj,sk],
+            z[si,sj,sk+Int32(1)]-z[si,sj,sk],
+        )
+        ez_xf_jm,w_xf_jm = ct_weno7_cache_edge_data(
+            cache_i,Val(1),si,sj-Int32(1),sk,tx,ty,tz,
+        )
+        ez_xf_j,w_xf_j = ct_weno7_cache_edge_data(
+            cache_i,Val(1),si,sj,sk,tx,ty,tz,
+        )
+        ez_yf_im,w_yf_im = ct_weno7_cache_edge_data(
+            cache_j,Val(2),si-Int32(1),sj,sk,tx,ty,tz,
+        )
+        ez_yf_i,w_yf_i = ct_weno7_cache_edge_data(
+            cache_j,Val(2),si,sj,sk,tx,ty,tz,
+        )
+        cc_jm_im = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si-Int32(1),sj-Int32(1),sk,tx,ty,tz,
+        )
+        cc_jm_i = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj-Int32(1),sk,tx,ty,tz,
+        )
+        cc_j_im = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si-Int32(1),sj,sk,tx,ty,tz,
+        )
+        cc_j_i = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj,sk,tx,ty,tz,
+        )
+        @inbounds Ez_edge[i,j,k] = edge_length*ct_sg07_edge_emf(
+            ez_xf_jm,ez_xf_j,ez_yf_im,ez_yf_i,
+            cc_jm_im,cc_jm_i,cc_j_im,cc_j_i,
+            w_xf_jm,w_xf_j,w_yf_im,w_yf_i,
+        )
+    end
+
+    if i <= nxp + Int32(1) && j <= nyp && k <= nzp + Int32(1) &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(2), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_shock_edge_flagged(
+           shock_sensor,Int32(2),i,j,k,shock_threshold,
+       ))
+        si, sj, sk = i+ng, j+ng, k+ng
+        @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
+            x[si,sj+Int32(1),sk]-x[si,sj,sk],
+            y[si,sj+Int32(1),sk]-y[si,sj,sk],
+            z[si,sj+Int32(1),sk]-z[si,sj,sk],
+        )
+        ey_xf_km,w_xf_km = ct_weno7_cache_edge_data(
+            cache_i,Val(1),si,sj,sk-Int32(1),tx,ty,tz,
+        )
+        ey_xf_k,w_xf_k = ct_weno7_cache_edge_data(
+            cache_i,Val(1),si,sj,sk,tx,ty,tz,
+        )
+        ey_zf_im,w_zf_im = ct_weno7_cache_edge_data(
+            cache_k,Val(3),si-Int32(1),sj,sk,tx,ty,tz,
+        )
+        ey_zf_i,w_zf_i = ct_weno7_cache_edge_data(
+            cache_k,Val(3),si,sj,sk,tx,ty,tz,
+        )
+        cc_km_im = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si-Int32(1),sj,sk-Int32(1),tx,ty,tz,
+        )
+        cc_km_i = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj,sk-Int32(1),tx,ty,tz,
+        )
+        cc_k_im = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si-Int32(1),sj,sk,tx,ty,tz,
+        )
+        cc_k_i = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj,sk,tx,ty,tz,
+        )
+        @inbounds Ey_edge[i,j,k] = edge_length*ct_sg07_edge_emf(
+            ey_xf_km,ey_xf_k,ey_zf_im,ey_zf_i,
+            cc_km_im,cc_km_i,cc_k_im,cc_k_i,
+            w_xf_km,w_xf_k,w_zf_im,w_zf_i,
+        )
+    end
+
+    if i <= nxp && j <= nyp + Int32(1) && k <= nzp + Int32(1) &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(1), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_shock_edge_flagged(
+           shock_sensor,Int32(1),i,j,k,shock_threshold,
+       ))
+        si, sj, sk = i+ng, j+ng, k+ng
+        @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
+            x[si+Int32(1),sj,sk]-x[si,sj,sk],
+            y[si+Int32(1),sj,sk]-y[si,sj,sk],
+            z[si+Int32(1),sj,sk]-z[si,sj,sk],
+        )
+        ex_yf_km,w_yf_km = ct_weno7_cache_edge_data(
+            cache_j,Val(2),si,sj,sk-Int32(1),tx,ty,tz,
+        )
+        ex_yf_k,w_yf_k = ct_weno7_cache_edge_data(
+            cache_j,Val(2),si,sj,sk,tx,ty,tz,
+        )
+        ex_zf_jm,w_zf_jm = ct_weno7_cache_edge_data(
+            cache_k,Val(3),si,sj-Int32(1),sk,tx,ty,tz,
+        )
+        ex_zf_j,w_zf_j = ct_weno7_cache_edge_data(
+            cache_k,Val(3),si,sj,sk,tx,ty,tz,
+        )
+        cc_km_jm = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj-Int32(1),sk-Int32(1),tx,ty,tz,
+        )
+        cc_km_j = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj,sk-Int32(1),tx,ty,tz,
+        )
+        cc_k_jm = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj-Int32(1),sk,tx,ty,tz,
+        )
+        cc_k_j = ct_cell_centered_edge_emf_from_state(
+            U_stage,Q_stage,si,sj,sk,tx,ty,tz,
+        )
+        @inbounds Ex_edge[i,j,k] = edge_length*ct_sg07_edge_emf(
+            ex_yf_km,ex_yf_k,ex_zf_jm,ex_zf_j,
+            cc_km_jm,cc_km_j,cc_k_jm,cc_k_j,
+            w_yf_km,w_yf_k,w_zf_jm,w_zf_j,
+        )
+    end
+    return
+end
+
 function ct_compute_edge_line_emf_kernel!(
     Ex_edge, Ey_edge, Ez_edge,
     Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z, U_stage,
@@ -318,35 +918,45 @@ function ct_compute_edge_line_emf_kernel!(
     Areaj, nxj, nyj, nzj,
     Areak, nxk, nyk, nzk,
     Vol, x, y, z, dt, nxp, nyp, nzp, Q_stage,
+    junction_edge_mask=UInt16(0), fofc_flags=nothing,
+    selective_only::Bool=false, shock_sensor=nothing,
+    shock_threshold=zero(FT), flux_halo::Int32=Int32(1),
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
     ng = Int32(NG)
 
-    if i <= nxp + Int32(1) && j <= nyp + Int32(1) && k <= nzp
+    if i <= nxp + Int32(1) && j <= nyp + Int32(1) && k <= nzp &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(3), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_edge_uses_sg07(
+           shock_sensor,fofc_flags,shock_threshold,Int32(3),i,j,k,
+       ))
         ni = i + ng; nj = j + ng; nk = k + ng
         @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
             x[ni,nj,nk+Int32(1)] - x[ni,nj,nk],
             y[ni,nj,nk+Int32(1)] - y[ni,nj,nk],
             z[ni,nj,nk+Int32(1)] - z[ni,nj,nk],
         )
-        (xf_jm, xf_j), (yf_im, yf_i) = ct_ez_face_flux_indices(i, j, k)
+        (xf_jm, xf_j), (yf_im, yf_i) = ct_ez_face_flux_indices(
+            i,j,k,flux_halo,
+        )
         ez_xf_jm, w_xf_jm = ct_xface_edge_data(
             Fx, rho_sum_x, U_stage, Q_stage, Areai, nxi, nyi, nzi, Vol,
-            xf_jm, tx, ty, tz, dt,
+            xf_jm, tx, ty, tz, dt, flux_halo,
         )
         ez_xf_j, w_xf_j = ct_xface_edge_data(
             Fx, rho_sum_x, U_stage, Q_stage, Areai, nxi, nyi, nzi, Vol,
-            xf_j, tx, ty, tz, dt,
+            xf_j, tx, ty, tz, dt, flux_halo,
         )
         ez_yf_im, w_yf_im = ct_yface_edge_data(
             Fy, rho_sum_y, U_stage, Q_stage, Areaj, nxj, nyj, nzj, Vol,
-            yf_im, tx, ty, tz, dt,
+            yf_im, tx, ty, tz, dt, flux_halo,
         )
         ez_yf_i, w_yf_i = ct_yface_edge_data(
             Fy, rho_sum_y, U_stage, Q_stage, Areaj, nxj, nyj, nzj, Vol,
-            yf_i, tx, ty, tz, dt,
+            yf_i, tx, ty, tz, dt, flux_halo,
         )
         cc_jm_im = ct_cell_centered_edge_emf_from_state(
             U_stage, Q_stage, i-Int32(1)+ng, j-Int32(1)+ng, k+ng, tx, ty, tz,
@@ -367,29 +977,36 @@ function ct_compute_edge_line_emf_kernel!(
         )
     end
 
-    if i <= nxp + Int32(1) && j <= nyp && k <= nzp + Int32(1)
+    if i <= nxp + Int32(1) && j <= nyp && k <= nzp + Int32(1) &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(2), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_edge_uses_sg07(
+           shock_sensor,fofc_flags,shock_threshold,Int32(2),i,j,k,
+       ))
         ni = i + ng; nj = j + ng; nk = k + ng
         @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
             x[ni,nj+Int32(1),nk] - x[ni,nj,nk],
             y[ni,nj+Int32(1),nk] - y[ni,nj,nk],
             z[ni,nj+Int32(1),nk] - z[ni,nj,nk],
         )
-        (xf_km, xf_k), (zf_im, zf_i) = ct_ey_face_flux_indices(i, j, k)
+        (xf_km, xf_k), (zf_im, zf_i) = ct_ey_face_flux_indices(
+            i,j,k,flux_halo,
+        )
         ey_xf_km, w_xf_km = ct_xface_edge_data(
             Fx, rho_sum_x, U_stage, Q_stage, Areai, nxi, nyi, nzi, Vol,
-            xf_km, tx, ty, tz, dt,
+            xf_km, tx, ty, tz, dt, flux_halo,
         )
         ey_xf_k, w_xf_k = ct_xface_edge_data(
             Fx, rho_sum_x, U_stage, Q_stage, Areai, nxi, nyi, nzi, Vol,
-            xf_k, tx, ty, tz, dt,
+            xf_k, tx, ty, tz, dt, flux_halo,
         )
         ey_zf_im, w_zf_im = ct_zface_edge_data(
             Fz, rho_sum_z, U_stage, Q_stage, Areak, nxk, nyk, nzk, Vol,
-            zf_im, tx, ty, tz, dt,
+            zf_im, tx, ty, tz, dt, flux_halo,
         )
         ey_zf_i, w_zf_i = ct_zface_edge_data(
             Fz, rho_sum_z, U_stage, Q_stage, Areak, nxk, nyk, nzk, Vol,
-            zf_i, tx, ty, tz, dt,
+            zf_i, tx, ty, tz, dt, flux_halo,
         )
         cc_km_im = ct_cell_centered_edge_emf_from_state(
             U_stage, Q_stage, i-Int32(1)+ng, j+ng, k-Int32(1)+ng, tx, ty, tz,
@@ -410,29 +1027,36 @@ function ct_compute_edge_line_emf_kernel!(
         )
     end
 
-    if i <= nxp && j <= nyp + Int32(1) && k <= nzp + Int32(1)
+    if i <= nxp && j <= nyp + Int32(1) && k <= nzp + Int32(1) &&
+       !ct_junction_edge_masked(
+           junction_edge_mask, Int32(1), i, j, k, nxp, nyp, nzp,
+       ) && (!selective_only || ct_edge_uses_sg07(
+           shock_sensor,fofc_flags,shock_threshold,Int32(1),i,j,k,
+       ))
         ni = i + ng; nj = j + ng; nk = k + ng
         @inbounds tx, ty, tz, edge_length = ct_edge_geometry(
             x[ni+Int32(1),nj,nk] - x[ni,nj,nk],
             y[ni+Int32(1),nj,nk] - y[ni,nj,nk],
             z[ni+Int32(1),nj,nk] - z[ni,nj,nk],
         )
-        (yf_km, yf_k), (zf_jm, zf_j) = ct_ex_face_flux_indices(i, j, k)
+        (yf_km, yf_k), (zf_jm, zf_j) = ct_ex_face_flux_indices(
+            i,j,k,flux_halo,
+        )
         ex_yf_km, w_yf_km = ct_yface_edge_data(
             Fy, rho_sum_y, U_stage, Q_stage, Areaj, nxj, nyj, nzj, Vol,
-            yf_km, tx, ty, tz, dt,
+            yf_km, tx, ty, tz, dt, flux_halo,
         )
         ex_yf_k, w_yf_k = ct_yface_edge_data(
             Fy, rho_sum_y, U_stage, Q_stage, Areaj, nxj, nyj, nzj, Vol,
-            yf_k, tx, ty, tz, dt,
+            yf_k, tx, ty, tz, dt, flux_halo,
         )
         ex_zf_jm, w_zf_jm = ct_zface_edge_data(
             Fz, rho_sum_z, U_stage, Q_stage, Areak, nxk, nyk, nzk, Vol,
-            zf_jm, tx, ty, tz, dt,
+            zf_jm, tx, ty, tz, dt, flux_halo,
         )
         ex_zf_j, w_zf_j = ct_zface_edge_data(
             Fz, rho_sum_z, U_stage, Q_stage, Areak, nxk, nyk, nzk, Vol,
-            zf_j, tx, ty, tz, dt,
+            zf_j, tx, ty, tz, dt, flux_halo,
         )
         cc_km_jm = ct_cell_centered_edge_emf_from_state(
             U_stage, Q_stage, i+ng, j-Int32(1)+ng, k-Int32(1)+ng, tx, ty, tz,
@@ -451,6 +1075,35 @@ function ct_compute_edge_line_emf_kernel!(
             cc_km_jm, cc_km_j, cc_k_jm, cc_k_j,
             w_yf_km, w_yf_k, w_zf_jm, w_zf_j,
         )
+    end
+    return
+end
+
+
+function ct_scale_edge_line_emf_kernel!(
+    Ex_edge,Ey_edge,Ez_edge,fofc_flags,nxp,nyp,nzp,
+)
+    i = (blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j = (blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k = (blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+
+    if i <= nxp+Int32(1) && j <= nyp+Int32(1) && k <= nzp
+        active,scale = ct_fofc_edge_activity(
+            fofc_flags,Int32(3),i,j,k,
+        )
+        active && (@inbounds Ez_edge[i,j,k] *= scale)
+    end
+    if i <= nxp+Int32(1) && j <= nyp && k <= nzp+Int32(1)
+        active,scale = ct_fofc_edge_activity(
+            fofc_flags,Int32(2),i,j,k,
+        )
+        active && (@inbounds Ey_edge[i,j,k] *= scale)
+    end
+    if i <= nxp && j <= nyp+Int32(1) && k <= nzp+Int32(1)
+        active,scale = ct_fofc_edge_activity(
+            fofc_flags,Int32(1),i,j,k,
+        )
+        active && (@inbounds Ex_edge[i,j,k] *= scale)
     end
     return
 end
@@ -835,6 +1488,135 @@ end
     end
 end
 
+@inline function _ct_junction_resistive_face_edge_data(
+    face, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    cell_i, cell_j, cell_k,
+    tangent_x, tangent_y, tangent_z, nxp, nyp, nzp,
+)
+    normal_axis = _ct_junction_face_axis(face)
+    halo = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    if normal_axis == Int32(1)
+        face_i = _ct_junction_boundary_node(face, nxp)
+        return ct_xface_resistive_edge_data(
+            Fv_x, emf_x, emf_y, emf_z, Areai, nxi, nyi, nzi,
+            (face_i, cell_j + halo, cell_k + halo),
+            tangent_x, tangent_y, tangent_z,
+        )
+    elseif normal_axis == Int32(2)
+        face_j = _ct_junction_boundary_node(face, nyp)
+        return ct_yface_resistive_edge_data(
+            Fv_y, emf_x, emf_y, emf_z, Areaj, nxj, nyj, nzj,
+            (cell_i + halo, face_j, cell_k + halo),
+            tangent_x, tangent_y, tangent_z,
+        )
+    end
+    face_k = _ct_junction_boundary_node(face, nzp)
+    return ct_zface_resistive_edge_data(
+        Fv_z, emf_x, emf_y, emf_z, Areak, nxk, nyk, nzk,
+        (cell_i + halo, cell_j + halo, face_k),
+        tangent_x, tangent_y, tangent_z,
+    )
+end
+
+function ct_pack_generalized_junction_resistive_payload_kernel!(
+    payload, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    x, y, z, edge_axis, face1, face2, edge_orientation,
+    nxp, nyp, nzp,
+)
+    segment = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    segment_extent = _ct_junction_dimension(edge_axis, nxp, nyp, nzp)
+    segment > segment_extent && return
+    face_x = _ct_junction_face_for_axis(face1, face2, Int32(1))
+    face_y = _ct_junction_face_for_axis(face1, face2, Int32(2))
+    face_z = _ct_junction_face_for_axis(face1, face2, Int32(3))
+    edge_i = edge_axis == Int32(1) ? segment :
+        _ct_junction_boundary_node(face_x, nxp)
+    edge_j = edge_axis == Int32(2) ? segment :
+        _ct_junction_boundary_node(face_y, nyp)
+    edge_k = edge_axis == Int32(3) ? segment :
+        _ct_junction_boundary_node(face_z, nzp)
+    cell_i = edge_axis == Int32(1) ? segment :
+        _ct_junction_boundary_cell(face_x, nxp)
+    cell_j = edge_axis == Int32(2) ? segment :
+        _ct_junction_boundary_cell(face_y, nyp)
+    cell_k = edge_axis == Int32(3) ? segment :
+        _ct_junction_boundary_cell(face_z, nzp)
+    ng = Int32(NG)
+    ni, nj, nk = edge_i + ng, edge_j + ng, edge_k + ng
+    next_i = edge_axis == Int32(1) ? ni + Int32(1) : ni
+    next_j = edge_axis == Int32(2) ? nj + Int32(1) : nj
+    next_k = edge_axis == Int32(3) ? nk + Int32(1) : nk
+    @inbounds tangent_x, tangent_y, tangent_z, _ = ct_edge_geometry(
+        x[next_i, next_j, next_k] - x[ni, nj, nk],
+        y[next_i, next_j, next_k] - y[ni, nj, nk],
+        z[next_i, next_j, next_k] - z[ni, nj, nk],
+    )
+    cell_emf = ct_cached_edge_emf(
+        emf_x, emf_y, emf_z,
+        cell_i + ng, cell_j + ng, cell_k + ng,
+        tangent_x, tangent_y, tangent_z,
+    )
+    face1_emf = _ct_junction_resistive_face_edge_data(
+        face1, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        cell_i, cell_j, cell_k,
+        tangent_x, tangent_y, tangent_z, nxp, nyp, nzp,
+    )
+    face2_emf = _ct_junction_resistive_face_edge_data(
+        face2, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        cell_i, cell_j, cell_k,
+        tangent_x, tangent_y, tangent_z, nxp, nyp, nzp,
+    )
+    canonical_segment = edge_orientation < 0 ?
+        segment_extent - segment + Int32(1) : segment
+    edge_sign = edge_orientation < 0 ? -one(cell_emf) : one(cell_emf)
+    @inbounds begin
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_CELL_EMF,
+                canonical_segment] = edge_sign * cell_emf
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_FACE1_EMF,
+                canonical_segment] = edge_sign * face1_emf
+        payload[CT_JUNCTION_PAYLOAD_RESISTIVE_FACE2_EMF,
+                canonical_segment] = edge_sign * face2_emf
+    end
+    return
+end
+
+function ct_launch_generalized_junction_resistive_payload!(
+    payload, b, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+    edge_axis, face1, face2, edge_orientation,
+)
+    segment_count = _ct_junction_dimension(
+        Int32(edge_axis), Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+    )
+    thread_count = Int32(min(256, max(1, segment_count)))
+    threads = (thread_count, Int32(1), Int32(1))
+    blocks = (
+        Int32(cld(segment_count, thread_count)), Int32(1), Int32(1),
+    )
+    @gpu_launch threads=threads blocks=blocks ct_pack_generalized_junction_resistive_payload_kernel!(
+        payload, Fv_x, Fv_y, Fv_z, emf_x, emf_y, emf_z,
+        b.Areai, b.nxi, b.nyi, b.nzi,
+        b.Areaj, b.nxj, b.nyj, b.nzj,
+        b.Areak, b.nxk, b.nyk, b.nzk,
+        b.x, b.y, b.z,
+        Int32(edge_axis), Int32(face1), Int32(face2),
+        Int8(edge_orientation),
+        Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+    )
+    return nothing
+end
+
 function ct_add_resistive_edge_line_emf_kernel!(
     Ex_edge, Ey_edge, Ez_edge,
     Fv_x, Fv_y, Fv_z,
@@ -1079,45 +1861,13 @@ function ct_conducting_wall_edge_emf_kernel!(
     return
 end
 
-function ct_profiled_inflow_edge_emf_kernel!(
-    Ey_edge, Ez_edge, x, y, z, bcp, nxp, nyp, nzp,
-)
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    i == Int32(1) || return
-    ni = Int32(NG) + Int32(1)
-    nj = j + Int32(NG)
-    nk = k + Int32(NG)
-
-    if j <= nyp && k <= nzp + Int32(1)
-        @inbounds Ey_edge[1,j,k] = magnetic_nozzle_profiled_inflow_line_emf(
-            bcp,
-            x[ni,nj,nk], y[ni,nj,nk], z[ni,nj,nk],
-            x[ni,nj+Int32(1),nk], y[ni,nj+Int32(1),nk],
-            z[ni,nj+Int32(1),nk],
-            Rg, (isothermal_mhd ? one(FT) : Cp/(Cp-Rg)), isothermal_mhd,
-        )
-    end
-    if j <= nyp + Int32(1) && k <= nzp
-        @inbounds Ez_edge[1,j,k] = magnetic_nozzle_profiled_inflow_line_emf(
-            bcp,
-            x[ni,nj,nk], y[ni,nj,nk], z[ni,nj,nk],
-            x[ni,nj,nk+Int32(1)], y[ni,nj,nk+Int32(1)],
-            z[ni,nj,nk+Int32(1)],
-            Rg, (isothermal_mhd ? one(FT) : Cp/(Cp-Rg)), isothermal_mhd,
-        )
-    end
-    return
-end
-
 @inline function ct_is_conducting_wall_bc(bc)
     return bc == Int(BC_MHD_WALL) ||
            bc == Int(BC_ISOTHERMAL_WALL) ||
            bc == Int(BC_ADIABATIC_WALL)
 end
 
-function ct_enforce_physical_edge_emf!(b, bid, face_bc, bc_params=nothing)
+function ct_enforce_physical_edge_emf!(b, bid, face_bc)
     nb = (
         cld(b.Nx + 1, nthreads[1]),
         cld(b.Ny + 1, nthreads[2]),
@@ -1125,24 +1875,6 @@ function ct_enforce_physical_edge_emf!(b, bid, face_bc, bc_params=nothing)
     )
     for fid in 1:6
         bc = get(face_bc, (bid, fid), Int(BC_INTERBLOCK))
-        if bc == Int(BC_MHD_PROFILED_INFLOW)
-            fid == 1 || throw(ArgumentError(
-                "profiled CT inflow edge EMF currently supports only x-lo",
-            ))
-            b.rx == 0 || continue
-            bc_params === nothing && throw(ArgumentError(
-                "profiled CT inflow edge EMF requires boundary parameters",
-            ))
-            bcp = get(bc_params, (bid, fid), nothing)
-            bcp === nothing && throw(ArgumentError(
-                "missing profiled CT inflow parameters for block=$bid face=$fid",
-            ))
-            @gpu_launch threads=nthreads blocks=nb ct_profiled_inflow_edge_emf_kernel!(
-                b.Ey_edge, b.Ez_edge, b.x, b.y, b.z, bcp,
-                Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
-            )
-            continue
-        end
         ct_is_conducting_wall_bc(bc) || continue
         direction = Int32((fid + 1) ÷ 2)
         side = Int32(isodd(fid) ? 0 : 1)
@@ -1413,6 +2145,68 @@ function ct_rkl2_face_stage_kernel!(
     return
 end
 
+@inline function _ct_recover_cell_b_from_face_fluxes(
+    Bx_face, By_face, Bz_face,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    recovery_mode, ii, jj, kk,
+    B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+)
+    @inbounds if recovery_mode == CT_CELL_B_POINT6
+        return ct_recover_cell_b_point6(
+            Bx_face, By_face, Bz_face,
+            B0x_face, B0y_face, B0z_face,
+            Areai, nxi, nyi, nzi,
+            Areaj, nxj, nyj, nzj,
+            Areak, nxk, nyk, nzk,
+            ii, jj, kk,
+        )
+    end
+    @inbounds begin
+        area_i_lo = SVector(
+            Areai[ii,jj,kk]*nxi[ii,jj,kk],
+            Areai[ii,jj,kk]*nyi[ii,jj,kk],
+            Areai[ii,jj,kk]*nzi[ii,jj,kk],
+        )
+        area_i_hi = SVector(
+            Areai[ii+Int32(1),jj,kk]*nxi[ii+Int32(1),jj,kk],
+            Areai[ii+Int32(1),jj,kk]*nyi[ii+Int32(1),jj,kk],
+            Areai[ii+Int32(1),jj,kk]*nzi[ii+Int32(1),jj,kk],
+        )
+        area_j_lo = SVector(
+            Areaj[ii,jj,kk]*nxj[ii,jj,kk],
+            Areaj[ii,jj,kk]*nyj[ii,jj,kk],
+            Areaj[ii,jj,kk]*nzj[ii,jj,kk],
+        )
+        area_j_hi = SVector(
+            Areaj[ii,jj+Int32(1),kk]*nxj[ii,jj+Int32(1),kk],
+            Areaj[ii,jj+Int32(1),kk]*nyj[ii,jj+Int32(1),kk],
+            Areaj[ii,jj+Int32(1),kk]*nzj[ii,jj+Int32(1),kk],
+        )
+        area_k_lo = SVector(
+            Areak[ii,jj,kk]*nxk[ii,jj,kk],
+            Areak[ii,jj,kk]*nyk[ii,jj,kk],
+            Areak[ii,jj,kk]*nzk[ii,jj,kk],
+        )
+        area_k_hi = SVector(
+            Areak[ii,jj,kk+Int32(1)]*nxk[ii,jj,kk+Int32(1)],
+            Areak[ii,jj,kk+Int32(1)]*nyk[ii,jj,kk+Int32(1)],
+            Areak[ii,jj,kk+Int32(1)]*nzk[ii,jj,kk+Int32(1)],
+        )
+        return ct_recover_cell_b(
+            area_i_lo, area_i_hi, area_j_lo, area_j_hi,
+            area_k_lo, area_k_hi,
+            _ct_total_face_flux(Bx_face, B0x_face, ii, jj, kk),
+            _ct_total_face_flux(Bx_face, B0x_face, ii+Int32(1), jj, kk),
+            _ct_total_face_flux(By_face, B0y_face, ii, jj, kk),
+            _ct_total_face_flux(By_face, B0y_face, ii, jj+Int32(1), kk),
+            _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk),
+            _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk+Int32(1)),
+        )
+    end
+end
+
 # CT face fluxes are authoritative. This kernel only refreshes the derived
 # cell-centered magnetic cache; it never changes conservative total energy.
 function ct_recover_cell_b_kernel!(
@@ -1422,8 +2216,6 @@ function ct_recover_cell_b_kernel!(
     Areak, nxk, nyk, nzk,
     recovery_mode, nxp, nyp, nzp, cell_offset,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
-    output_bx=nothing, output_by=nothing, output_bz=nothing,
-    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -1433,96 +2225,118 @@ function ct_recover_cell_b_kernel!(
     jj = j + cell_offset
     kk = k + cell_offset
 
+    magnetic = _ct_recover_cell_b_from_face_fluxes(
+        Bx_face, By_face, Bz_face,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        recovery_mode, ii, jj, kk,
+        B0x_face, B0y_face, B0z_face,
+    )
+
     @inbounds begin
-        split_background = B0x_cell !== nothing
-        recovery_B0x_face = split_background ? nothing : B0x_face
-        recovery_B0y_face = split_background ? nothing : B0y_face
-        recovery_B0z_face = split_background ? nothing : B0z_face
-        if recovery_mode == CT_CELL_B_POINT6
-            magnetic = ct_recover_cell_b_point6(
-                Bx_face, By_face, Bz_face,
-                recovery_B0x_face, recovery_B0y_face, recovery_B0z_face,
-                Areai, nxi, nyi, nzi,
-                Areaj, nxj, nyj, nzj,
-                Areak, nxk, nyk, nzk,
-                ii, jj, kk,
-            )
-        else
-            area_i_lo = SVector(
-                Areai[ii,jj,kk]*nxi[ii,jj,kk],
-                Areai[ii,jj,kk]*nyi[ii,jj,kk],
-                Areai[ii,jj,kk]*nzi[ii,jj,kk],
-            )
-            area_i_hi = SVector(
-                Areai[ii+Int32(1),jj,kk]*nxi[ii+Int32(1),jj,kk],
-                Areai[ii+Int32(1),jj,kk]*nyi[ii+Int32(1),jj,kk],
-                Areai[ii+Int32(1),jj,kk]*nzi[ii+Int32(1),jj,kk],
-            )
-            area_j_lo = SVector(
-                Areaj[ii,jj,kk]*nxj[ii,jj,kk],
-                Areaj[ii,jj,kk]*nyj[ii,jj,kk],
-                Areaj[ii,jj,kk]*nzj[ii,jj,kk],
-            )
-            area_j_hi = SVector(
-                Areaj[ii,jj+Int32(1),kk]*nxj[ii,jj+Int32(1),kk],
-                Areaj[ii,jj+Int32(1),kk]*nyj[ii,jj+Int32(1),kk],
-                Areaj[ii,jj+Int32(1),kk]*nzj[ii,jj+Int32(1),kk],
-            )
-            area_k_lo = SVector(
-                Areak[ii,jj,kk]*nxk[ii,jj,kk],
-                Areak[ii,jj,kk]*nyk[ii,jj,kk],
-                Areak[ii,jj,kk]*nzk[ii,jj,kk],
-            )
-            area_k_hi = SVector(
-                Areak[ii,jj,kk+Int32(1)]*nxk[ii,jj,kk+Int32(1)],
-                Areak[ii,jj,kk+Int32(1)]*nyk[ii,jj,kk+Int32(1)],
-                Areak[ii,jj,kk+Int32(1)]*nzk[ii,jj,kk+Int32(1)],
-            )
-            magnetic = ct_recover_cell_b(
-                area_i_lo, area_i_hi, area_j_lo, area_j_hi,
-                area_k_lo, area_k_hi,
-                _ct_total_face_flux(
-                    Bx_face, recovery_B0x_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    Bx_face, recovery_B0x_face, ii+Int32(1), jj, kk,
-                ),
-                _ct_total_face_flux(
-                    By_face, recovery_B0y_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    By_face, recovery_B0y_face, ii, jj+Int32(1), kk,
-                ),
-                _ct_total_face_flux(
-                    Bz_face, recovery_B0z_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    Bz_face, recovery_B0z_face, ii, jj, kk+Int32(1),
-                ),
-            )
-        end
-
-        if split_background
-            magnetic += SVector(
-                B0x_cell[ii,jj,kk],
-                B0y_cell[ii,jj,kk],
-                B0z_cell[ii,jj,kk],
-            )
-        end
-
         if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
            isfinite(magnetic[3])
-            if output_bx === nothing
-                Q[ii,jj,kk,QBX] = magnetic[1]
-                Q[ii,jj,kk,QBY] = magnetic[2]
-                Q[ii,jj,kk,QBZ] = magnetic[3]
-                Q[ii,jj,kk,QPSI] = zero(FT)
-            else
-                output_bx[ii,jj,kk] = magnetic[1]
-                output_by[ii,jj,kk] = magnetic[2]
-                output_bz[ii,jj,kk] = magnetic[3]
-            end
+            Q[ii,jj,kk,QBX] = magnetic[1]
+            Q[ii,jj,kk,QBY] = magnetic[2]
+            Q[ii,jj,kk,QBZ] = magnetic[3]
+            Q[ii,jj,kk,QPSI] = zero(FT)
         end
+    end
+    return
+end
+
+# Topological ghosts are reconstructed from the packed authoritative halo.
+# Physical ghosts instead own local, boundary-filled face fluxes; recover only
+# that disjoint region here after every face-B halo transaction is complete.
+function ct_recover_physical_ghost_b_kernel!(
+    Q, Bx_face, By_face, Bz_face,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    nxp, nyp, nzp, physical_faces,
+    B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+)
+    i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1))*blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1))*blockDim().z + threadIdx().z
+    if i > nxp+2NG || j > nyp+2NG || k > nzp+2NG
+        return
+    end
+    if NG < i <= nxp+NG && NG < j <= nyp+NG && NG < k <= nzp+NG
+        return
+    end
+    physical =
+        (physical_faces[1] && i <= NG) ||
+        (physical_faces[2] && i > nxp+NG) ||
+        (physical_faces[3] && j <= NG) ||
+        (physical_faces[4] && j > nyp+NG) ||
+        (physical_faces[5] && k <= NG) ||
+        (physical_faces[6] && k > nzp+NG)
+    physical || return
+
+    magnetic = _ct_recover_cell_b_from_face_fluxes(
+        Bx_face, By_face, Bz_face,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        CT_CELL_B_LSQ2, i, j, k,
+        B0x_face, B0y_face, B0z_face,
+    )
+    @inbounds if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
+                 isfinite(magnetic[3])
+        Q[i,j,k,QBX] = magnetic[1]
+        Q[i,j,k,QBY] = magnetic[2]
+        Q[i,j,k,QBZ] = magnetic[3]
+        Q[i,j,k,QPSI] = zero(FT)
+    end
+    return
+end
+
+function ct_recover_physical_ghost_b!(
+    b, nxp, nyp, nzp;
+    physical_faces::NTuple{6,Bool},
+)
+    any(physical_faces) || return nothing
+    background_faces = hasproperty(b,:B0x_face) ?
+        (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    total = (nxp+2NG,nyp+2NG,nzp+2NG)
+    blocks = ntuple(axis -> cld(total[axis],nthreads[axis]),Val(3))
+    @gpu_launch threads=nthreads blocks=blocks ct_recover_physical_ghost_b_kernel!(
+        b.Q,b.Bx_face,b.By_face,b.Bz_face,
+        b.Areai,b.nxi,b.nyi,b.nzi,
+        b.Areaj,b.nxj,b.nyj,b.nzj,
+        b.Areak,b.nxk,b.nyk,b.nzk,
+        Int32(nxp),Int32(nyp),Int32(nzp),physical_faces,
+        background_faces...,
+    )
+    return nothing
+end
+
+function ct_recover_background_cell_b_kernel!(
+    background_cell, B0x_face, B0y_face, B0z_face,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    recovery_mode, nxp, nyp, nzp, cell_offset,
+)
+    i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1))*blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1))*blockDim().z + threadIdx().z
+    if i > nxp || j > nyp || k > nzp; return; end
+    ii, jj, kk = i+cell_offset, j+cell_offset, k+cell_offset
+    magnetic = _ct_recover_cell_b_from_face_fluxes(
+        B0x_face, B0y_face, B0z_face,
+        Areai, nxi, nyi, nzi,
+        Areaj, nxj, nyj, nzj,
+        Areak, nxk, nyk, nzk,
+        recovery_mode, ii, jj, kk,
+    )
+    @inbounds if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
+                 isfinite(magnetic[3])
+        background_cell[ii,jj,kk,1] = magnetic[1]
+        background_cell[ii,jj,kk,2] = magnetic[2]
+        background_cell[ii,jj,kk,3] = magnetic[3]
     end
     return
 end
@@ -1716,23 +2530,410 @@ end
     ))
 end
 
+@inline function ct_recover_cell_b_lsq2_shell(
+    face_fluxes, face_shells, background_fluxes, background_shells,
+    face_metrics, area_vector_shells, face_layout, i, j, k,
+)
+    area_i_lo = _ct_shell_face_area_vector(
+        face_metrics[1]...,area_vector_shells[1],face_layout,i,j,k,
+    )
+    area_i_hi = _ct_shell_face_area_vector(
+        face_metrics[1]...,area_vector_shells[1],face_layout,i+1,j,k,
+    )
+    area_j_lo = _ct_shell_face_area_vector(
+        face_metrics[2]...,area_vector_shells[2],face_layout,i,j,k,
+    )
+    area_j_hi = _ct_shell_face_area_vector(
+        face_metrics[2]...,area_vector_shells[2],face_layout,i,j+1,k,
+    )
+    area_k_lo = _ct_shell_face_area_vector(
+        face_metrics[3]...,area_vector_shells[3],face_layout,i,j,k,
+    )
+    area_k_hi = _ct_shell_face_area_vector(
+        face_metrics[3]...,area_vector_shells[3],face_layout,i,j,k+1,
+    )
+    flux_i_lo = _ct_shell_total_face_flux(
+        face_fluxes[1],face_shells[1],background_fluxes[1],
+        background_shells[1],face_layout,i,j,k,
+    )
+    flux_i_hi = _ct_shell_total_face_flux(
+        face_fluxes[1],face_shells[1],background_fluxes[1],
+        background_shells[1],face_layout,i+1,j,k,
+    )
+    flux_j_lo = _ct_shell_total_face_flux(
+        face_fluxes[2],face_shells[2],background_fluxes[2],
+        background_shells[2],face_layout,i,j,k,
+    )
+    flux_j_hi = _ct_shell_total_face_flux(
+        face_fluxes[2],face_shells[2],background_fluxes[2],
+        background_shells[2],face_layout,i,j+1,k,
+    )
+    flux_k_lo = _ct_shell_total_face_flux(
+        face_fluxes[3],face_shells[3],background_fluxes[3],
+        background_shells[3],face_layout,i,j,k,
+    )
+    flux_k_hi = _ct_shell_total_face_flux(
+        face_fluxes[3],face_shells[3],background_fluxes[3],
+        background_shells[3],face_layout,i,j,k+1,
+    )
+    return ct_recover_cell_b(
+        area_i_lo,area_i_hi,area_j_lo,area_j_hi,area_k_lo,area_k_hi,
+        flux_i_lo,flux_i_hi,flux_j_lo,flux_j_hi,flux_k_lo,flux_k_hi,
+    )
+end
+
+@inline function ct_conservative_direct_shell(
+    U, conservative_shell, cell_layout, i, j, k,
+)
+    T = eltype(U)
+    offset = _ct_active_shell_offset(cell_layout,i,j,k)
+    if offset == 0
+        @inbounds begin
+            density = U[i,j,k,1]
+            momentum_x = U[i,j,k,2]
+            momentum_y = U[i,j,k,3]
+            momentum_z = U[i,j,k,4]
+            energy = U[i,j,k,5]
+        end
+    else
+        @inbounds begin
+            density = conservative_shell[offset,1]
+            momentum_x = conservative_shell[offset,2]
+            momentum_y = conservative_shell[offset,3]
+            momentum_z = conservative_shell[offset,4]
+            energy = conservative_shell[offset,5]
+        end
+    end
+    return SVector{6,T}(
+        density,momentum_x,momentum_y,momentum_z,energy,zero(T),
+    )
+end
+
+@inline function _ct_point6_shell_stencil(
+    U, conservative_shell, cell_layout, i, j, k, ::Val{DIRECTION},
+) where {DIRECTION}
+    return ntuple(Val(5)) do index
+        offset = index-3
+        ii = DIRECTION == 1 ? i+offset : i
+        jj = DIRECTION == 2 ? j+offset : j
+        kk = DIRECTION == 3 ? k+offset : k
+        ct_conservative_direct_shell(
+            U,conservative_shell,cell_layout,ii,jj,kk,
+        )
+    end
+end
+
+@inline function ct_point6_shell_ao_coefficients(
+    U, conservative_shell, cell_layout, i, j, k,
+)
+    fixed = _ct_point6_fixed_coefficients(eltype(U))
+    homogeneous = _ct_point6_homogeneous_axes()
+    sensor_i,sensor_j,sensor_k = _ct_point6_sensor_center(i,j,k)
+    x_coefficients, x_sensor = homogeneous[1] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_shell_stencil(
+                U,conservative_shell,cell_layout,
+                sensor_i,sensor_j,sensor_k,Val(1),
+            ),
+        )
+    y_coefficients, y_sensor = homogeneous[2] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_shell_stencil(
+                U,conservative_shell,cell_layout,
+                sensor_i,sensor_j,sensor_k,Val(2),
+            ),
+        )
+    z_coefficients, z_sensor = homogeneous[3] ? (fixed,zero(eltype(U))) :
+        ct_point6_ao_direction_coefficients(
+            _ct_point6_shell_stencil(
+                U,conservative_shell,cell_layout,
+                sensor_i,sensor_j,sensor_k,Val(3),
+            ),
+        )
+    return x_coefficients, y_coefficients, z_coefficients,
+           x_sensor, y_sensor, z_sensor
+end
+
+@inline function ct_conservative_average_to_point_coefficients_shell(
+    U, conservative_shell, inverse_volume, inverse_volume_shell,
+    cell_layout, i, j, k,
+    x_coefficients::SVector{5,T}, y_coefficients::SVector{5,T},
+    z_coefficients::SVector{5,T},
+) where {T}
+    point = MVector{6,T}(
+        zero(T),zero(T),zero(T),zero(T),zero(T),zero(T),
+    )
+    jacobian_point = zero(T)
+    @static if @isdefined(Ncell_cons)
+        has_psi = Ncell_cons >= 9
+    else
+        has_psi = size(U,4) >= 9
+    end
+    for x_index in 1:5
+        di = x_index-3
+        for y_index in 1:5
+            dj = y_index-3
+            for z_index in 1:5
+                dk = z_index-3
+                weight = x_coefficients[x_index]*y_coefficients[y_index]*
+                         z_coefficients[z_index]
+                ii, jj, kk = i+di, j+dj, k+dk
+                offset = _ct_active_shell_offset(cell_layout,ii,jj,kk)
+                local_inverse_volume = if offset == 0
+                    @inbounds inverse_volume[ii,jj,kk]
+                else
+                    @inbounds inverse_volume_shell[offset]
+                end
+                jacobian_average = one(T)/local_inverse_volume
+                weighted_jacobian = weight*jacobian_average
+                jacobian_point += weighted_jacobian
+                for component in 1:5
+                    value = if offset == 0
+                        @inbounds U[ii,jj,kk,component]
+                    else
+                        @inbounds conservative_shell[offset,component]
+                    end
+                    point[component] += weighted_jacobian*value
+                end
+                if has_psi
+                    value = if offset == 0
+                        @inbounds U[ii,jj,kk,9]
+                    elseif size(conservative_shell,2) >= 9
+                        @inbounds conservative_shell[offset,9]
+                    else
+                        zero(T)
+                    end
+                    point[6] += weighted_jacobian*value
+                end
+            end
+        end
+    end
+    if !(isfinite(jacobian_point) && jacobian_point > zero(T))
+        bad = T(NaN)
+        return SVector{6,T}(ntuple(_ -> bad,Val(6)))
+    end
+    return SVector{6,T}(point/jacobian_point)
+end
+
+@inline function ct_conservative_average_to_point_adaptive_shell(
+    U, conservative_shell, inverse_volume, inverse_volume_shell,
+    cell_layout, i, j, k,
+)
+    T = eltype(U)
+    fixed = _ct_point6_fixed_coefficients(T)
+    if !_ct_point6_adaptive_enabled()
+        hydro = ct_conservative_average_to_point6_shell(
+            U,conservative_shell,inverse_volume,inverse_volume_shell,
+            cell_layout,i,j,k,
+        )
+        return hydro, fixed, fixed, fixed, false
+    end
+    x_ao, y_ao, z_ao, x_sensor, y_sensor, z_sensor =
+        ct_point6_shell_ao_coefficients(
+            U,conservative_shell,cell_layout,i,j,k,
+        )
+    threshold = _ct_point6_sensor_threshold(T)
+    x_coefficients,x_used = ct_point6_select_direction_coefficients(
+        fixed,x_ao,x_sensor,threshold,
+    )
+    y_coefficients,y_used = ct_point6_select_direction_coefficients(
+        fixed,y_ao,y_sensor,threshold,
+    )
+    z_coefficients,z_used = ct_point6_select_direction_coefficients(
+        fixed,z_ao,z_sensor,threshold,
+    )
+    used_ao = x_used || y_used || z_used
+    if !used_ao
+        hydro = ct_conservative_average_to_point6_shell(
+            U,conservative_shell,inverse_volume,inverse_volume_shell,
+            cell_layout,i,j,k,
+        )
+        return hydro, x_ao, y_ao, z_ao, false
+    end
+    hydro = ct_conservative_average_to_point_coefficients_shell(
+        U,conservative_shell,inverse_volume,inverse_volume_shell,
+        cell_layout,i,j,k,
+        x_coefficients,y_coefficients,z_coefficients,
+    )
+    return hydro, x_ao, y_ao, z_ao, true
+end
+
+@inline function _ct_record_point6_recovery!(meta, mode::Int32)
+    meta === nothing && return nothing
+    @static if @isdefined(CT_POS_POINT6_TO_AO_COUNT)
+        if mode == Int32(1) || mode == Int32(2)
+            ct_record_fallback!(meta,CT_POS_POINT6_TO_AO_COUNT)
+        end
+        if mode == Int32(2)
+            ct_record_fallback!(meta,CT_POS_POINT6_LIMIT_COUNT)
+        end
+        if mode == Int32(3)
+            ct_record_fallback!(meta,CT_POS_POINT6_UNRECOVERABLE_COUNT)
+        end
+    end
+    return nothing
+end
+
+@inline function _ct_store_q_direct_shell!(
+    Q, U, background_cell, conservative_shell, cell_layout,
+    face_fluxes, face_shells, background_fluxes, background_shells,
+    face_metrics, area_vector_shells, face_layout,
+    i, j, k, gamma, gas_constant,
+)
+    magnetic = ct_recover_cell_b_lsq2_shell(
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,i,j,k,
+    )
+    hydro = ct_conservative_direct_shell(
+        U,conservative_shell,cell_layout,i,j,k,
+    )
+    primitive = ct_mhd_point_conservative_to_primitive(
+        hydro,magnetic,gamma,
+    )
+    if background_cell !== nothing
+        no_background = (nothing,nothing,nothing)
+        background = ct_recover_cell_b_lsq2_shell(
+            background_fluxes,background_shells,no_background,no_background,
+            face_metrics,area_vector_shells,face_layout,i,j,k,
+        )
+        @inbounds begin
+            background_cell[i,j,k,1]=background[1]
+            background_cell[i,j,k,2]=background[2]
+            background_cell[i,j,k,3]=background[3]
+        end
+    end
+    temperature = primitive[5]/(primitive[1]*gas_constant)
+    @inbounds begin
+        Q[i,j,k,1]=primitive[1]; Q[i,j,k,2]=primitive[2]
+        Q[i,j,k,3]=primitive[3]; Q[i,j,k,4]=primitive[4]
+        Q[i,j,k,5]=primitive[5]; Q[i,j,k,6]=temperature
+        Q[i,j,k,QBX]=primitive[6]; Q[i,j,k,QBY]=primitive[7]
+        Q[i,j,k,QBZ]=primitive[8]; Q[i,j,k,QPSI]=zero(FT)
+    end
+    return
+end
+
+function ct_derive_q_direct_ghost_kernel!(
+    Q, U, background_cell, conservative_shell, cell_layout,
+    face_fluxes, face_shells, background_fluxes, background_shells,
+    face_metrics, area_vector_shells, face_layout,
+    nxp, nyp, nzp, gamma, gas_constant, physical_faces,
+)
+    i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1))*blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1))*blockDim().z + threadIdx().z
+    if i > nxp+2NG || j > nyp+2NG || k > nzp+2NG
+        return
+    end
+    if NG < i <= nxp+NG && NG < j <= nyp+NG && NG < k <= nzp+NG
+        return
+    end
+    if (physical_faces[1] && i <= NG) ||
+       (physical_faces[2] && i > nxp+NG) ||
+       (physical_faces[3] && j <= NG) ||
+       (physical_faces[4] && j > nyp+NG) ||
+       (physical_faces[5] && k <= NG) ||
+       (physical_faces[6] && k > nzp+NG)
+        return
+    end
+    _ct_store_q_direct_shell!(
+        Q,U,background_cell,conservative_shell,cell_layout,
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,
+        i,j,k,gamma,gas_constant,
+    )
+    return
+end
+
+function ct_derive_q_direct_ghost!(
+    b, halo, nxp, nyp, nzp;
+    gamma,
+    gas_constant,
+    physical_faces::NTuple{6,Bool}=ntuple(_ -> false,Val(6)),
+)
+    face_fluxes=(b.Bx_face,b.By_face,b.Bz_face)
+    background_fluxes=hasproperty(b,:B0x_face) ?
+        (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    background_cell=hasproperty(b,:B0_cell) ? b.B0_cell : nothing
+    face_metrics=(
+        (b.Areai,b.nxi,b.nyi,b.nzi),
+        (b.Areaj,b.nxj,b.nyj,b.nzj),
+        (b.Areak,b.nxk,b.nyk,b.nzk),
+    )
+    total=(nxp+2NG,nyp+2NG,nzp+2NG)
+    blocks=ntuple(axis -> cld(total[axis],nthreads[axis]),Val(3))
+    @gpu_launch threads=nthreads blocks=blocks ct_derive_q_direct_ghost_kernel!(
+        b.Q,b.U,background_cell,halo.conservative_shell,halo.cell_layout,
+        face_fluxes,halo.face_b_shells,background_fluxes,
+        halo.background_face_shells,face_metrics,halo.face_area_vector_shells,
+        halo.face_layout,Int32(nxp),Int32(nyp),Int32(nzp),
+        FT(gamma),FT(gas_constant),physical_faces,
+    )
+    return nothing
+end
+
 @inline function _ct_store_q_point6_shell!(
-    Q, U, conservative_shell, inverse_volume, inverse_volume_shell,
+    Q, U, background_cell, conservative_shell,
+    inverse_volume, inverse_volume_shell,
     cell_layout, face_fluxes, face_shells,
     background_fluxes, background_shells, face_metrics,
-    area_vector_shells, face_layout, i, j, k, gamma, gas_constant,
+    area_vector_shells, face_layout, positivity_meta,
+    i, j, k, gamma, gas_constant,
 )
-    magnetic = ct_recover_cell_b_point6_shell(
+    high_magnetic = ct_recover_cell_b_point6_shell(
         face_fluxes, face_shells, background_fluxes, background_shells,
         face_metrics, area_vector_shells, face_layout, i, j, k,
     )
-    hydro = ct_conservative_average_to_point6_shell(
-        U, conservative_shell, inverse_volume, inverse_volume_shell,
-        cell_layout, i, j, k,
+    low_magnetic = ct_recover_cell_b_lsq2_shell(
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,i,j,k,
     )
+    candidate_hydro, x_ao, y_ao, z_ao, used_ao =
+        ct_conservative_average_to_point_adaptive_shell(
+            U,conservative_shell,inverse_volume,inverse_volume_shell,
+            cell_layout,i,j,k,
+        )
+    ao_hydro = used_ao ? candidate_hydro :
+        ct_conservative_average_to_point_coefficients_shell(
+            U,conservative_shell,inverse_volume,inverse_volume_shell,
+            cell_layout,i,j,k,x_ao,y_ao,z_ao,
+        )
+    low_hydro = ct_conservative_direct_shell(
+        U,conservative_shell,cell_layout,i,j,k,
+    )
+    hydro, magnetic, theta, recovery_mode =
+        ct_point6_select_admissible_state(
+            candidate_hydro,ao_hydro,low_hydro,high_magnetic,low_magnetic,
+            gamma,eltype(U)(density_floor),eltype(U)(pressure_floor),used_ao,
+        )
+    _ct_record_point6_recovery!(positivity_meta,recovery_mode)
     primitive = ct_mhd_point_conservative_to_primitive(
-        hydro, magnetic, gamma,
+        hydro,magnetic,gamma,
     )
+    if background_cell !== nothing
+        no_background = (nothing,nothing,nothing)
+        high_background = ct_recover_cell_b_point6_shell(
+            background_fluxes,background_shells,
+            no_background,no_background,
+            face_metrics,area_vector_shells,face_layout,i,j,k,
+        )
+        background = high_background
+        if theta < one(theta)
+            low_background = ct_recover_cell_b_lsq2_shell(
+                background_fluxes,background_shells,
+                no_background,no_background,
+                face_metrics,area_vector_shells,face_layout,i,j,k,
+            )
+            background = _ct_point6_blend(
+                low_background,high_background,theta,
+            )
+        end
+        @inbounds begin
+            background_cell[i,j,k,1]=background[1]
+            background_cell[i,j,k,2]=background[2]
+            background_cell[i,j,k,3]=background[3]
+        end
+    end
     temperature = primitive[5]/(primitive[1]*gas_constant)
     @inbounds begin
         Q[i,j,k,1]=primitive[1]; Q[i,j,k,2]=primitive[2]
@@ -1745,10 +2946,11 @@ end
 end
 
 function ct_derive_q_point6_ghost_kernel!(
-    Q, U, conservative_shell, inverse_volume, inverse_volume_shell,
+    Q, U, background_cell, conservative_shell,
+    inverse_volume, inverse_volume_shell,
     cell_layout, face_fluxes, face_shells,
     background_fluxes, background_shells, face_metrics,
-    area_vector_shells, face_layout, nxp, nyp, nzp,
+    area_vector_shells, face_layout, positivity_meta, nxp, nyp, nzp,
     gamma, gas_constant, physical_faces,
 )
     i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
@@ -1770,19 +2972,21 @@ function ct_derive_q_point6_ghost_kernel!(
         return
     end
     _ct_store_q_point6_shell!(
-        Q, U, conservative_shell, inverse_volume, inverse_volume_shell,
-        cell_layout, face_fluxes, face_shells, background_fluxes,
-        background_shells, face_metrics, area_vector_shells, face_layout,
-        i, j, k, gamma, gas_constant,
+        Q,U,background_cell,conservative_shell,
+        inverse_volume,inverse_volume_shell,
+        cell_layout,face_fluxes,face_shells,background_fluxes,
+        background_shells,face_metrics,area_vector_shells,face_layout,
+        positivity_meta,i,j,k,gamma,gas_constant,
     )
     return
 end
 
 function ct_derive_q_point6_topological_active_kernel!(
-    Q, U, conservative_shell, inverse_volume, inverse_volume_shell,
+    Q, U, background_cell, conservative_shell,
+    inverse_volume, inverse_volume_shell,
     cell_layout, face_fluxes, face_shells,
     background_fluxes, background_shells, face_metrics,
-    area_vector_shells, face_layout, nxp, nyp, nzp,
+    area_vector_shells, face_layout, positivity_meta, nxp, nyp, nzp,
     gamma, gas_constant, physical_faces,
 )
     i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
@@ -1808,10 +3012,11 @@ function ct_derive_q_point6_topological_active_kernel!(
         (k > nzp-reach && physical_faces[6])
     (touches_topology && !touches_physical) || return
     _ct_store_q_point6_shell!(
-        Q, U, conservative_shell, inverse_volume, inverse_volume_shell,
-        cell_layout, face_fluxes, face_shells, background_fluxes,
-        background_shells, face_metrics, area_vector_shells, face_layout,
-        i+NG, j+NG, k+NG, gamma, gas_constant,
+        Q,U,background_cell,conservative_shell,
+        inverse_volume,inverse_volume_shell,
+        cell_layout,face_fluxes,face_shells,background_fluxes,
+        background_shells,face_metrics,area_vector_shells,face_layout,
+        positivity_meta,i+NG,j+NG,k+NG,gamma,gas_constant,
     )
     return
 end
@@ -1819,10 +3024,12 @@ end
 function ct_derive_q_point6_ghost!(
     b, halo, nxp, nyp, nzp;
     physical_faces::NTuple{6,Bool}=ntuple(_ -> false, Val(6)),
+    positivity_meta=nothing,
 )
     face_fluxes = (b.Bx_face,b.By_face,b.Bz_face)
     background_fluxes = hasproperty(b,:B0x_face) ?
         (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    background_cell = hasproperty(b,:B0_cell) ? b.B0_cell : nothing
     face_metrics = (
         (b.Areai,b.nxi,b.nyi,b.nzi),
         (b.Areaj,b.nxj,b.nyj,b.nzj),
@@ -1831,10 +3038,11 @@ function ct_derive_q_point6_ghost!(
     total = (nxp+2NG,nyp+2NG,nzp+2NG)
     blocks = ntuple(axis -> cld(total[axis],nthreads[axis]), Val(3))
     @gpu_launch threads=nthreads blocks=blocks ct_derive_q_point6_ghost_kernel!(
-        b.Q,b.U,halo.conservative_shell,b.Vol,halo.inverse_volume_shell,
+        b.Q,b.U,background_cell,halo.conservative_shell,
+        b.Vol,halo.inverse_volume_shell,
         halo.cell_layout,face_fluxes,halo.face_b_shells,
         background_fluxes,halo.background_face_shells,face_metrics,
-        halo.face_area_vector_shells,halo.face_layout,
+        halo.face_area_vector_shells,halo.face_layout,positivity_meta,
         Int32(nxp),Int32(nyp),Int32(nzp),FT(γ),FT(Rg),physical_faces)
     return nothing
 end
@@ -1842,10 +3050,12 @@ end
 function ct_derive_q_point6_topological_active!(
     b, halo, nxp, nyp, nzp;
     physical_faces::NTuple{6,Bool}=ntuple(_ -> false, Val(6)),
+    positivity_meta=nothing,
 )
     face_fluxes = (b.Bx_face,b.By_face,b.Bz_face)
     background_fluxes = hasproperty(b,:B0x_face) ?
         (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    background_cell = hasproperty(b,:B0_cell) ? b.B0_cell : nothing
     face_metrics = (
         (b.Areai,b.nxi,b.nyi,b.nzi),
         (b.Areaj,b.nxj,b.nyj,b.nzj),
@@ -1855,10 +3065,11 @@ function ct_derive_q_point6_topological_active!(
         cld(nxp,nthreads[1]), cld(nyp,nthreads[2]), cld(nzp,nthreads[3]),
     )
     @gpu_launch threads=nthreads blocks=blocks ct_derive_q_point6_topological_active_kernel!(
-        b.Q,b.U,halo.conservative_shell,b.Vol,halo.inverse_volume_shell,
+        b.Q,b.U,background_cell,halo.conservative_shell,
+        b.Vol,halo.inverse_volume_shell,
         halo.cell_layout,face_fluxes,halo.face_b_shells,
         background_fluxes,halo.background_face_shells,face_metrics,
-        halo.face_area_vector_shells,halo.face_layout,
+        halo.face_area_vector_shells,halo.face_layout,positivity_meta,
         Int32(nxp),Int32(nyp),Int32(nzp),FT(γ),FT(Rg),physical_faces)
     return nothing
 end
@@ -1880,7 +3091,6 @@ function _ct_launch_recover_cell_b!(
     range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
     cell_offset::Int32,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
-    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     nb = (
         cld(range_nxp, nthreads[1]),
@@ -1893,57 +3103,7 @@ function _ct_launch_recover_cell_b!(
         b.Areaj, b.nxj, b.nyj, b.nzj,
         b.Areak, b.nxk, b.nyk, b.nzk,
         recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
-        B0x_face, B0y_face, B0z_face,
-        nothing, nothing, nothing,
-        B0x_cell, B0y_cell, B0z_cell)
-    return nothing
-end
-
-function _ct_launch_recover_background_cell_b!(
-    b, recovery_mode::Int32,
-    range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
-    cell_offset::Int32,
-)
-    nb = (
-        cld(range_nxp, nthreads[1]),
-        cld(range_nyp, nthreads[2]),
-        cld(range_nzp, nthreads[3]),
-    )
-    @gpu_launch threads=nthreads blocks=nb ct_recover_cell_b_kernel!(
-        b.Q, b.B0x_face, b.B0y_face, b.B0z_face,
-        b.Areai, b.nxi, b.nyi, b.nzi,
-        b.Areaj, b.nxj, b.nyj, b.nzj,
-        b.Areak, b.nxk, b.nyk, b.nzk,
-        recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
-        nothing, nothing, nothing,
-        b.B0x_cell, b.B0y_cell, b.B0z_cell)
-    return nothing
-end
-
-function ct_recover_background_cell_b!(
-    b, nxp, nyp, nzp;
-    recovery_mode::Int32=ct_cell_b_recovery,
-)
-    b.B0x_cell === nothing && return nothing
-    recovery_mode in (CT_CELL_B_LSQ2, CT_CELL_B_POINT6) ||
-        throw(ArgumentError("unknown CT background cell-B recovery mode $recovery_mode"))
-    if recovery_mode == CT_CELL_B_POINT6
-        _ct_launch_recover_background_cell_b!(
-            b, CT_CELL_B_LSQ2,
-            Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
-            Int32(0),
-        )
-        _ct_launch_recover_background_cell_b!(
-            b, CT_CELL_B_POINT6,
-            Int32(nxp), Int32(nyp), Int32(nzp), Int32(NG),
-        )
-    else
-        _ct_launch_recover_background_cell_b!(
-            b, recovery_mode,
-            Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
-            Int32(0),
-        )
-    end
+        B0x_face, B0y_face, B0z_face)
     return nothing
 end
 
@@ -1958,10 +3118,6 @@ function ct_recover_cell_b!(
         (b.B0x_face, b.B0y_face, b.B0z_face) :
         (nothing, nothing, nothing)
     B0x_face, B0y_face, B0z_face = background_faces
-    background_cells = B0x_face !== nothing && hasproperty(b, :B0x_cell) ?
-        (b.B0x_cell, b.B0y_cell, b.B0z_cell) :
-        (nothing, nothing, nothing)
-    B0x_cell, B0y_cell, B0z_cell = background_cells
     if include_ghosts && recovery_mode == CT_CELL_B_POINT6
         # POINT6 needs two face layers on the low side and three on the high
         # side. Those layers do not exist outside the padded allocation, so
@@ -1972,13 +3128,11 @@ function ct_recover_cell_b!(
             b, CT_CELL_B_LSQ2,
             Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
             Int32(0), B0x_face, B0y_face, B0z_face,
-            B0x_cell, B0y_cell, B0z_cell,
         )
         _ct_launch_recover_cell_b!(
             b, CT_CELL_B_POINT6,
             Int32(nxp), Int32(nyp), Int32(nzp), Int32(NG),
             B0x_face, B0y_face, B0z_face,
-            B0x_cell, B0y_cell, B0z_cell,
         )
     else
         _ct_launch_recover_cell_b!(
@@ -1988,59 +3142,58 @@ function ct_recover_cell_b!(
             Int32(include_ghosts ? nzp + 2*NG : nzp),
             Int32(include_ghosts ? 0 : NG),
             B0x_face, B0y_face, B0z_face,
-            B0x_cell, B0y_cell, B0z_cell,
         )
     end
     return nothing
 end
 
-# Prescribed external-field boundaries impose zero perturbation in the
-# background-split system. Deep physical ghost cells can have degenerate
-# extrapolated metrics, so they do not admit an LSQ face-flux recovery. Their
-# total magnetic primitive is nevertheless well-defined by the boundary:
-# B = B0 + b = B0. This operation touches only magnetic primitive components.
-function ct_restore_prescribed_background_ghost_b_kernel!(
-    Q, B0x_cell, B0y_cell, B0z_cell, prescribed_faces,
-    nxp, nyp, nzp,
+function _ct_launch_recover_background_cell_b!(
+    b, recovery_mode::Int32,
+    range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
+    cell_offset::Int32,
 )
-    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
-    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
-    if i > nxp + 2NG || j > nyp + 2NG || k > nzp + 2NG
-        return
-    end
-    prescribed =
-        (prescribed_faces[1] && i <= NG) ||
-        (prescribed_faces[2] && i > nxp + NG) ||
-        (prescribed_faces[3] && j <= NG) ||
-        (prescribed_faces[4] && j > nyp + NG) ||
-        (prescribed_faces[5] && k <= NG) ||
-        (prescribed_faces[6] && k > nzp + NG)
-    prescribed || return
-
-    @inbounds begin
-        Q[i,j,k,QBX] = B0x_cell[i,j,k]
-        Q[i,j,k,QBY] = B0y_cell[i,j,k]
-        Q[i,j,k,QBZ] = B0z_cell[i,j,k]
-        Q[i,j,k,QPSI] = zero(FT)
-    end
-    return
+    b.B0_cell === nothing && return nothing
+    nb = (
+        cld(range_nxp,nthreads[1]), cld(range_nyp,nthreads[2]),
+        cld(range_nzp,nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_recover_background_cell_b_kernel!(
+        b.B0_cell, b.B0x_face, b.B0y_face, b.B0z_face,
+        b.Areai, b.nxi, b.nyi, b.nzi,
+        b.Areaj, b.nxj, b.nyj, b.nzj,
+        b.Areak, b.nxk, b.nyk, b.nzk,
+        recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
+    )
+    return nothing
 end
 
-function ct_restore_prescribed_background_ghost_b!(
+"""Recover the fixed cell-centered `B0` cache from authoritative face fluxes."""
+function ct_recover_background_cell_b!(
     b, nxp, nyp, nzp;
-    prescribed_faces::NTuple{6,Bool},
+    recovery_mode::Int32=ct_cell_b_recovery,
+    include_ghosts::Bool=true,
 )
-    b.B0x_cell === nothing && return nothing
-    any(prescribed_faces) || return nothing
-    nb = (
-        cld(nxp + 2NG, nthreads[1]), cld(nyp + 2NG, nthreads[2]),
-        cld(nzp + 2NG, nthreads[3]),
-    )
-    @gpu_launch threads=nthreads blocks=nb ct_restore_prescribed_background_ghost_b_kernel!(
-        b.Q, b.B0x_cell, b.B0y_cell, b.B0z_cell, prescribed_faces,
-        Int32(nxp), Int32(nyp), Int32(nzp),
-    )
+    b.B0_cell === nothing && return nothing
+    recovery_mode in (CT_CELL_B_LSQ2,CT_CELL_B_POINT6) ||
+        throw(ArgumentError("unknown CT background recovery mode $recovery_mode"))
+    if include_ghosts && recovery_mode == CT_CELL_B_POINT6
+        _ct_launch_recover_background_cell_b!(
+            b,CT_CELL_B_LSQ2,
+            Int32(nxp+2NG),Int32(nyp+2NG),Int32(nzp+2NG),Int32(0),
+        )
+        _ct_launch_recover_background_cell_b!(
+            b,CT_CELL_B_POINT6,
+            Int32(nxp),Int32(nyp),Int32(nzp),Int32(NG),
+        )
+    else
+        _ct_launch_recover_background_cell_b!(
+            b,recovery_mode,
+            Int32(include_ghosts ? nxp+2NG : nxp),
+            Int32(include_ghosts ? nyp+2NG : nyp),
+            Int32(include_ghosts ? nzp+2NG : nzp),
+            Int32(include_ghosts ? 0 : NG),
+        )
+    end
     return nothing
 end
 
@@ -2203,23 +3356,67 @@ function ct_update_q_b_kernel!(Q, U, nxp, nyp, nzp)
     return
 end
 
-function ct_update_q_point6_kernel!(Q, U, inverse_volume, nxp, nyp, nzp)
+function ct_update_q_point6_kernel!(
+    Q, U, inverse_volume,
+    face_fluxes, background_fluxes, face_metrics, background_cell,
+    positivity_meta, nxp, nyp, nzp,
+)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
     if i > nxp || j > nyp || k > nzp; return; end
     ii = i + NG; jj = j + NG; kk = k + NG
-    hydro = ct_conservative_average_to_point6(
-        U, inverse_volume, ii, jj, kk,
-    )
-    @inbounds magnetic = SVector{3,FT}(
+    candidate_hydro, x_ao, y_ao, z_ao, used_ao =
+        ct_conservative_average_to_point_adaptive(
+            U,inverse_volume,ii,jj,kk,
+        )
+    ao_hydro = used_ao ? candidate_hydro :
+        ct_conservative_average_to_point_coefficients(
+            U,inverse_volume,ii,jj,kk,x_ao,y_ao,z_ao,
+        )
+    low_hydro = _ct_point6_cell_conservative(U,ii,jj,kk)
+    @inbounds high_magnetic = SVector{3,FT}(
         Q[ii, jj, kk, QBX],
         Q[ii, jj, kk, QBY],
         Q[ii, jj, kk, QBZ],
     )
+    low_magnetic = _ct_recover_cell_b_from_face_fluxes(
+        face_fluxes[1],face_fluxes[2],face_fluxes[3],
+        face_metrics[1]...,face_metrics[2]...,face_metrics[3]...,
+        CT_CELL_B_LSQ2,ii,jj,kk,background_fluxes...,
+    )
+    hydro, magnetic, theta, recovery_mode =
+        ct_point6_select_admissible_state(
+            candidate_hydro,ao_hydro,low_hydro,high_magnetic,low_magnetic,
+            FT(γ),FT(density_floor),FT(pressure_floor),used_ao,
+        )
+    _ct_record_point6_recovery!(positivity_meta,recovery_mode)
     primitive = ct_mhd_point_conservative_to_primitive(
         hydro, magnetic, FT(γ),
     )
+    if background_cell !== nothing
+        high_background = _ct_recover_cell_b_from_face_fluxes(
+            background_fluxes[1],background_fluxes[2],background_fluxes[3],
+            face_metrics[1]...,face_metrics[2]...,face_metrics[3]...,
+            CT_CELL_B_POINT6,ii,jj,kk,
+        )
+        background = high_background
+        if theta < one(theta)
+            low_background = _ct_recover_cell_b_from_face_fluxes(
+                background_fluxes[1],background_fluxes[2],background_fluxes[3],
+                face_metrics[1]...,face_metrics[2]...,face_metrics[3]...,
+                CT_CELL_B_LSQ2,ii,jj,kk,
+            )
+            background = _ct_point6_blend(
+                low_background,high_background,theta,
+            )
+        end
+        @inbounds begin
+            background_cell[ii,jj,kk,1]=background[1]
+            background_cell[ii,jj,kk,2]=background[2]
+            background_cell[ii,jj,kk,3]=background[3]
+        end
+    end
     temperature = primitive[5] / (primitive[1] * FT(Rg))
     @inbounds begin
         Q[ii, jj, kk, 1] = primitive[1]
@@ -2236,12 +3433,23 @@ function ct_update_q_point6_kernel!(Q, U, inverse_volume, nxp, nyp, nzp)
     return
 end
 
-function ct_update_q_b!(b, nxp, nyp, nzp)
+function ct_update_q_b!(b, nxp, nyp, nzp; positivity_meta=nothing)
     nb = (cld(nxp, nthreads[1]), cld(nyp, nthreads[2]), cld(nzp, nthreads[3]))
     @static if isdefined(@__MODULE__, :ct_primitive_recovery) &&
                ct_primitive_recovery == CT_PRIMITIVE_POINT6
+        face_fluxes = (b.Bx_face,b.By_face,b.Bz_face)
+        background_fluxes = hasproperty(b,:B0x_face) ?
+            (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+        face_metrics = (
+            (b.Areai,b.nxi,b.nyi,b.nzi),
+            (b.Areaj,b.nxj,b.nyj,b.nzj),
+            (b.Areak,b.nxk,b.nyk,b.nzk),
+        )
+        background_cell = hasproperty(b,:B0_cell) ? b.B0_cell : nothing
         @gpu_launch threads=nthreads blocks=nb ct_update_q_point6_kernel!(
-            b.Q, b.U, b.Vol, Int32(nxp), Int32(nyp), Int32(nzp))
+            b.Q,b.U,b.Vol,face_fluxes,background_fluxes,face_metrics,
+            background_cell,positivity_meta,
+            Int32(nxp),Int32(nyp),Int32(nzp))
     else
         @gpu_launch threads=nthreads blocks=nb ct_update_q_b_kernel!(
             b.Q, b.U, Int32(nxp), Int32(nyp), Int32(nzp))
@@ -2786,10 +3994,15 @@ function ct_fill_external_field_face_b!(
     b, nxp, nyp, nzp, boundary_axis::Integer, side::Integer, bcp,
     ; include_normal_face::Bool=true,
       background_splitting::Bool=false,
+      preserve_perturbation::Bool=false,
 )
     axis = Int32(boundary_axis)
     side_value = Int32(side)
     nx = Int32(nxp); ny = Int32(nyp); nz = Int32(nzp)
+    background_faces = hasproperty(b, :B0x_face) ?
+        (b.B0x_face, b.B0y_face, b.B0z_face) :
+        (nothing, nothing, nothing)
+    B0x_face, B0y_face, B0z_face = background_faces
 
     n1x = nx + Int32(2)*NG + Int32(1)
     n2x = ny + Int32(2)*NG
@@ -2799,7 +4012,8 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.Bx_face, b.Areai, b.nxi, b.nyi, b.nzi, b.x, b.y, b.z,
         axis, side_value, Int32(1), nx, ny, nz, bcp,
-        include_normal_face, background_splitting,
+        include_normal_face, background_splitting, preserve_perturbation,
+        B0x_face,
     )
 
     n1y = nx + Int32(2)*NG
@@ -2810,7 +4024,8 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.By_face, b.Areaj, b.nxj, b.nyj, b.nzj, b.x, b.y, b.z,
         axis, side_value, Int32(2), nx, ny, nz, bcp,
-        include_normal_face, background_splitting,
+        include_normal_face, background_splitting, preserve_perturbation,
+        B0y_face,
     )
 
     n1z = nx + Int32(2)*NG
@@ -2821,7 +4036,8 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.Bz_face, b.Areak, b.nxk, b.nyk, b.nzk, b.x, b.y, b.z,
         axis, side_value, Int32(3), nx, ny, nz, bcp,
-        include_normal_face, background_splitting,
+        include_normal_face, background_splitting, preserve_perturbation,
+        B0z_face,
     )
     return nothing
 end

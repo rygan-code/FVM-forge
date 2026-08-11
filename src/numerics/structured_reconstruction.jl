@@ -8,105 +8,110 @@ end
 @inline _structured_state_component(U, Q, i, j, k, n) =
     ct_cell_state_component(U, Q, i, j, k, n)
 
-@inline function _structured_state_component(
-    U, Q, B0x_cell, B0y_cell, B0z_cell, i, j, k, n,
-)
-    B0x_cell === nothing && return ct_cell_state_component(
-        U, Q, i, j, k, n,
+@inline function _ct_background_cell_sample(background_cell, i, j, k)
+    @inbounds return SVector{3,FT}(
+        background_cell[i,j,k,1],
+        background_cell[i,j,k,2],
+        background_cell[i,j,k,3],
     )
-    if n <= 4
-        @inbounds return U[i, j, k, n]
-    end
-    @inbounds begin
-        b0x = B0x_cell[i, j, k]
-        b0y = B0y_cell[i, j, k]
-        b0z = B0z_cell[i, j, k]
-        total_bx = Q[i, j, k, QBX]
-        total_by = Q[i, j, k, QBY]
-        total_bz = Q[i, j, k, QBZ]
-    end
-    if n == 5
-        if isothermal_mhd
-            @inbounds return U[i, j, k, 5]
-        end
-        bx = total_bx - b0x
-        by = total_by - b0y
-        bz = total_bz - b0z
-        removed_energy = FT(0.5) * (b0x*b0x + b0y*b0y + b0z*b0z) +
-                         b0x*bx + b0y*by + b0z*bz
-        @inbounds return U[i, j, k, 5] - removed_energy*INV_MU0_SI
-    elseif n == UBX
-        return total_bx - b0x
-    elseif n == UBY
-        return total_by - b0y
-    elseif n == UBZ
-        return total_bz - b0z
-    end
-    return zero(FT)
 end
 
-@inline function _ct_background_face_component(
-    field, i, j, k, ::Val{DIRECTION}, ::Val{RECONSTRUCTION},
-) where {DIRECTION,RECONSTRUCTION}
-    T = eltype(field)
-    if RECONSTRUCTION == CT_CHARACTERISTIC_PLM
-        ii = DIRECTION == 1 ? i + Int32(1) : i
-        jj = DIRECTION == 2 ? j + Int32(1) : j
-        kk = DIRECTION == 3 ? k + Int32(1) : k
-        @inbounds return T(0.5) * (
-            field[i, j, k] + field[ii, jj, kk]
+@inline function _ct_background_split_sample(Q, background_cell, i, j, k)
+    background = _ct_background_cell_sample(background_cell, i, j, k)
+    @inbounds total = SVector{3,FT}(
+        Q[i,j,k,QBX],Q[i,j,k,QBY],Q[i,j,k,QBZ],
+    )
+    return total-background, background
+end
+
+@inline function _ct_weno7_vector_interface(samples, ss)
+    T = eltype(first(samples))
+    left = SVector{3,T}(ntuple(Val(3)) do component
+        stencil = SVector{7,T}(ntuple(
+            sample -> samples[sample][component], Val(7),
+        ))
+        weno7_face_left(stencil,ss)
+    end)
+    right = SVector{3,T}(ntuple(Val(3)) do component
+        stencil = SVector{7,T}(ntuple(
+            sample -> samples[sample+1][component], Val(7),
+        ))
+        weno7_face_right(stencil,ss)
+    end)
+    return left,right
+end
+
+@inline function ct_background_interface_field(
+    background_cell, i, j, k, ss,
+    normal_x, normal_y, normal_z, background_bn,
+    ::Val{DIRECTION},
+) where {DIRECTION}
+    di = DIRECTION == 1 ? Int32(1) : Int32(0)
+    dj = DIRECTION == 2 ? Int32(1) : Int32(0)
+    dk = DIRECTION == 3 ? Int32(1) : Int32(0)
+    samples = ntuple(Val(8)) do sample
+        offset = Int32(sample-4)
+        _ct_background_cell_sample(
+            background_cell,
+            i+offset*di,j+offset*dj,k+offset*dk,
         )
     end
-    weights = SVector{6,T}(T(3), T(-25), T(150), T(150), T(-25), T(3)) /
-              T(256)
-    value = zero(T)
-    for sample in 1:6
-        offset = sample - 3
-        ii = DIRECTION == 1 ? i + offset : i
-        jj = DIRECTION == 2 ? j + offset : j
-        kk = DIRECTION == 3 ? k + offset : k
-        @inbounds value += weights[sample] * field[ii, jj, kk]
+    background_left,background_right =
+        _ct_weno7_vector_interface(samples,ss)
+    background_face = (background_left+background_right)/FT(2)
+    return SVector{3,FT}(ct_replace_normal_component(
+        background_face[1],background_face[2],background_face[3],
+        normal_x,normal_y,normal_z,background_bn,
+    ))
+end
+
+@inline function ct_background_split_interface_magnetic(
+    Q, background_cell, i, j, k, ss,
+    normal_x, normal_y, normal_z, background_bn,
+    direction::Val{DIRECTION},
+) where {DIRECTION}
+    di = DIRECTION == 1 ? Int32(1) : Int32(0)
+    dj = DIRECTION == 2 ? Int32(1) : Int32(0)
+    dk = DIRECTION == 3 ? Int32(1) : Int32(0)
+    perturbation_samples = ntuple(Val(8)) do sample
+        offset = Int32(sample-4)
+        perturbation, _ = _ct_background_split_sample(
+            Q,background_cell,
+            i+offset*di,j+offset*dj,k+offset*dk,
+        )
+        perturbation
     end
-    return value
-end
-
-@inline function _ct_background_face_component6(
-    field, i, j, k, direction,
-)
-    return _ct_background_face_component(
-        field, i, j, k, direction,
-        Val(ct_characteristic_reconstruction),
+    perturbation_left,perturbation_right =
+        _ct_weno7_vector_interface(perturbation_samples,ss)
+    background_face = ct_background_interface_field(
+        background_cell,i,j,k,ss,
+        normal_x,normal_y,normal_z,background_bn,direction,
     )
+    return background_face+perturbation_left,
+           background_face+perturbation_right,background_face
 end
 
-@inline _ct_background_face_vector(
-    ::Nothing, B0y_cell, B0z_cell, i, j, k, direction,
-    nx, ny, nz, background_bn,
-) = nothing
-
-@inline function _ct_background_face_vector(
-    B0x_cell, B0y_cell, B0z_cell, i, j, k, direction,
-    nx, ny, nz, background_bn,
-)
-    b0x = _ct_background_face_component6(B0x_cell, i, j, k, direction)
-    b0y = _ct_background_face_component6(B0y_cell, i, j, k, direction)
-    b0z = _ct_background_face_component6(B0z_cell, i, j, k, direction)
-    b0x, b0y, b0z = ct_replace_normal_component(
-        b0x, b0y, b0z, nx, ny, nz, background_bn,
+@inline function ct_background_split_interface_states(
+    left_state, right_state, Q, background_cell,
+    i, j, k, ss, normal_x, normal_y, normal_z, background_bn,
+    ::Val{DIRECTION},
+) where {DIRECTION}
+    magnetic_left,magnetic_right,background_face =
+        ct_background_split_interface_magnetic(
+            Q,background_cell,i,j,k,ss,
+            normal_x,normal_y,normal_z,background_bn,Val(DIRECTION),
+        )
+    left_state = ct_impose_magnetic_preserve_p(
+        left_state,magnetic_left,
     )
-    return SVector{3,FT}(b0x, b0y, b0z)
+    right_state = ct_impose_magnetic_preserve_p(
+        right_state,magnetic_right,
+    )
+    return left_state,right_state,background_face
 end
 
-@inline function Blend_Flux(
-    UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID,
-    ch_glm::FT, background_face=nothing,
-)
+@inline function Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID, ch_glm::FT)
     @static if equation_type == :MHD
-        if background_face !== nothing
-            return MHD_HLLE_Background_Flux(
-                UL_vec, UR_vec, background_face, nx, ny, nz, ch_glm,
-            )
-        end
         @static if isothermal_mhd
             if splitMethodID == Int32(6)
                 return MHD_HLLE_Flux(UL_vec, UR_vec, nx, ny, nz, ch_glm)
@@ -174,13 +179,66 @@ end
            all(isfinite, state)
 end
 
+@inline function _ct_record_characteristic_recovery!(
+    pos_meta, recovery_mode::Int32,
+)
+    pos_meta === nothing && return nothing
+    if recovery_mode >= Int32(1)
+        ct_record_fallback!(pos_meta, CT_POS_WENO_TO_PLM_COUNT)
+    end
+    if recovery_mode >= Int32(2)
+        ct_record_fallback!(pos_meta, CT_POS_PLM_TO_FIRST_COUNT)
+    end
+    return nothing
+end
+
+@inline function _ct_characteristic_weno7_admissible(
+    stencil::NTuple{7,SVector{9,T}},
+    nx::T, ny::T, nz::T, face_bn::T, gamma::T,
+    ::Val{SIDE},
+) where {T,SIDE}
+    primitive_state = if SIDE == 1
+        ct_mhd_characteristic_weno7_left(
+            stencil..., nx, ny, nz, face_bn, gamma,
+        )
+    else
+        ct_mhd_characteristic_weno7_right(
+            stencil..., nx, ny, nz, face_bn, gamma,
+        )
+    end
+    recovery_mode = Int32(0)
+    if !_ct_primitive_is_physical(primitive_state)
+        recovery_mode = Int32(1)
+        primitive_state = if SIDE == 1
+            ct_mhd_characteristic_plm_plus(
+                stencil[3], stencil[4], stencil[5],
+                nx, ny, nz, face_bn, gamma,
+            )
+        else
+            ct_mhd_characteristic_plm_minus(
+                stencil[3], stencil[4], stencil[5],
+                nx, ny, nz, face_bn, gamma,
+            )
+        end
+        if !_ct_primitive_is_physical(primitive_state)
+            recovery_mode = Int32(2)
+            primitive_state = stencil[4]
+        end
+    end
+    return primitive_state, recovery_mode
+end
+
 @inline function _ct_finalize_characteristic_state!(
     states, fi, fj, fk, primitive_state, nx, ny, nz, face_bn,
     direction::Int32, side::Int32, i, j, k, pos_meta, pos_values,
+    magnetic=nothing,
 )
     state = ct_primitive_to_conservative(
         primitive_state, nx, ny, nz, face_bn, FT(γ),
     )
+    if magnetic !== nothing
+        state = ct_impose_magnetic_preserve_p(state, magnetic)
+    end
     _ct_record_if_invalid!(
         pos_meta, pos_values, CT_POS_SITE_RECONSTRUCTED,
         direction, side, i, j, k, state, face_bn,
@@ -206,6 +264,7 @@ end
 @inline function _ct_hlld_flux_from_interface_states!(
     left_states, right_states, flux, rho_sum,
     fi, fj, fk, nx, ny, nz, area, ch_glm, pos_meta,
+    background=nothing,
 )
     left_state = SVector{9,FT}(
         ntuple(n -> @inbounds(left_states[fi, fj, fk, n]), Val(9)),
@@ -216,6 +275,11 @@ end
     flux_value = HLLD_Flux(
         left_state, right_state, nx, ny, nz, ch_glm, pos_meta,
     )
+    if background !== nothing
+        flux_value = ct_remove_background_maxwell_stress(
+            flux_value,background,nx,ny,nz,
+        )
+    end
     @inbounds rho_sum[fi, fj, fk] = left_state[1] + right_state[1]
     @inbounds for n = 1:9
         flux[fi, fj, fk, n] = flux_value[n] * area
@@ -225,7 +289,7 @@ end
 
 @inline function _ct_mhd_characteristic_reconstruct_kernel!(
     Q, states, area_array, nx_array, ny_array, nz_array, face_b,
-    background_face,
+    background_face, background_cell,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
     ::Val{DIRECTION}, ::Val{SIDE},
 ) where {DIRECTION,SIDE}
@@ -264,8 +328,16 @@ end
     face_i, face_j, face_k = i+di, j+dj, k+dk
     area,nx,ny,nz,face_bn = structured_ct_face_geometry_bn(
         face_b,background_face,area_array,nx_array,ny_array,nz_array,
-        face_i,face_j,face_k,Val(DIRECTION),
+        face_i,face_j,face_k,Val(DIRECTION),Q,
     )
+    background_bn = zero(FT)
+    if background_cell !== nothing
+        _,_,_,_,background_bn = structured_ct_face_geometry_bn(
+            background_face,nothing,
+            area_array,nx_array,ny_array,nz_array,
+            face_i,face_j,face_k,Val(DIRECTION),nothing,CT_FACE_BN_POINT6,
+        )
+    end
 
     if ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7
         first_offset = SIDE == 1 ? Int32(-3) : Int32(-2)
@@ -275,39 +347,11 @@ end
                 Q, i+offset*di, j+offset*dj, k+offset*dk,
             )
         end
-        if SIDE == 1
-            primitive_state = ct_mhd_characteristic_weno7_left(
-                stencil..., nx, ny, nz, face_bn, FT(γ),
+        primitive_state, recovery_mode =
+            _ct_characteristic_weno7_admissible(
+                stencil, nx, ny, nz, face_bn, FT(γ), Val(SIDE),
             )
-        else
-            primitive_state = ct_mhd_characteristic_weno7_right(
-                stencil..., nx, ny, nz, face_bn, FT(γ),
-            )
-        end
-        if !_ct_primitive_is_physical(primitive_state)
-            ct_record_fallback!(pos_meta, CT_POS_WENO_TO_PLM_COUNT)
-            if SIDE == 1
-                Wm = ct_primitive_state(Q, i-di, j-dj, k-dk)
-                Wc = ct_primitive_state(Q, i, j, k)
-                Wp = ct_primitive_state(Q, i+di, j+dj, k+dk)
-                primitive_state = ct_mhd_characteristic_plm_plus(
-                    Wm, Wc, Wp, nx, ny, nz, face_bn, FT(γ),
-                )
-                first_order_state = Wc
-            else
-                Wc = ct_primitive_state(Q, i, j, k)
-                Wp = ct_primitive_state(Q, i+di, j+dj, k+dk)
-                Wpp = ct_primitive_state(Q, i+2di, j+2dj, k+2dk)
-                primitive_state = ct_mhd_characteristic_plm_minus(
-                    Wc, Wp, Wpp, nx, ny, nz, face_bn, FT(γ),
-                )
-                first_order_state = Wp
-            end
-            if !_ct_primitive_is_physical(primitive_state)
-                ct_record_fallback!(pos_meta, CT_POS_PLM_TO_FIRST_COUNT)
-                primitive_state = first_order_state
-            end
-        end
+        _ct_record_characteristic_recovery!(pos_meta, recovery_mode)
     elseif SIDE == 1
         Wm = ct_primitive_state(Q, i-di, j-dj, k-dk)
         Wc = ct_primitive_state(Q, i, j, k)
@@ -338,20 +382,37 @@ end
          j-Int32(NG)+tangential_halo
     fk = DIRECTION == 3 ? k-Int32(NG)+Int32(1) :
          k-Int32(NG)+tangential_halo
-    _ct_finalize_characteristic_state!(
-        states, fi, fj, fk, primitive_state, nx, ny, nz, face_bn,
-        Int32(DIRECTION), Int32(SIDE), i, j, k, pos_meta, pos_values,
-    )
+    if background_cell === nothing
+        _ct_finalize_characteristic_state!(
+            states, fi, fj, fk, primitive_state, nx, ny, nz, face_bn,
+            Int32(DIRECTION), Int32(SIDE), i, j, k, pos_meta, pos_values,
+        )
+    else
+        @inbounds split_ss = FT(2)/(
+            area_array[i+di,j+dj,k+dk]+area_array[i,j,k]
+        )
+        magnetic_left,magnetic_right,_ =
+            ct_background_split_interface_magnetic(
+                Q,background_cell,i,j,k,split_ss,
+                nx,ny,nz,background_bn,Val(DIRECTION),
+            )
+        magnetic = SIDE == 1 ? magnetic_left : magnetic_right
+        _ct_finalize_characteristic_state!(
+            states, fi, fj, fk, primitive_state, nx, ny, nz, face_bn,
+            Int32(DIRECTION), Int32(SIDE), i, j, k, pos_meta, pos_values,
+            magnetic,
+        )
+    end
     return
 end
 
 function ct_mhd_characteristic_reconstruct_left_i_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(1), Val(1),
     )
 end
@@ -359,10 +420,10 @@ end
 function ct_mhd_characteristic_reconstruct_right_i_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(1), Val(2),
     )
 end
@@ -370,10 +431,10 @@ end
 function ct_mhd_characteristic_reconstruct_left_j_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(2), Val(1),
     )
 end
@@ -381,10 +442,10 @@ end
 function ct_mhd_characteristic_reconstruct_right_j_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(2), Val(2),
     )
 end
@@ -392,10 +453,10 @@ end
 function ct_mhd_characteristic_reconstruct_left_k_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(3), Val(1),
     )
 end
@@ -403,10 +464,10 @@ end
 function ct_mhd_characteristic_reconstruct_right_k_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
-        Q, states, area, nx, ny, nz, face_b, background_face,
+        Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
         nxp, nyp, nzp, mode, pos_meta, pos_values, Val(3), Val(2),
     )
 end
@@ -415,6 +476,7 @@ end
     left_states, right_states, flux, rho_sum,
     area_array, nx_array, ny_array, nz_array,
     nxp, nyp, nzp, ch_glm::FT, mode::Int32, pos_meta,
+    background_face, background_cell,
     ::Val{DIRECTION},
 ) where {DIRECTION}
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -450,10 +512,25 @@ end
     dj = DIRECTION == 2 ? Int32(1) : Int32(0)
     dk = DIRECTION == 3 ? Int32(1) : Int32(0)
     face_i, face_j, face_k = i+di, j+dj, k+dk
-    area,nx,ny,nz = structured_face_geometry(
+    area,nx,ny,nz = structured_ct_face_geometry(
         area_array,nx_array,ny_array,nz_array,
         face_i,face_j,face_k,Val(DIRECTION),
     )
+    background = nothing
+    if background_cell !== nothing
+        _,_,_,_,background_bn = structured_ct_face_geometry_bn(
+            background_face,nothing,
+            area_array,nx_array,ny_array,nz_array,
+            face_i,face_j,face_k,Val(DIRECTION),nothing,CT_FACE_BN_POINT6,
+        )
+        @inbounds split_ss = FT(2)/(
+            area_array[i+di,j+dj,k+dk]+area_array[i,j,k]
+        )
+        background = ct_background_interface_field(
+            background_cell,i,j,k,split_ss,
+            nx,ny,nz,background_bn,Val(DIRECTION),
+        )
+    end
     fi = DIRECTION == 1 ? i-Int32(NG)+Int32(1) :
          i-Int32(NG)+tangential_halo
     fj = DIRECTION == 2 ? j-Int32(NG)+Int32(1) :
@@ -463,6 +540,7 @@ end
     _ct_hlld_flux_from_interface_states!(
         left_states, right_states, flux, rho_sum,
         fi, fj, fk, nx, ny, nz, area, ch_glm, pos_meta,
+        background,
     )
     return
 end
@@ -470,39 +548,278 @@ end
 function ct_mhd_hlld_flux_i_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta,
+    pos_meta, background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
-        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta, Val(1),
+        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
+        background_face, background_cell, Val(1),
     )
 end
 
 function ct_mhd_hlld_flux_j_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta,
+    pos_meta, background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
-        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta, Val(2),
+        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
+        background_face, background_cell, Val(2),
     )
 end
 
 function ct_mhd_hlld_flux_k_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta,
+    pos_meta, background_face=nothing, background_cell=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
-        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta, Val(3),
+        area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
+        background_face, background_cell, Val(3),
     )
 end
 
+@inline function _ct_fofc_face_cell_indices(
+    fi, fj, fk, ::Val{DIRECTION},
+) where {DIRECTION}
+    ng = Int32(NG)
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    if DIRECTION == 1
+        left = (fi+ng-Int32(1),fj+ng-tangent,fk+ng-tangent)
+        right = (left[1]+Int32(1),left[2],left[3])
+        geometry = (fi+ng,left[2],left[3])
+    elseif DIRECTION == 2
+        left = (fi+ng-tangent,fj+ng-Int32(1),fk+ng-tangent)
+        right = (left[1],left[2]+Int32(1),left[3])
+        geometry = (left[1],fj+ng,left[3])
+    else
+        left = (fi+ng-tangent,fj+ng-tangent,fk+ng-Int32(1))
+        right = (left[1],left[2],left[3]+Int32(1))
+        geometry = (left[1],left[2],fk+ng)
+    end
+    return left,right,geometry
+end
+
+@inline function _ct_fofc_face_activity(flags, left, right)
+    @inbounds begin
+        left_value = flags[left...,1]
+        right_value = flags[right...,1]
+    end
+    left_active = ct_fofc_flag_is_active(left_value)
+    right_active = ct_fofc_flag_is_active(right_value)
+    active = left_active || right_active
+    scale = min(
+        left_active ? ct_fofc_flag_scale(left_value) : one(FT),
+        right_active ? ct_fofc_flag_scale(right_value) : one(FT),
+    )
+    return active,scale
+end
+
+@inline function _ct_fofc_cell_magnetic(
+    Bx_face,By_face,Bz_face,
+    B0x_face,B0y_face,B0z_face,
+    Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+    cell,
+)
+    return _ct_recover_cell_b_from_face_fluxes(
+        Bx_face,By_face,Bz_face,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+        CT_CELL_B_LSQ2,cell...,B0x_face,B0y_face,B0z_face,
+    )
+end
+
+@inline function _ct_fofc_cell_state(U,magnetic,cell)
+    @inbounds return SVector{9,FT}(
+        U[cell...,1],U[cell...,2],U[cell...,3],U[cell...,4],U[cell...,5],
+        magnetic[1],magnetic[2],magnetic[3],zero(FT),
+    )
+end
+
+@inline function _ct_fofc_background_interface(
+    ::Nothing,B0y_face,B0z_face,
+    Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+    area,nx,ny,nz,left,right,geometry,
+)
+    return nothing,nothing,nothing
+end
+
+@inline function _ct_fofc_background_interface(
+    B0x_face,B0y_face,B0z_face,
+    Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+    area,nx,ny,nz,left,right,geometry,
+)
+    left_background = _ct_fofc_cell_magnetic(
+        B0x_face,B0y_face,B0z_face,nothing,nothing,nothing,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,left,
+    )
+    right_background = _ct_fofc_cell_magnetic(
+        B0x_face,B0y_face,B0z_face,nothing,nothing,nothing,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,right,
+    )
+    midpoint = FT(0.5)*(left_background+right_background)
+    gi,gj,gk = geometry
+    @inbounds begin
+        face_area = area[gi,gj,gk]
+        normal_x,normal_y,normal_z = nx[gi,gj,gk],ny[gi,gj,gk],nz[gi,gj,gk]
+        background_face = if geometry[1] != left[1]
+            B0x_face
+        elseif geometry[2] != left[2]
+            B0y_face
+        else
+            B0z_face
+        end
+        background_bn = background_face[gi,gj,gk]/face_area
+    end
+    background = SVector{3,FT}(ct_replace_normal_component(
+        midpoint[1],midpoint[2],midpoint[3],
+        normal_x,normal_y,normal_z,background_bn,
+    ))
+    return background,left_background,right_background
+end
+
+@inline function _ct_fofc_replace_face_flux!(
+    flux,rho_sum,flags,U,
+    Bx_face,By_face,Bz_face,B0x_face,B0y_face,B0z_face,
+    Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+    fi, fj, fk, ch_glm, fallback_meta, record_face::Bool,
+    direction::Val{DIRECTION},
+) where {DIRECTION}
+    left,right,geometry = _ct_fofc_face_cell_indices(
+        fi,fj,fk,direction,
+    )
+    active,_ = _ct_fofc_face_activity(flags,left,right)
+    active || return false
+
+    face_b = DIRECTION == 1 ? Bx_face : (DIRECTION == 2 ? By_face : Bz_face)
+    background_face = DIRECTION == 1 ? B0x_face :
+        (DIRECTION == 2 ? B0y_face : B0z_face)
+    area_array = DIRECTION == 1 ? Areai : (DIRECTION == 2 ? Areaj : Areak)
+    nx_array = DIRECTION == 1 ? nxi : (DIRECTION == 2 ? nxj : nxk)
+    ny_array = DIRECTION == 1 ? nyi : (DIRECTION == 2 ? nyj : nyk)
+    nz_array = DIRECTION == 1 ? nzi : (DIRECTION == 2 ? nzj : nzk)
+    gi,gj,gk = geometry
+    @inbounds begin
+        area = area_array[gi,gj,gk]
+        nx,ny,nz = nx_array[gi,gj,gk],ny_array[gi,gj,gk],nz_array[gi,gj,gk]
+        face_bn = (
+            face_b[gi,gj,gk] +
+            _structured_optional_face_value(
+                background_face,gi,gj,gk,eltype(area_array),
+            )
+        )/area
+    end
+    left_magnetic = _ct_fofc_cell_magnetic(
+        Bx_face,By_face,Bz_face,B0x_face,B0y_face,B0z_face,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,left,
+    )
+    right_magnetic = _ct_fofc_cell_magnetic(
+        Bx_face,By_face,Bz_face,B0x_face,B0y_face,B0z_face,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,right,
+    )
+    left_state = _ct_fofc_cell_state(U,left_magnetic,left)
+    right_state = _ct_fofc_cell_state(U,right_magnetic,right)
+    background,left_background,right_background =
+        _ct_fofc_background_interface(
+            B0x_face,B0y_face,B0z_face,
+            Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+            area_array,nx_array,ny_array,nz_array,left,right,geometry,
+        )
+    if background !== nothing
+        left_interface_magnetic = background+(left_magnetic-left_background)
+        right_interface_magnetic = background+(right_magnetic-right_background)
+        left_state = ct_impose_magnetic_preserve_p(
+            left_state,left_interface_magnetic,
+        )
+        right_state = ct_impose_magnetic_preserve_p(
+            right_state,right_interface_magnetic,
+        )
+    end
+    left_state = ct_impose_face_bn_preserve_p(
+        left_state,nx,ny,nz,face_bn,
+    )
+    right_state = ct_impose_face_bn_preserve_p(
+        right_state,nx,ny,nz,face_bn,
+    )
+    low_order_flux = MHD_HLLE_Flux(
+        left_state,right_state,nx,ny,nz,ch_glm,
+    )
+    if background !== nothing
+        low_order_flux = ct_remove_background_maxwell_stress(
+            low_order_flux,background,nx,ny,nz,
+        )
+    end
+    @inbounds begin
+        rho_sum[fi,fj,fk] = left_state[1]+right_state[1]
+        for variable in 1:9
+            flux[fi,fj,fk,variable] = low_order_flux[variable]*area
+        end
+    end
+    record_face &&
+        ct_record_fallback!(fallback_meta,CT_POS_FOFC_FACE_COUNT)
+    return true
+end
+
+function ct_fofc_replace_face_flux_kernel!(
+    flux,rho_sum,flags,U,
+    Bx_face,By_face,Bz_face,B0x_face,B0y_face,B0z_face,
+    Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+    nxp,nyp,nzp,ch_glm,fallback_meta,record_face::Bool,
+    ::Val{DIRECTION},
+) where {DIRECTION}
+    i = (blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j = (blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k = (blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    ni = DIRECTION == 1 ? nxp+Int32(1) : nxp+Int32(2)*tangent
+    nj = DIRECTION == 2 ? nyp+Int32(1) : nyp+Int32(2)*tangent
+    nk = DIRECTION == 3 ? nzp+Int32(1) : nzp+Int32(2)*tangent
+    (i > ni || j > nj || k > nk) && return
+    _ct_fofc_replace_face_flux!(
+        flux,rho_sum,flags,U,
+        Bx_face,By_face,Bz_face,B0x_face,B0y_face,B0z_face,
+        Areai,nxi,nyi,nzi,Areaj,nxj,nyj,nzj,Areak,nxk,nyk,nzk,
+        i,j,k,ch_glm,fallback_meta,record_face,Val(DIRECTION),
+    )
+    return
+end
+
+
+@inline function _ct_fofc_scale_face_flux!(
+    flux,diffusive_flux,flags,fi,fj,fk,direction::Val{DIRECTION},
+) where {DIRECTION}
+    left,right,_ = _ct_fofc_face_cell_indices(fi,fj,fk,direction)
+    active,scale = _ct_fofc_face_activity(flags,left,right)
+    active || return false
+    @inbounds for variable in 1:9
+        flux[fi,fj,fk,variable] *= scale
+        diffusive_flux[fi,fj,fk,variable] *= scale
+    end
+    return true
+end
+
+function ct_fofc_scale_face_flux_kernel!(
+    flux,diffusive_flux,flags,nxp,nyp,nzp,::Val{DIRECTION},
+) where {DIRECTION}
+    i = (blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j = (blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k = (blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    ni = DIRECTION == 1 ? nxp+Int32(1) : nxp+Int32(2)*tangent
+    nj = DIRECTION == 2 ? nyp+Int32(1) : nyp+Int32(2)*tangent
+    nk = DIRECTION == 3 ? nzp+Int32(1) : nzp+Int32(2)*tangent
+    (i > ni || j > nj || k > nk) && return
+    _ct_fofc_scale_face_flux!(
+        flux,diffusive_flux,flags,i,j,k,Val(DIRECTION),
+    )
+    return
+end
+
 @inline function _ct_mhd_characteristic_weno7_cache_kernel!(
-    Q, cache, area_array, nx_array, ny_array, nz_array, face_b, background_face, Vol,
-    nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
+    Q, cache, area_array, nx_array, ny_array, nz_array,
+    face_b, background_face, background_cell, Vol,
+    nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32, pos_meta,
     ::Val{DIRECTION},
 ) where {DIRECTION}
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -540,8 +857,16 @@ end
     face_i, face_j, face_k = i+di, j+dj, k+dk
     area,nx,ny,nz,face_bn = structured_ct_face_geometry_bn(
         face_b,background_face,area_array,nx_array,ny_array,nz_array,
-        face_i,face_j,face_k,Val(DIRECTION),
+        face_i,face_j,face_k,Val(DIRECTION),Q,
     )
+    background_bn = zero(FT)
+    if background_cell !== nothing
+        _,_,_,_,background_bn = structured_ct_face_geometry_bn(
+            background_face,nothing,
+            area_array,nx_array,ny_array,nz_array,
+            face_i,face_j,face_k,Val(DIRECTION),nothing,CT_FACE_BN_POINT6,
+        )
+    end
 
     if ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7
         stencil = ntuple(Val(8)) do s
@@ -550,10 +875,18 @@ end
                 Q, i+offset*di, j+offset*dj, k+offset*dk,
             )
         end
-        left_state, right_state =
-            ct_mhd_characteristic_weno7_interface_states(
-                stencil..., nx, ny, nz, face_bn, FT(γ),
+        left_primitive, left_recovery =
+            _ct_characteristic_weno7_admissible(
+                ntuple(index -> stencil[index], Val(7)),
+                nx, ny, nz, face_bn, FT(γ), Val(1),
             )
+        right_primitive, right_recovery =
+            _ct_characteristic_weno7_admissible(
+                ntuple(index -> stencil[index+1], Val(7)),
+                nx, ny, nz, face_bn, FT(γ), Val(2),
+            )
+        _ct_record_characteristic_recovery!(pos_meta, left_recovery)
+        _ct_record_characteristic_recovery!(pos_meta, right_recovery)
     else
         Wm = ct_primitive_state(Q, i-di, j-dj, k-dk)
         Wc = ct_primitive_state(Q, i, j, k)
@@ -561,9 +894,45 @@ end
         Wpp = ct_primitive_state(
             Q, i+Int32(2)*di, j+Int32(2)*dj, k+Int32(2)*dk,
         )
-        left_state, right_state = ct_mhd_characteristic_interface_states(
-            Wm, Wc, Wp, Wpp, nx, ny, nz, face_bn, FT(γ),
+        left_primitive = ct_mhd_characteristic_plm_plus(
+            Wm, Wc, Wp, nx, ny, nz, face_bn, FT(γ),
         )
+        if !_ct_primitive_is_physical(left_primitive)
+            left_primitive = Wc
+            if pos_meta !== nothing
+                ct_record_fallback!(
+                    pos_meta, CT_POS_PLM_TO_FIRST_COUNT,
+                )
+            end
+        end
+        right_primitive = ct_mhd_characteristic_plm_minus(
+            Wc, Wp, Wpp, nx, ny, nz, face_bn, FT(γ),
+        )
+        if !_ct_primitive_is_physical(right_primitive)
+            right_primitive = Wp
+            if pos_meta !== nothing
+                ct_record_fallback!(
+                    pos_meta, CT_POS_PLM_TO_FIRST_COUNT,
+                )
+            end
+        end
+    end
+    left_state = ct_primitive_to_conservative(
+        left_primitive, nx, ny, nz, face_bn, FT(γ),
+    )
+    right_state = ct_primitive_to_conservative(
+        right_primitive, nx, ny, nz, face_bn, FT(γ),
+    )
+    background = nothing
+    if background_cell !== nothing
+        @inbounds split_ss = FT(2)/(
+            area_array[i+di,j+dj,k+dk]+area_array[i,j,k]
+        )
+        left_state,right_state,background =
+            ct_background_split_interface_states(
+                left_state,right_state,Q,background_cell,
+                i,j,k,split_ss,nx,ny,nz,background_bn,Val(DIRECTION),
+            )
     end
     left_state = ct_impose_face_bn_preserve_p(
         left_state, nx, ny, nz, face_bn,
@@ -572,8 +941,13 @@ end
         right_state, nx, ny, nz, face_bn,
     )
     flux_temp = HLLD_Flux(
-        left_state, right_state, nx, ny, nz, ch_glm,
+        left_state, right_state, nx, ny, nz, ch_glm, pos_meta,
     )
+    if background !== nothing
+        flux_temp = ct_remove_background_maxwell_stress(
+            flux_temp,background,nx,ny,nz,
+        )
+    end
     flux_b = SVector{3,FT}(
         flux_temp[UBX], flux_temp[UBY], flux_temp[UBZ],
     )
@@ -602,11 +976,12 @@ end
 function ct_mhd_characteristic_weno7_cache_i_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing, pos_meta=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
-        Q, cache, area, nx, ny, nz, face_b, background_face, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, Val(1),
+        Q, cache, area, nx, ny, nz,
+        face_b, background_face, background_cell, Vol,
+        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(1),
     )
 end
 
@@ -614,11 +989,12 @@ end
 function ct_mhd_characteristic_weno7_cache_j_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing, pos_meta=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
-        Q, cache, area, nx, ny, nz, face_b, background_face, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, Val(2),
+        Q, cache, area, nx, ny, nz,
+        face_b, background_face, background_cell, Vol,
+        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(2),
     )
 end
 
@@ -626,11 +1002,12 @@ end
 function ct_mhd_characteristic_weno7_cache_k_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing,
+    background_face=nothing, background_cell=nothing, pos_meta=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
-        Q, cache, area, nx, ny, nz, face_b, background_face, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, Val(3),
+        Q, cache, area, nx, ny, nz,
+        face_b, background_face, background_cell, Vol,
+        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(3),
     )
 end
 
@@ -1460,9 +1837,7 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
                               ch_glm::FT, mode::Int32, Bx_face_CT,
                               cache_i, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0x_face_CT=nothing,
-                              B0x_cell=nothing, B0y_cell=nothing,
-                              B0z_cell=nothing)
+                              B0x_face_CT=nothing, B0_cell_CT=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -1493,17 +1868,18 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
     if mode == Int32(1) && (i < NG+Int32(4) || i > nxp+NG-Int32(4)); return; end
     if mode == Int32(2) && (i >= NG+Int32(4) && i <= nxp+NG-Int32(4)); return; end
     # 2. Geometry
-    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
-            structured_ct_split_face_geometry(
+        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
             Bx_face_CT,B0x_face_CT,Areai,nxi,nyi,nzi,
-            i+Int32(1),j,k,Val(1),
+            i+Int32(1),j,k,Val(1),Q,
         )
-        background_face_vector = _ct_background_face_vector(
-            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(1),
-            nx, ny, nz, _B0n_geometry,
-        )
+        _B0n_geometry = zero(FT)
+        if B0_cell_CT !== nothing
+            _,_,_,_,_B0n_geometry = structured_ct_face_geometry_bn(
+                B0x_face_CT,nothing,Areai,nxi,nyi,nzi,
+                i+Int32(1),j,k,Val(1),nothing,CT_FACE_BN_POINT6,
+            )
+        end
     else
         Area,nx,ny,nz = structured_face_geometry(
             Areai,nxi,nyi,nzi,i+Int32(1),j,k,Val(1),
@@ -1562,8 +1938,8 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         @inbounds L5 = stencil_arr[i,5] + α_adapt * Δstencil_arr[i,5]; @inbounds L6 = stencil_arr[i,6] + α_adapt * Δstencil_arr[i,6]
         @inbounds L7 = stencil_arr[i,7] + α_adapt * Δstencil_arr[i,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-3,j,k,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
-            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
+            @inbounds v1 = _structured_state_component(U,Q,i-3,j,k,n); v2 = _structured_state_component(U,Q,i-2,j,k,n); v3 = _structured_state_component(U,Q,i-1,j,k,n)
+            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i+1,j,k,n); v6 = _structured_state_component(U,Q,i+2,j,k,n); v7 = _structured_state_component(U,Q,i+3,j,k,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         # Right-state weights (temporal register reuse)
@@ -1572,8 +1948,8 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         @inbounds L5 = stencil_R_arr[i,5] + α_adapt * Δstencil_R_arr[i,5]; @inbounds L6 = stencil_R_arr[i,6] + α_adapt * Δstencil_R_arr[i,6]
         @inbounds L7 = stencil_R_arr[i,7] + α_adapt * Δstencil_R_arr[i,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+4,j,k,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
-            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
+            @inbounds r1 = _structured_state_component(U,Q,i+4,j,k,n); r2 = _structured_state_component(U,Q,i+3,j,k,n); r3 = _structured_state_component(U,Q,i+2,j,k,n)
+            @inbounds r4 = _structured_state_component(U,Q,i+1,j,k,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i-1,j,k,n); r7 = _structured_state_component(U,Q,i-2,j,k,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -1589,21 +1965,21 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         for n = 1:Ncons
 
             # 2b. 投影 U -> V (Component-wise Reconstruction)
-            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-3,j,k,n)
-            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
-            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
-            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n)
-            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
-            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
+            @inbounds V1L = _structured_state_component(U,Q,i-3,j,k,n)
+            @inbounds V2L = _structured_state_component(U,Q,i-2,j,k,n)
+            @inbounds V3L = _structured_state_component(U,Q,i-1,j,k,n)
+            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,i+1,j,k,n)
+            @inbounds V6L = _structured_state_component(U,Q,i+2,j,k,n)
+            @inbounds V7L = _structured_state_component(U,Q,i+3,j,k,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+4,j,k,n)
-            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
-            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
-            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n)
-            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
-            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
+            @inbounds V1R = _structured_state_component(U,Q,i+4,j,k,n)
+            @inbounds V2R = _structured_state_component(U,Q,i+3,j,k,n)
+            @inbounds V3R = _structured_state_component(U,Q,i+2,j,k,n)
+            @inbounds V4R = _structured_state_component(U,Q,i+1,j,k,n)
+            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,i-1,j,k,n)
+            @inbounds V7R = _structured_state_component(U,Q,i-2,j,k,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -1743,16 +2119,28 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i+1,j,k,n); end
     end
     end
 
     # 4. 组装并计算通量 (use Tuple construction to avoid StaticArray dynamic dispatch on GPU)
     UL_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UL_final[n]), Val(Ncons))::NTuple{Ncons, FT})
     UR_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UR_final[n]), Val(Ncons))::NTuple{Ncons, FT})
+
+    _background_face = SVector{3,FT}(zero(FT),zero(FT),zero(FT))
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            @inbounds _split_ss = FT(2)/(S[i+Int32(1),j,k]+S[i,j,k])
+            UL_vec,UR_vec,_background_face =
+                ct_background_split_interface_states(
+                    UL_vec,UR_vec,Q,B0_cell_CT,i,j,k,_split_ss,
+                    nx,ny,nz,_B0n_geometry,Val(1),
+                )
+        end
+    end
 
     # CT: replace normal B (Bx=UBX) with face-centered Bn for both L and R states
     # Reconstruction thread (i,j,k) solves the interface between cells i and
@@ -1786,10 +2174,14 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
     end
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
-    flux_temp = Blend_Flux(
-        UL_vec, UR_vec, nx, ny, nz, ϕx, hybrid_ϕ1, local_lin_ϕ,
-        splitMethodID, ch_glm, background_face_vector,
-    )
+    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕx, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            flux_temp = ct_remove_background_maxwell_stress(
+                flux_temp,_background_face,nx,ny,nz,
+            )
+        end
+    end
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&
@@ -1834,9 +2226,7 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
                               ch_glm::FT, mode::Int32, By_face_CT,
                               cache_j, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0y_face_CT=nothing,
-                              B0x_cell=nothing, B0y_cell=nothing,
-                              B0z_cell=nothing)
+                              B0y_face_CT=nothing, B0_cell_CT=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -1867,17 +2257,18 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
     if mode == Int32(2) && (j >= NG+Int32(4) && j <= nyp+NG-Int32(4)); return; end
 
     # 2. Geometry
-    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
-            structured_ct_split_face_geometry(
+        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
             By_face_CT,B0y_face_CT,Areaj,nxj,nyj,nzj,
-            i,j+Int32(1),k,Val(2),
+            i,j+Int32(1),k,Val(2),Q,
         )
-        background_face_vector = _ct_background_face_vector(
-            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(2),
-            nx, ny, nz, _B0n_geometry,
-        )
+        _B0n_geometry = zero(FT)
+        if B0_cell_CT !== nothing
+            _,_,_,_,_B0n_geometry = structured_ct_face_geometry_bn(
+                B0y_face_CT,nothing,Areaj,nxj,nyj,nzj,
+                i,j+Int32(1),k,Val(2),nothing,CT_FACE_BN_POINT6,
+            )
+        end
     else
         Area,nx,ny,nz = structured_face_geometry(
             Areaj,nxj,nyj,nzj,i,j+Int32(1),k,Val(2),
@@ -1933,8 +2324,8 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
         @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-3,k,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
-            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
+            @inbounds v1 = _structured_state_component(U,Q,i,j-3,k,n); v2 = _structured_state_component(U,Q,i,j-2,k,n); v3 = _structured_state_component(U,Q,i,j-1,k,n)
+            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i,j+1,k,n); v6 = _structured_state_component(U,Q,i,j+2,k,n); v7 = _structured_state_component(U,Q,i,j+3,k,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
@@ -1942,8 +2333,8 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
         @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+4,k,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
-            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
+            @inbounds r1 = _structured_state_component(U,Q,i,j+4,k,n); r2 = _structured_state_component(U,Q,i,j+3,k,n); r3 = _structured_state_component(U,Q,i,j+2,k,n)
+            @inbounds r4 = _structured_state_component(U,Q,i,j+1,k,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i,j-1,k,n); r7 = _structured_state_component(U,Q,i,j-2,k,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -1957,21 +2348,21 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds ss = FT(2.0)/(S[i, j+1, k] + S[i, j, k])
 
         for n = 1:Ncons
-            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-3,k,n)
-            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
-            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
-            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n)
-            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
-            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
+            @inbounds V1L = _structured_state_component(U,Q,i,j-3,k,n)
+            @inbounds V2L = _structured_state_component(U,Q,i,j-2,k,n)
+            @inbounds V3L = _structured_state_component(U,Q,i,j-1,k,n)
+            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,i,j+1,k,n)
+            @inbounds V6L = _structured_state_component(U,Q,i,j+2,k,n)
+            @inbounds V7L = _structured_state_component(U,Q,i,j+3,k,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+4,k,n)
-            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
-            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
-            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n)
-            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
-            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
+            @inbounds V1R = _structured_state_component(U,Q,i,j+4,k,n)
+            @inbounds V2R = _structured_state_component(U,Q,i,j+3,k,n)
+            @inbounds V3R = _structured_state_component(U,Q,i,j+2,k,n)
+            @inbounds V4R = _structured_state_component(U,Q,i,j+1,k,n)
+            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,i,j-1,k,n)
+            @inbounds V7R = _structured_state_component(U,Q,i,j-2,k,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -2093,16 +2484,28 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i,j+1,k,n); end
     end
     end
 
     # 4. 组装并计算通量
     UL_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UL_final[n]), Val(Ncons))::NTuple{Ncons, FT})
     UR_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UR_final[n]), Val(Ncons))::NTuple{Ncons, FT})
+
+    _background_face = SVector{3,FT}(zero(FT),zero(FT),zero(FT))
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            @inbounds _split_ss = FT(2)/(S[i,j+Int32(1),k]+S[i,j,k])
+            UL_vec,UR_vec,_background_face =
+                ct_background_split_interface_states(
+                    UL_vec,UR_vec,Q,B0_cell_CT,i,j,k,_split_ss,
+                    nx,ny,nz,_B0n_geometry,Val(2),
+                )
+        end
+    end
 
     # CT: replace normal B (By=UBY) with face-centered Bn
     @static if ct_mode
@@ -2134,10 +2537,14 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
     end
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
-    flux_temp = Blend_Flux(
-        UL_vec, UR_vec, nx, ny, nz, ϕy, hybrid_ϕ1, local_lin_ϕ,
-        splitMethodID, ch_glm, background_face_vector,
-    )
+    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕy, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            flux_temp = ct_remove_background_maxwell_stress(
+                flux_temp,_background_face,nx,ny,nz,
+            )
+        end
+    end
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&
@@ -2182,9 +2589,7 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
                               ch_glm::FT, mode::Int32, Bz_face_CT,
                               cache_k, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0z_face_CT=nothing,
-                              B0x_cell=nothing, B0y_cell=nothing,
-                              B0z_cell=nothing)
+                              B0z_face_CT=nothing, B0_cell_CT=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -2217,17 +2622,18 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
     if mode == Int32(2) && (k >= NG+Int32(4) && k <= nzp+NG-Int32(4)); return; end
 
     # 2. Geometry
-    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
-            structured_ct_split_face_geometry(
+        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
             Bz_face_CT,B0z_face_CT,Areak,nxk,nyk,nzk,
-            i,j,k+Int32(1),Val(3),
+            i,j,k+Int32(1),Val(3),Q,
         )
-        background_face_vector = _ct_background_face_vector(
-            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(3),
-            nx, ny, nz, _B0n_geometry,
-        )
+        _B0n_geometry = zero(FT)
+        if B0_cell_CT !== nothing
+            _,_,_,_,_B0n_geometry = structured_ct_face_geometry_bn(
+                B0z_face_CT,nothing,Areak,nxk,nyk,nzk,
+                i,j,k+Int32(1),Val(3),nothing,CT_FACE_BN_POINT6,
+            )
+        end
     else
         Area,nx,ny,nz = structured_face_geometry(
             Areak,nxk,nyk,nzk,i,j,k+Int32(1),Val(3),
@@ -2282,8 +2688,8 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
         @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-3,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
-            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
+            @inbounds v1 = _structured_state_component(U,Q,i,j,k-3,n); v2 = _structured_state_component(U,Q,i,j,k-2,n); v3 = _structured_state_component(U,Q,i,j,k-1,n)
+            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i,j,k+1,n); v6 = _structured_state_component(U,Q,i,j,k+2,n); v7 = _structured_state_component(U,Q,i,j,k+3,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
@@ -2291,8 +2697,8 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
         @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+4,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
-            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
+            @inbounds r1 = _structured_state_component(U,Q,i,j,k+4,n); r2 = _structured_state_component(U,Q,i,j,k+3,n); r3 = _structured_state_component(U,Q,i,j,k+2,n)
+            @inbounds r4 = _structured_state_component(U,Q,i,j,k+1,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i,j,k-1,n); r7 = _structured_state_component(U,Q,i,j,k-2,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -2306,21 +2712,21 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds ss = FT(2.0)/(S[i, j, k+1] + S[i, j, k])
 
         for n = 1:Ncons
-            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-3,n)
-            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
-            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
-            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n)
-            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
-            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
+            @inbounds V1L = _structured_state_component(U,Q,i,j,k-3,n)
+            @inbounds V2L = _structured_state_component(U,Q,i,j,k-2,n)
+            @inbounds V3L = _structured_state_component(U,Q,i,j,k-1,n)
+            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,i,j,k+1,n)
+            @inbounds V6L = _structured_state_component(U,Q,i,j,k+2,n)
+            @inbounds V7L = _structured_state_component(U,Q,i,j,k+3,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+4,n)
-            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
-            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
-            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n)
-            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
-            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
+            @inbounds V1R = _structured_state_component(U,Q,i,j,k+4,n)
+            @inbounds V2R = _structured_state_component(U,Q,i,j,k+3,n)
+            @inbounds V3R = _structured_state_component(U,Q,i,j,k+2,n)
+            @inbounds V4R = _structured_state_component(U,Q,i,j,k+1,n)
+            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,i,j,k-1,n)
+            @inbounds V7R = _structured_state_component(U,Q,i,j,k-2,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -2442,16 +2848,28 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i,j,k+1,n); end
     end
     end
 
     # 4. 组装并计算通量
     UL_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UL_final[n]), Val(Ncons))::NTuple{Ncons, FT})
     UR_vec = SVector{Ncons, FT}(ntuple(n -> @inbounds(UR_final[n]), Val(Ncons))::NTuple{Ncons, FT})
+
+    _background_face = SVector{3,FT}(zero(FT),zero(FT),zero(FT))
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            @inbounds _split_ss = FT(2)/(S[i,j,k+Int32(1)]+S[i,j,k])
+            UL_vec,UR_vec,_background_face =
+                ct_background_split_interface_states(
+                    UL_vec,UR_vec,Q,B0_cell_CT,i,j,k,_split_ss,
+                    nx,ny,nz,_B0n_geometry,Val(3),
+                )
+        end
+    end
 
     # CT: replace normal B (Bz=UBZ) with face-centered Bn
     @static if ct_mode
@@ -2484,10 +2902,14 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
-    flux_temp = Blend_Flux(
-        UL_vec, UR_vec, nx, ny, nz, ϕz, hybrid_ϕ1, local_lin_ϕ,
-        splitMethodID, ch_glm, background_face_vector,
-    )
+    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕz, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    @static if ct_mode
+        if B0_cell_CT !== nothing
+            flux_temp = ct_remove_background_maxwell_stress(
+                flux_temp,_background_face,nx,ny,nz,
+            )
+        end
+    end
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&

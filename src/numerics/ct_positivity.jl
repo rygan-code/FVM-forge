@@ -1,6 +1,6 @@
 # Observation-only positivity diagnostics for the strict CT+HLLD path.
 
-const CT_POS_META_LEN = 10
+const CT_POS_META_LEN = 22
 const CT_POS_VALUE_LEN = 17
 const CT_POS_SITE_RECONSTRUCTED = Int32(1)
 const CT_POS_SITE_FACE_B_INVARIANT = Int32(2)
@@ -11,9 +11,30 @@ const CT_POS_SITE_GHOST_REFRESH = Int32(6)
 const CT_POS_SITE_PRE_CT_SYNC = Int32(7)
 const CT_POS_SITE_FINALIZE_FLOOR = Int32(8)
 const CT_POS_SITE_POST_CT_RECONCILE = Int32(9)
+const CT_POS_SITE_FOFC_CLOSURE = Int32(10)
+const CT_POS_SITE_FOFC_ANCHOR = Int32(11)
 const CT_POS_WENO_TO_PLM_COUNT = 8
 const CT_POS_PLM_TO_FIRST_COUNT = 9
 const CT_POS_HLLD_TO_HLLE_COUNT = 10
+const CT_POS_POINT6_TO_AO_COUNT = 11
+const CT_POS_POINT6_LIMIT_COUNT = 12
+if !@isdefined(CT_POS_FACE_P2A_TO_AO_COUNT)
+    const CT_POS_FACE_P2A_TO_AO_COUNT = 13
+    const CT_POS_FACE_P2A_TO_MIDPOINT_COUNT = 14
+end
+const CT_POS_FOFC_CELL_COUNT = 15
+const CT_POS_FOFC_FACE_COUNT = 16
+const CT_POS_FOFC_NEW_CELL_COUNT = 17
+const CT_POS_FOFC_BAD_CELL_COUNT = 18
+const CT_POS_POINT6_UNRECOVERABLE_COUNT = 19
+const CT_POS_FOFC_LIMIT_COUNT = 20
+const CT_POS_FOFC_REDUCED_CELL_COUNT = 21
+const CT_POS_FOFC_UNRECOVERABLE_COUNT = 22
+const CT_POS_FAILURE_META_LEN = 7
+const CT_FOFC_DIFFUSIVE_ACTIVE =
+    (@isdefined(viscous) ? Bool(viscous) : false) ||
+    ((@isdefined(equation_type) ? equation_type : :Compressible) == :MHD &&
+     (@isdefined(resistive) ? Bool(resistive) : false))
 
 @inline function _ct_try_claim!(meta)
     @static if @isdefined(gpu_atomic_cas!)
@@ -183,6 +204,45 @@ end
     return true
 end
 
+@inline function ct_record_point_primitive_if_invalid!(
+    meta, values, site::Int32, i::Int32, j::Int32, k::Int32,
+    rho, velocity_x, velocity_y, velocity_z, pressure,
+    magnetic_x, magnetic_y, magnetic_z, psi, gamma,
+)
+    kinetic = rho * (
+        velocity_x^2 + velocity_y^2 + velocity_z^2
+    ) / 2
+    magnetic = (
+        magnetic_x^2 + magnetic_y^2 + magnetic_z^2
+    ) * INV_MU0_SI / 2
+    @static if isothermal_mhd
+        internal = pressure
+    else
+        internal = pressure / (gamma-one(gamma))
+    end
+    energy = kinetic + magnetic + internal
+    finite = isfinite(rho) && isfinite(velocity_x) &&
+             isfinite(velocity_y) && isfinite(velocity_z) &&
+             isfinite(pressure) && isfinite(magnetic_x) &&
+             isfinite(magnetic_y) && isfinite(magnetic_z) &&
+             isfinite(psi) && isfinite(energy)
+    valid = finite && rho > zero(rho) && pressure > zero(pressure)
+    @static if !isothermal_mhd
+        valid &= isfinite(internal) && internal > zero(internal)
+    end
+    valid && return false
+
+    point_state = SVector{9,typeof(rho)}(
+        rho,rho*velocity_x,rho*velocity_y,rho*velocity_z,energy,
+        magnetic_x,magnetic_y,magnetic_z,psi,
+    )
+    _ct_store_failure!(
+        meta,values,site,Int32(0),Int32(0),i,j,k,
+        point_state,oftype(rho,NaN),rho,kinetic,magnetic,internal,pressure,
+    )
+    return true
+end
+
 @inline function ct_record_cell_values_if_below_floors!(
     meta, values, site::Int32, i::Int32, j::Int32, k::Int32,
     rho, momentum_x, momentum_y, momentum_z, energy,
@@ -339,6 +399,40 @@ function ct_check_cell_positivity_kernel!(
     return
 end
 
+function ct_check_point_primitive_positivity_kernel!(
+    meta, values, Q, gamma::FT, site::Int32, include_ghost::Int32,
+    nxp::Int32, nyp::Int32, nzp::Int32,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    ng = Int32(NG)
+
+    if include_ghost == Int32(0)
+        if i > nxp || j > nyp || k > nzp
+            return
+        end
+        ii = i + ng
+        jj = j + ng
+        kk = k + ng
+    else
+        if i > nxp + Int32(2)*ng ||
+           j > nyp + Int32(2)*ng ||
+           k > nzp + Int32(2)*ng
+            return
+        end
+        ii, jj, kk = i, j, k
+    end
+
+    @inbounds ct_record_point_primitive_if_invalid!(
+        meta,values,site,Int32(ii),Int32(jj),Int32(kk),
+        Q[ii,jj,kk,1],Q[ii,jj,kk,2],Q[ii,jj,kk,3],Q[ii,jj,kk,4],
+        Q[ii,jj,kk,5],Q[ii,jj,kk,QBX],Q[ii,jj,kk,QBY],Q[ii,jj,kk,QBZ],
+        Q[ii,jj,kk,QPSI],gamma,
+    )
+    return
+end
+
 function ct_check_sync_transition_kernel!(
     meta, values, U, Q, Bx_face, By_face, Bz_face,
     Areai, nxi, nyi, nzi,
@@ -347,7 +441,6 @@ function ct_check_sync_transition_kernel!(
     gamma::FT, recovery_mode::Int32,
     nxp::Int32, nyp::Int32, nzp::Int32,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
-    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -368,10 +461,6 @@ function ct_check_sync_transition_kernel!(
         old_bx = Q[ii, jj, kk, QBX]
         old_by = Q[ii, jj, kk, QBY]
         old_bz = Q[ii, jj, kk, QBZ]
-        split_background = B0x_cell !== nothing
-        recovery_B0x_face = split_background ? nothing : B0x_face
-        recovery_B0y_face = split_background ? nothing : B0y_face
-        recovery_B0z_face = split_background ? nothing : B0z_face
         area_i_lo = SVector(
             Areai[ii,jj,kk]*nxi[ii,jj,kk],
             Areai[ii,jj,kk]*nyi[ii,jj,kk],
@@ -402,50 +491,16 @@ function ct_check_sync_transition_kernel!(
             Areak[ii,jj,kk+Int32(1)]*nyk[ii,jj,kk+Int32(1)],
             Areak[ii,jj,kk+Int32(1)]*nzk[ii,jj,kk+Int32(1)],
         )
-        recovered_b = if recovery_mode == CT_CELL_B_POINT6
-            ct_recover_cell_b_point6(
-                Bx_face, By_face, Bz_face,
-                recovery_B0x_face, recovery_B0y_face,
-                recovery_B0z_face,
-                Areai, nxi, nyi, nzi,
-                Areaj, nxj, nyj, nzj,
-                Areak, nxk, nyk, nzk,
-                ii, jj, kk,
-            )
-        else
-            ct_recover_cell_b(
-                area_i_lo, area_i_hi, area_j_lo, area_j_hi,
-                area_k_lo, area_k_hi,
-                _ct_total_face_flux(
-                    Bx_face, recovery_B0x_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    Bx_face, recovery_B0x_face,
-                    ii+Int32(1), jj, kk,
-                ),
-                _ct_total_face_flux(
-                    By_face, recovery_B0y_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    By_face, recovery_B0y_face,
-                    ii, jj+Int32(1), kk,
-                ),
-                _ct_total_face_flux(
-                    Bz_face, recovery_B0z_face, ii, jj, kk,
-                ),
-                _ct_total_face_flux(
-                    Bz_face, recovery_B0z_face,
-                    ii, jj, kk+Int32(1),
-                ),
-            )
-        end
-        if split_background
-            recovered_b += SVector(
-                B0x_cell[ii,jj,kk],
-                B0y_cell[ii,jj,kk],
-                B0z_cell[ii,jj,kk],
-            )
-        end
+        recovered_b = ct_recover_cell_b(
+            area_i_lo, area_i_hi, area_j_lo, area_j_hi,
+            area_k_lo, area_k_hi,
+            _ct_total_face_flux(Bx_face, B0x_face, ii, jj, kk),
+            _ct_total_face_flux(Bx_face, B0x_face, ii+Int32(1), jj, kk),
+            _ct_total_face_flux(By_face, B0y_face, ii, jj, kk),
+            _ct_total_face_flux(By_face, B0y_face, ii, jj+Int32(1), kk),
+            _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk),
+            _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk+Int32(1)),
+        )
         new_bx = recovered_b[1]
         new_by = recovered_b[2]
         new_bz = recovered_b[3]
@@ -462,10 +517,14 @@ function ct_check_sync_transition_kernel!(
         return
     end
 
-    _, _, _, _, old_pressure = mhd_raw_thermo_components(
-        rho, momentum_x, momentum_y, momentum_z, energy,
-        old_bx, old_by, old_bz, gamma,
-    )
+    old_pressure = if recovery_mode == CT_CELL_B_POINT6
+        @inbounds Q[ii,jj,kk,5]
+    else
+        mhd_raw_thermo_components(
+            rho,momentum_x,momentum_y,momentum_z,energy,
+            old_bx,old_by,old_bz,gamma,
+        )[5]
+    end
 
     if _ct_try_claim!(meta)
         @inbounds begin
@@ -494,6 +553,327 @@ function ct_check_sync_transition_kernel!(
             values[17] = FT(NaN)
         end
     end
+    return
+end
+
+@inline function _ct_fofc_candidate_i_face(
+    face_b, face_b_base, edge_y, edge_z, face_i, cell_j, cell_k,
+    dt, rk_a,
+)
+    ng = Int32(NG)
+    ii, jj, kk = face_i+ng, cell_j+ng, cell_k+ng
+    euler = ct_stokes_update_i(
+        @inbounds(face_b[ii,jj,kk]),
+        @inbounds(edge_y[face_i,cell_j,cell_k]),
+        @inbounds(edge_y[face_i,cell_j,cell_k+Int32(1)]),
+        @inbounds(edge_z[face_i,cell_j,cell_k]),
+        @inbounds(edge_z[face_i,cell_j+Int32(1),cell_k]),
+        dt,
+    )
+    base = @inbounds face_b_base[ii,jj,kk]
+    return base + rk_a*(euler-base)
+end
+
+@inline function _ct_fofc_candidate_j_face(
+    face_b, face_b_base, edge_x, edge_z, cell_i, face_j, cell_k,
+    dt, rk_a,
+)
+    ng = Int32(NG)
+    ii, jj, kk = cell_i+ng, face_j+ng, cell_k+ng
+    euler = ct_stokes_update_j(
+        @inbounds(face_b[ii,jj,kk]),
+        @inbounds(edge_x[cell_i,face_j,cell_k]),
+        @inbounds(edge_x[cell_i,face_j,cell_k+Int32(1)]),
+        @inbounds(edge_z[cell_i,face_j,cell_k]),
+        @inbounds(edge_z[cell_i+Int32(1),face_j,cell_k]),
+        dt,
+    )
+    base = @inbounds face_b_base[ii,jj,kk]
+    return base + rk_a*(euler-base)
+end
+
+@inline function _ct_fofc_candidate_k_face(
+    face_b, face_b_base, edge_x, edge_y, cell_i, cell_j, face_k,
+    dt, rk_a,
+)
+    ng = Int32(NG)
+    ii, jj, kk = cell_i+ng, cell_j+ng, face_k+ng
+    euler = ct_stokes_update_k(
+        @inbounds(face_b[ii,jj,kk]),
+        @inbounds(edge_x[cell_i,cell_j,face_k]),
+        @inbounds(edge_x[cell_i,cell_j+Int32(1),face_k]),
+        @inbounds(edge_y[cell_i,cell_j,face_k]),
+        @inbounds(edge_y[cell_i+Int32(1),cell_j,face_k]),
+        dt,
+    )
+    base = @inbounds face_b_base[ii,jj,kk]
+    return base + rk_a*(euler-base)
+end
+
+@inline _ct_fofc_add_background(value, ::Nothing, i, j, k) = value
+@inline _ct_fofc_add_background(value, background, i, j, k) =
+    value + @inbounds(background[i,j,k])
+
+@inline function _ct_fofc_anchor_face(face_b, face_b_base, i, j, k, rk_a)
+    @inbounds begin
+        base = face_b_base[i,j,k]
+        return base+rk_a*(face_b[i,j,k]-base)
+    end
+end
+
+@inline function _ct_fofc_topology_scale(flags, i, j, k)
+    scale = one(FT)
+    for dk in Int32(-1):Int32(1),
+        dj in Int32(-1):Int32(1), di in Int32(-1):Int32(1)
+        # A cell shares a face or an edge, but not only a vertex, with the
+        # target when at most two offsets are nonzero.
+        nonzero_offsets = Int32(di != 0)+Int32(dj != 0)+Int32(dk != 0)
+        nonzero_offsets <= Int32(2) || continue
+        @inbounds value =
+            flags[i+di,j+dj,k+dk,CT_FOFC_COMMITTED_CHANNEL]
+        ct_fofc_flag_is_active(value) || continue
+        scale = min(scale,ct_fofc_flag_scale(value))
+    end
+    return scale
+end
+
+function ct_mark_fofc_candidate_kernel!(
+    flags, fallback_meta, fallback_values,
+    U, Un, Q, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z, Vol,
+    Bx_face, By_face, Bz_face,
+    Bx_face_base, By_face_base, Bz_face_base,
+    B0x_face, B0y_face, B0z_face,
+    Ex_edge, Ey_edge, Ez_edge,
+    Areai, nxi, nyi, nzi,
+    Areaj, nxj, nyj, nzj,
+    Areak, nxk, nyk, nzk,
+    dt, rk_a, gamma, minimum_density, minimum_pressure,
+    nxp, nyp, nzp,
+)
+    i = (blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j = (blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k = (blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    (i > nxp || j > nyp || k > nzp) && return
+
+    ng = Int32(NG)
+    ii, jj, kk = i+ng, j+ng, k+ng
+    @inbounds old_flag = flags[ii,jj,kk,CT_FOFC_COMMITTED_CHANNEL]
+    @inbounds flags[ii,jj,kk,CT_FOFC_PROPOSAL_CHANNEL] = old_flag
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    volume_scaled_dt = @inbounds Vol[ii,jj,kk]*dt
+    hydro = MVector{6,FT}(zero(FT),zero(FT),zero(FT),zero(FT),zero(FT),zero(FT))
+    anchor_hydro = MVector{6,FT}(
+        zero(FT),zero(FT),zero(FT),zero(FT),zero(FT),zero(FT),
+    )
+    for variable in 1:5
+        inviscid =
+            @inbounds(Fx[i,j+tangent,k+tangent,variable]) -
+            @inbounds(Fx[i+Int32(1),j+tangent,k+tangent,variable]) +
+            @inbounds(Fy[i+tangent,j,k+tangent,variable]) -
+            @inbounds(Fy[i+tangent,j+Int32(1),k+tangent,variable]) +
+            @inbounds(Fz[i+tangent,j+tangent,k,variable]) -
+            @inbounds(Fz[i+tangent,j+tangent,k+Int32(1),variable])
+        @static if CT_FOFC_DIFFUSIVE_ACTIVE
+            diffusive =
+                @inbounds(Fv_x[i,j+tangent,k+tangent,variable]) -
+                @inbounds(Fv_x[i+Int32(1),j+tangent,k+tangent,variable]) +
+                @inbounds(Fv_y[i+tangent,j,k+tangent,variable]) -
+                @inbounds(Fv_y[i+tangent,j+Int32(1),k+tangent,variable]) +
+                @inbounds(Fv_z[i+tangent,j+tangent,k,variable]) -
+                @inbounds(Fv_z[i+tangent,j+tangent,k+Int32(1),variable])
+        else
+            diffusive = zero(FT)
+        end
+        euler = @inbounds(U[ii,jj,kk,variable]) +
+            (inviscid-diffusive)*volume_scaled_dt
+        hydro[variable] = @inbounds(Un[ii,jj,kk,variable]) +
+            rk_a*(euler-@inbounds(Un[ii,jj,kk,variable]))
+        anchor_hydro[variable] = @inbounds(Un[ii,jj,kk,variable]) +
+            rk_a*(@inbounds(U[ii,jj,kk,variable])-@inbounds(Un[ii,jj,kk,variable]))
+    end
+
+    phi_i_lo = _ct_fofc_candidate_i_face(
+        Bx_face,Bx_face_base,Ey_edge,Ez_edge,i,j,k,dt,rk_a,
+    )
+    phi_i_hi = _ct_fofc_candidate_i_face(
+        Bx_face,Bx_face_base,Ey_edge,Ez_edge,i+Int32(1),j,k,dt,rk_a,
+    )
+    phi_j_lo = _ct_fofc_candidate_j_face(
+        By_face,By_face_base,Ex_edge,Ez_edge,i,j,k,dt,rk_a,
+    )
+    phi_j_hi = _ct_fofc_candidate_j_face(
+        By_face,By_face_base,Ex_edge,Ez_edge,i,j+Int32(1),k,dt,rk_a,
+    )
+    phi_k_lo = _ct_fofc_candidate_k_face(
+        Bz_face,Bz_face_base,Ex_edge,Ey_edge,i,j,k,dt,rk_a,
+    )
+    phi_k_hi = _ct_fofc_candidate_k_face(
+        Bz_face,Bz_face_base,Ex_edge,Ey_edge,i,j,k+Int32(1),dt,rk_a,
+    )
+    phi_i_lo = _ct_fofc_add_background(phi_i_lo,B0x_face,ii,jj,kk)
+    phi_i_hi = _ct_fofc_add_background(phi_i_hi,B0x_face,ii+Int32(1),jj,kk)
+    phi_j_lo = _ct_fofc_add_background(phi_j_lo,B0y_face,ii,jj,kk)
+    phi_j_hi = _ct_fofc_add_background(phi_j_hi,B0y_face,ii,jj+Int32(1),kk)
+    phi_k_lo = _ct_fofc_add_background(phi_k_lo,B0z_face,ii,jj,kk)
+    phi_k_hi = _ct_fofc_add_background(phi_k_hi,B0z_face,ii,jj,kk+Int32(1))
+
+    @inbounds begin
+        area_i_lo = SVector{3,FT}(
+            Areai[ii,jj,kk]*nxi[ii,jj,kk],
+            Areai[ii,jj,kk]*nyi[ii,jj,kk],
+            Areai[ii,jj,kk]*nzi[ii,jj,kk],
+        )
+        area_i_hi = SVector{3,FT}(
+            Areai[ii+Int32(1),jj,kk]*nxi[ii+Int32(1),jj,kk],
+            Areai[ii+Int32(1),jj,kk]*nyi[ii+Int32(1),jj,kk],
+            Areai[ii+Int32(1),jj,kk]*nzi[ii+Int32(1),jj,kk],
+        )
+        area_j_lo = SVector{3,FT}(
+            Areaj[ii,jj,kk]*nxj[ii,jj,kk],
+            Areaj[ii,jj,kk]*nyj[ii,jj,kk],
+            Areaj[ii,jj,kk]*nzj[ii,jj,kk],
+        )
+        area_j_hi = SVector{3,FT}(
+            Areaj[ii,jj+Int32(1),kk]*nxj[ii,jj+Int32(1),kk],
+            Areaj[ii,jj+Int32(1),kk]*nyj[ii,jj+Int32(1),kk],
+            Areaj[ii,jj+Int32(1),kk]*nzj[ii,jj+Int32(1),kk],
+        )
+        area_k_lo = SVector{3,FT}(
+            Areak[ii,jj,kk]*nxk[ii,jj,kk],
+            Areak[ii,jj,kk]*nyk[ii,jj,kk],
+            Areak[ii,jj,kk]*nzk[ii,jj,kk],
+        )
+        area_k_hi = SVector{3,FT}(
+            Areak[ii,jj,kk+Int32(1)]*nxk[ii,jj,kk+Int32(1)],
+            Areak[ii,jj,kk+Int32(1)]*nyk[ii,jj,kk+Int32(1)],
+            Areak[ii,jj,kk+Int32(1)]*nzk[ii,jj,kk+Int32(1)],
+        )
+    end
+    magnetic = ct_recover_cell_b(
+        area_i_lo,area_i_hi,area_j_lo,area_j_hi,area_k_lo,area_k_hi,
+        phi_i_lo,phi_i_hi,phi_j_lo,phi_j_hi,phi_k_lo,phi_k_hi,
+    )
+    anchor_phi_i_lo = _ct_fofc_anchor_face(
+        Bx_face,Bx_face_base,ii,jj,kk,rk_a,
+    )
+    anchor_phi_i_hi = _ct_fofc_anchor_face(
+        Bx_face,Bx_face_base,ii+Int32(1),jj,kk,rk_a,
+    )
+    anchor_phi_j_lo = _ct_fofc_anchor_face(
+        By_face,By_face_base,ii,jj,kk,rk_a,
+    )
+    anchor_phi_j_hi = _ct_fofc_anchor_face(
+        By_face,By_face_base,ii,jj+Int32(1),kk,rk_a,
+    )
+    anchor_phi_k_lo = _ct_fofc_anchor_face(
+        Bz_face,Bz_face_base,ii,jj,kk,rk_a,
+    )
+    anchor_phi_k_hi = _ct_fofc_anchor_face(
+        Bz_face,Bz_face_base,ii,jj,kk+Int32(1),rk_a,
+    )
+    anchor_phi_i_lo = _ct_fofc_add_background(
+        anchor_phi_i_lo,B0x_face,ii,jj,kk,
+    )
+    anchor_phi_i_hi = _ct_fofc_add_background(
+        anchor_phi_i_hi,B0x_face,ii+Int32(1),jj,kk,
+    )
+    anchor_phi_j_lo = _ct_fofc_add_background(
+        anchor_phi_j_lo,B0y_face,ii,jj,kk,
+    )
+    anchor_phi_j_hi = _ct_fofc_add_background(
+        anchor_phi_j_hi,B0y_face,ii,jj+Int32(1),kk,
+    )
+    anchor_phi_k_lo = _ct_fofc_add_background(
+        anchor_phi_k_lo,B0z_face,ii,jj,kk,
+    )
+    anchor_phi_k_hi = _ct_fofc_add_background(
+        anchor_phi_k_hi,B0z_face,ii,jj,kk+Int32(1),
+    )
+    anchor_magnetic = ct_recover_cell_b(
+        area_i_lo,area_i_hi,area_j_lo,area_j_hi,area_k_lo,area_k_hi,
+        anchor_phi_i_lo,anchor_phi_i_hi,anchor_phi_j_lo,anchor_phi_j_hi,
+        anchor_phi_k_lo,anchor_phi_k_hi,
+    )
+    hydro_state = SVector{6,FT}(hydro)
+    anchor_hydro_state = SVector{6,FT}(anchor_hydro)
+    admissible = ct_point6_state_is_admissible(
+        hydro_state,magnetic,gamma,minimum_density,minimum_pressure,
+    )
+    if !admissible
+        was_flagged = ct_fofc_flag_is_active(old_flag)
+        ct_record_fallback!(fallback_meta,CT_POS_FOFC_BAD_CELL_COUNT)
+        if !was_flagged
+            @inbounds flags[ii,jj,kk,CT_FOFC_PROPOSAL_CHANNEL] = one(FT)
+            ct_record_fallback!(fallback_meta,CT_POS_FOFC_CELL_COUNT)
+            ct_record_fallback!(fallback_meta,CT_POS_FOFC_NEW_CELL_COUNT)
+        else
+            _,_,theta,recoverable = ct_point6_convex_limit(
+                hydro_state,magnetic,anchor_hydro_state,anchor_magnetic,
+                gamma,minimum_density,minimum_pressure,
+            )
+            if recoverable
+                topology_scale = _ct_fofc_topology_scale(flags,ii,jj,kk)
+                new_scale = min(
+                    ct_fofc_flag_scale(old_flag),
+                    FT(ct_fofc_theta_safety)*theta*topology_scale,
+                )
+                new_scale = clamp(new_scale,zero(FT),one(FT))
+                if new_scale < old_flag
+                    @inbounds flags[ii,jj,kk,CT_FOFC_PROPOSAL_CHANNEL] =
+                        new_scale
+                    ct_record_fallback!(fallback_meta,CT_POS_FOFC_LIMIT_COUNT)
+                    ct_record_fallback!(
+                        fallback_meta,CT_POS_FOFC_REDUCED_CELL_COUNT,
+                    )
+                else
+                    ct_record_fallback!(
+                        fallback_meta,CT_POS_FOFC_UNRECOVERABLE_COUNT,
+                    )
+                end
+            else
+                ct_record_fallback!(
+                    fallback_meta,CT_POS_FOFC_UNRECOVERABLE_COUNT,
+                )
+                anchor_state = SVector{9,FT}(
+                    anchor_hydro[1],anchor_hydro[2],anchor_hydro[3],
+                    anchor_hydro[4],anchor_hydro[5],anchor_magnetic[1],
+                    anchor_magnetic[2],anchor_magnetic[3],zero(FT),
+                )
+                anchor_rho,anchor_kinetic,anchor_magnetic_energy,
+                    anchor_internal,anchor_pressure =
+                    mhd_raw_thermo(anchor_state,gamma)
+                _ct_store_failure!(
+                    fallback_meta,fallback_values,CT_POS_SITE_FOFC_ANCHOR,
+                    Int32(0),Int32(0),ii,jj,kk,anchor_state,FT(NaN),
+                    anchor_rho,anchor_kinetic,anchor_magnetic_energy,
+                    anchor_internal,anchor_pressure,
+                )
+            end
+        end
+        state = SVector{9,FT}(
+            hydro[1],hydro[2],hydro[3],hydro[4],hydro[5],
+            magnetic[1],magnetic[2],magnetic[3],zero(FT),
+        )
+        rho,kinetic,magnetic_energy,internal,pressure =
+            mhd_raw_thermo(state,gamma)
+        _ct_store_failure!(
+            fallback_meta,fallback_values,CT_POS_SITE_FOFC_CLOSURE,
+            Int32(0),Int32(0),ii,jj,kk,state,FT(NaN),rho,kinetic,
+            magnetic_energy,internal,pressure,
+        )
+    end
+    return
+end
+
+function ct_commit_fofc_candidate_kernel!(flags, nxp, nyp, nzp)
+    i = (blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j = (blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k = (blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    (i > nxp || j > nyp || k > nzp) && return
+
+    ii, jj, kk = i+Int32(NG), j+Int32(NG), k+Int32(NG)
+    @inbounds flags[ii,jj,kk,CT_FOFC_COMMITTED_CHANNEL] =
+        flags[ii,jj,kk,CT_FOFC_PROPOSAL_CHANNEL]
     return
 end
 
@@ -526,6 +906,36 @@ function ct_reset_positivity!(meta, values)
     return nothing
 end
 
+function ct_reset_positivity_violation!(meta, values)
+    fill!(view(meta, 1:CT_POS_FAILURE_META_LEN), Int32(0))
+    fill!(values, zero(eltype(values)))
+    return nothing
+end
+
+function ct_reset_fofc_iteration!(meta, values)
+    ct_reset_positivity_violation!(meta,values)
+    fill!(view(meta,CT_POS_FOFC_NEW_CELL_COUNT:CT_POS_FOFC_BAD_CELL_COUNT),
+          Int32(0))
+    fill!(view(meta,CT_POS_FOFC_REDUCED_CELL_COUNT:
+                    CT_POS_FOFC_UNRECOVERABLE_COUNT),Int32(0))
+    return nothing
+end
+
+function ct_fofc_iteration_counts(meta)
+    meta_h = Array(meta)
+    return (
+        new_cells=Int(meta_h[CT_POS_FOFC_NEW_CELL_COUNT]),
+        bad_cells=Int(meta_h[CT_POS_FOFC_BAD_CELL_COUNT]),
+        reduced_cells=Int(meta_h[CT_POS_FOFC_REDUCED_CELL_COUNT]),
+        unrecoverable_cells=Int(meta_h[CT_POS_FOFC_UNRECOVERABLE_COUNT]),
+    )
+end
+
+function ct_point6_unrecoverable_count(meta)
+    meta_h = Array(meta)
+    return Int(meta_h[CT_POS_POINT6_UNRECOVERABLE_COUNT])
+end
+
 function ct_positivity_snapshot(meta, values)
     return Array(meta), Array(values)
 end
@@ -536,6 +946,13 @@ function ct_fallback_counts(meta)
         weno_to_plm=Int(meta_h[CT_POS_WENO_TO_PLM_COUNT]),
         plm_to_first=Int(meta_h[CT_POS_PLM_TO_FIRST_COUNT]),
         hlld_to_hlle=Int(meta_h[CT_POS_HLLD_TO_HLLE_COUNT]),
+        point6_to_ao=Int(meta_h[CT_POS_POINT6_TO_AO_COUNT]),
+        point6_limited=Int(meta_h[CT_POS_POINT6_LIMIT_COUNT]),
+        face_p2a_to_ao=Int(meta_h[CT_POS_FACE_P2A_TO_AO_COUNT]),
+        face_p2a_to_midpoint=Int(meta_h[CT_POS_FACE_P2A_TO_MIDPOINT_COUNT]),
+        fofc_cells=Int(meta_h[CT_POS_FOFC_CELL_COUNT]),
+        fofc_faces=Int(meta_h[CT_POS_FOFC_FACE_COUNT]),
+        fofc_limited=Int(meta_h[CT_POS_FOFC_LIMIT_COUNT]),
     )
 end
 
@@ -558,6 +975,8 @@ function ct_check_positivity_or_abort!(
         "pre-CT-sync B/energy transition",
         "primitive finalize floor",
         "post-CT-state reconciliation",
+        "FOFC corrected candidate",
+        "FOFC no-transport anchor",
     )
     site = Int(meta_h[2])
     site_name = 1 <= site <= length(site_names) ? site_names[site] : "unknown"

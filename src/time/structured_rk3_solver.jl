@@ -665,13 +665,15 @@ function _has_nan(Q)
 end
 
 # ─── Entropy diagnostic kernel ───
-# Compute per-cell mathematical entropy density η_i = -ρ·s·Vol with
-# s = log(p) - γ·log(ρ). Caller does global sum + MPI.Allreduce.
-# Used as a non-invasive sanity check that total mathematical entropy
-# η = -ρs/(γ-1) is non-increasing over time (modulo boundary forcing).
+# Adiabatic runs use the scaled mathematical entropy
+# -rho*(log(p)-gamma*log(rho))*Vol. Isothermal MHD instead uses its convex
+# free-energy entropy: (carrier-p+c_s^2*rho*log(rho/rho_ref))*Vol.
+# The caller performs the global sum and MPI reduction.
 # Runs every 100 steps for all flow configurations.
-function entropy_total_kernel!(η_out, U, Vol, γ_local::FT, NG_::Int32,
-                                Nx_::Int32, Ny_::Int32, Nz_::Int32)
+function entropy_total_kernel!(
+    entropy_out, U, Vol, gamma_local::FT, density_reference::FT,
+    NG_::Int32, Nx_::Int32, Ny_::Int32, Nz_::Int32,
+)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -679,20 +681,45 @@ function entropy_total_kernel!(η_out, U, Vol, γ_local::FT, NG_::Int32,
     if j <= NG_ || j > Ny_ + NG_; return; end
     if k <= NG_ || k > Nz_ + NG_; return; end
     @inbounds begin
-        ρ  = U[i, j, k, 1]
-        ρu = U[i, j, k, 2]; ρv = U[i, j, k, 3]; ρw = U[i, j, k, 4]
-        ρE = U[i, j, k, 5]
-        u, v, w = ρu/ρ, ρv/ρ, ρw/ρ
-        K = FT(0.5)*(u*u + v*v + w*w)
-        p = (γ_local - one(FT)) * (ρE - ρ*K)
-        # Guard against negative p / ρ which would NaN log; produce a
-        # large positive sentinel that loudly indicates trouble in the
-        # diagnostic without crashing the simulation.
-        if p > zero(FT) && ρ > zero(FT)
-            s = log(p) - γ_local * log(ρ)
-            η_out[i, j, k] = -ρ * s * Vol[i, j, k]
+        rho = U[i, j, k, 1]
+        momentum_x = U[i, j, k, 2]
+        momentum_y = U[i, j, k, 3]
+        momentum_z = U[i, j, k, 4]
+        carrier = U[i, j, k, 5]
+        @static if equation_type == :MHD && isothermal_mhd
+            sound_speed_squared = Rg * isothermal_temperature
+            pressure = sound_speed_squared * rho
+            if rho > zero(FT) && isfinite(rho) && isfinite(carrier) &&
+               sound_speed_squared > zero(FT) &&
+               isfinite(sound_speed_squared) && isfinite(pressure) &&
+               density_reference > zero(FT) && isfinite(density_reference)
+                entropy_density = mhd_isothermal_entropy_density(
+                    rho, carrier, sound_speed_squared, density_reference,
+                )
+                entropy_out[i, j, k] = isfinite(entropy_density) ?
+                    entropy_density * Vol[i, j, k] : FT(NaN)
+            else
+                entropy_out[i, j, k] = FT(NaN)
+            end
         else
-            η_out[i, j, k] = FT(NaN)
+            velocity_x = momentum_x / rho
+            velocity_y = momentum_y / rho
+            velocity_z = momentum_z / rho
+            kinetic_specific = FT(0.5) * (
+                velocity_x*velocity_x + velocity_y*velocity_y +
+                velocity_z*velocity_z
+            )
+            pressure = (gamma_local - one(FT)) * (
+                carrier - rho*kinetic_specific
+            )
+            if pressure > zero(FT) && rho > zero(FT)
+                specific_entropy =
+                    log(pressure) - gamma_local * log(rho)
+                entropy_out[i, j, k] =
+                    -rho * specific_entropy * Vol[i, j, k]
+            else
+                entropy_out[i, j, k] = FT(NaN)
+            end
         end
     end
     return
@@ -864,18 +891,20 @@ mutable struct Block
     B0x_face::Union{GPUArray{FT, 3}, Nothing}
     B0y_face::Union{GPUArray{FT, 3}, Nothing}
     B0z_face::Union{GPUArray{FT, 3}, Nothing}
-    # Immutable cell-centered background. Analytic external-field models are
-    # sampled directly; generic vector potentials fall back to synchronized
-    # face-flux recovery. No RK backup is needed.
-    B0x_cell::Union{GPUArray{FT, 3}, Nothing}
-    B0y_cell::Union{GPUArray{FT, 3}, Nothing}
-    B0z_cell::Union{GPUArray{FT, 3}, Nothing}
+    # Cell-centered background cache used only by split-aware reconstruction.
+    # It is fixed after initialization and absent from ordinary CT/GLM runs.
+    B0_cell::Union{GPUArray{FT, 4}, Nothing}
     # CT edge line-integrated EMFs. These must persist across the per-block
     # reconstruction loop so shared physical edges can be synchronized before
     # any face receives its discrete-Stokes update.
     Ex_edge::Union{GPUArray{FT, 3}, Nothing}
     Ey_edge::Union{GPUArray{FT, 3}, Nothing}
     Ez_edge::Union{GPUArray{FT, 3}, Nothing}
+    # Athena-style first-order flux correction (FOFC) coefficients. Channel 1
+    # is the synchronized committed value; channel 2 is a local Jacobi
+    # proposal. The existing one-component halo exchange transfers only the
+    # committed channel, so no additional persistent MPI buffer is required.
+    fofc_flag::Union{GPUArray{FT, 4}, Nothing}
     # MPI Buffers
     sbuf_hx::Array{FT, 4}
     sbuf_dx::GPUArray{FT, 4}
@@ -941,7 +970,8 @@ end
 include(joinpath(@__DIR__,"implicit_solver.jl"))
 
 function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
-                    face_bc, connectivity, rank_offsets, temp_metrics_h, was_computed_h)
+                    face_bc, connectivity, rank_offsets, temp_metrics_h,
+                    was_computed_h, temp_metric_auxiliary_h)
     _mesh_base = isdefined(Main, :mesh_dir) ? mesh_dir : "MESH"
     mesh_path = joinpath(_mesh_base, "mesh_b$bid.h5")
     
@@ -975,20 +1005,11 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
         println("  > Block $bid: Expanding ghost coordinates at runtime...")
     end
     
-    metric_singularity_edges = ntuple(12) do edge_index
-        equation_type == :MHD && ct_mode &&
-        isdefined(@__MODULE__, :_SING_INFO) && _SING_INFO !== nothing &&
-        bid + 1 <= size(_SING_INFO.is_singularity_edge, 1) &&
-        _SING_INFO.is_singularity_edge[bid + 1, edge_index]
-    end
-    regularize_junction_metrics = any(metric_singularity_edges)
-
     # Expand to full padded coordinates with ghost cells
     x_full, y_full, z_full = expand_coords_with_ghost(
         x_real, y_real, z_real, nxp, nyp, nzp, NG, face_bc, bid, connectivity;
         cell_offsets=(ox, oy, oz),
         block_dims=(Nx_val, Ny_val, Nz_val),
-        topology_covariant=regularize_junction_metrics,
     )
     
     # Compute (or load cached) metrics from expanded coordinates
@@ -1001,9 +1022,15 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
                 Nprocs_block[direction] == 1
         end,
         topology_fingerprint=structured_connectivity_fingerprint(connectivity),
-        singularity_edges=regularize_junction_metrics ?
-            metric_singularity_edges : nothing,
-        junction_layers=STRUCTURED_METRIC_JUNCTION_LAYERS,
+        singularity_edges=structured_local_metric_singularity_edges(
+            bid, face_bc, connectivity,
+            (ox, oy, oz), (nxp, nyp, nzp),
+            (Nx_val, Ny_val, Nz_val),
+        ),
+        metric_mode=structured_metric_mode_setting(),
+        cell_offsets=(ox, oy, oz),
+        block_dims=(Nx_val, Ny_val, Nz_val),
+        metric_auxiliary=temp_metric_auxiliary_h,
     )
     
     temp_metrics_h[bid] = (cache_path, Areai_h, nxi_h, nyi_h, nzi_h, Areaj_h, nxj_h, nyj_h, nzj_h, Areak_h, nxk_h, nyk_h, nzk_h, Vol_h)
@@ -1284,21 +1311,18 @@ function load_block(bid, rx, ry, rz, NG, Ncons, Nprim, Nprocs_block, world_rank,
         gpu_zeros(FT, nxp + 2*NG + 1, nyp + 1 + 2*NG, nzp + 2*NG + 1) : nothing
     _ct_b0z = _ct_background_split ?
         gpu_zeros(FT, nxp + 2*NG + 1, nyp + 2*NG + 1, nzp + 1 + 2*NG) : nothing
-    _ct_b0x_cell = _ct_background_split ?
-        gpu_zeros(FT, nxp + 2*NG, nyp + 2*NG, nzp + 2*NG) : nothing
-    _ct_b0y_cell = _ct_background_split ?
-        gpu_zeros(FT, nxp + 2*NG, nyp + 2*NG, nzp + 2*NG) : nothing
-    _ct_b0z_cell = _ct_background_split ?
-        gpu_zeros(FT, nxp + 2*NG, nyp + 2*NG, nzp + 2*NG) : nothing
+    _ct_b0_cell = _ct_background_split ?
+        gpu_zeros(FT,nxp+2*NG,nyp+2*NG,nzp+2*NG,3) : nothing
     _ct_ex = ct_mode ? gpu_zeros(FT, nxp, nyp + 1, nzp + 1) : nothing
     _ct_ey = ct_mode ? gpu_zeros(FT, nxp + 1, nyp, nzp + 1) : nothing
     _ct_ez = ct_mode ? gpu_zeros(FT, nxp + 1, nyp + 1, nzp) : nothing
+    _ct_fofc_flag = ct_mode && ct_first_order_flux_correction ?
+        gpu_zeros(FT, nxp + 2*NG, nyp + 2*NG, nzp + 2*NG, 2) : nothing
 
     return Block(bid, nxp, nyp, nzp, rx, ry, rz, ox, oy, oz, Q, U, ϕ, Areai, Areaj, Areak, nxi, nyi, nzi, nxj, nyj, nzj, nxk, nyk, nzk, Vol, x, y, z, LTS_dt, Un,
                  _ct_bx, _ct_by, _ct_bz, _ct_bx_n, _ct_by_n, _ct_bz_n,
-                 _ct_b0x, _ct_b0y, _ct_b0z,
-                 _ct_b0x_cell, _ct_b0y_cell, _ct_b0z_cell,
-                 _ct_ex, _ct_ey, _ct_ez,
+                 _ct_b0x, _ct_b0y, _ct_b0z, _ct_b0_cell,
+                 _ct_ex, _ct_ey, _ct_ez, _ct_fofc_flag,
                  sbuf_hx, sbuf_dx, rbuf_hx, rbuf_dx, sbuf_hx2, sbuf_dx2, rbuf_hx2, rbuf_dx2,
                  sbuf_hy, sbuf_dy, rbuf_hy, rbuf_dy, sbuf_hz, sbuf_dz, rbuf_hz, rbuf_dz,
                  nb,
@@ -1584,40 +1608,40 @@ function compute_structured_point_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, Fz,
     if eigen_reconstruction && equation_type == :MHD && ct_mode
         # F* temporarily stores left states and Fv_* stores right states. HLLD
         # consumes them immediately; viscous/resistive kernels overwrite Fv_* below.
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_left_i_kernel!(Q, Fx, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face)
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_right_i_kernel!(Q, Fv_x, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face)
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_hlld_flux_i_kernel!(Fx, Fv_x, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_left_i_kernel!(Q, Fx, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_right_i_kernel!(Q, Fv_x, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_hlld_flux_i_kernel!(Fx, Fv_x, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0x_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fx, "Fx after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_i blocks=nb_weno_i ct_mhd_characteristic_weno7_cache_i_kernel!(Q, cache_i, Areai, nxi, nyi, nzi, block.Bx_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0x_face)
+            @gpu_launch threads=threads_recon_i blocks=nb_weno_i ct_mhd_characteristic_weno7_cache_i_kernel!(Q, cache_i, Areai, nxi, nyi, nzi, block.Bx_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0x_face, block.B0_cell, pos_meta)
         end
 
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_left_j_kernel!(Q, Fy, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_right_j_kernel!(Q, Fv_y, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_hlld_flux_j_kernel!(Fy, Fv_y, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_left_j_kernel!(Q, Fy, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_right_j_kernel!(Q, Fv_y, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_hlld_flux_j_kernel!(Fy, Fv_y, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0y_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fy, "Fy after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_j blocks=nb_weno_j ct_mhd_characteristic_weno7_cache_j_kernel!(Q, cache_j, Areaj, nxj, nyj, nzj, block.By_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0y_face)
+            @gpu_launch threads=threads_recon_j blocks=nb_weno_j ct_mhd_characteristic_weno7_cache_j_kernel!(Q, cache_j, Areaj, nxj, nyj, nzj, block.By_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0y_face, block.B0_cell, pos_meta)
         end
 
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_left_k_kernel!(Q, Fz, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_right_k_kernel!(Q, Fv_z, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_hlld_flux_k_kernel!(Fz, Fv_z, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_left_k_kernel!(Q, Fz, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_right_k_kernel!(Q, Fv_z, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_hlld_flux_k_kernel!(Fz, Fv_z, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0z_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fz, "Fz after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_k blocks=nb_weno_k ct_mhd_characteristic_weno7_cache_k_kernel!(Q, cache_k, Areak, nxk, nyk, nzk, block.Bz_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0z_face)
+            @gpu_launch threads=threads_recon_k blocks=nb_weno_k ct_mhd_characteristic_weno7_cache_k_kernel!(Q, cache_k, Areak, nxk, nyk, nzk, block.Bz_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0z_face, block.B0_cell, pos_meta)
         end
     elseif eigen_reconstruction
         @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0))
@@ -1630,19 +1654,19 @@ function compute_structured_point_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, Fz,
         _bx_ct = ct_mode ? block.Bx_face : block.ϕ
         _by_ct = ct_mode ? block.By_face : block.ϕ
         _bz_ct = ct_mode ? block.Bz_face : block.ϕ
-        @gpu_launch threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
+        @gpu_launch threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fx, "Fx after Conser_reconstruct_i", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
+        @gpu_launch threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(0), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fy, "Fy after Conser_reconstruct_j", block.id, world_rank, tt)
-        @gpu_launch threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
+        @gpu_launch threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(0), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0_cell)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
@@ -1661,6 +1685,7 @@ end
 
 function average_structured_point_face_fluxes!(
     block::Block, sensor, Fx, Fy, Fz, scratch_x, scratch_y, scratch_z,
+    pos_meta=nothing,
 )
     @static if structured_face_quadrature != STRUCTURED_FACE_POINT6
         return nothing
@@ -1677,17 +1702,160 @@ function average_structured_point_face_fluxes!(
     second_j=(cld(nxp,nthreads[1]),cld(nyp+Int32(1),nthreads[2]),cld(nzp,nthreads[3]))
     second_k=(cld(nxp,nthreads[1]),cld(nyp,nthreads[2]),cld(nzp+Int32(1),nthreads[3]))
     @gpu_launch threads=nthreads blocks=first_i structured_face_p2a_first_kernel!(
-        scratch_x,Fx,nxp,nyp,nzp,Val(1))
+        scratch_x,Fx,nxp,nyp,nzp,Val(1),pos_meta,sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_i structured_face_p2a_second_kernel!(
-        Fx,scratch_x,Fx,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(1))
+        Fx,scratch_x,Fx,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(1),
+        pos_meta)
     @gpu_launch threads=nthreads blocks=first_j structured_face_p2a_first_kernel!(
-        scratch_y,Fy,nxp,nyp,nzp,Val(2))
+        scratch_y,Fy,nxp,nyp,nzp,Val(2),pos_meta,sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_j structured_face_p2a_second_kernel!(
-        Fy,scratch_y,Fy,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(2))
+        Fy,scratch_y,Fy,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(2),
+        pos_meta)
     @gpu_launch threads=nthreads blocks=first_k structured_face_p2a_first_kernel!(
-        scratch_z,Fz,nxp,nyp,nzp,Val(3))
+        scratch_z,Fz,nxp,nyp,nzp,Val(3),pos_meta,sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_k structured_face_p2a_second_kernel!(
-        Fz,scratch_z,Fz,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(3))
+        Fz,scratch_z,Fz,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(3),
+        pos_meta)
+    return nothing
+end
+
+function correct_structured_ct_fofc_face_fluxes!(
+    block::Block, Fx, Fy, Fz, rho_sum_x, rho_sum_y, rho_sum_z,
+    fallback_meta; record_faces::Bool=true,
+)
+    @static if !(equation_type == :MHD && ct_mode &&
+                 ct_first_order_flux_correction)
+        return nothing
+    end
+    block.fofc_flag === nothing && return nothing
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    nxp,nyp,nzp = Int32(block.Nx),Int32(block.Ny),Int32(block.Nz)
+    blocks_i = (
+        cld(nxp+Int32(1),nthreads[1]),
+        cld(nyp+Int32(2)*tangent,nthreads[2]),
+        cld(nzp+Int32(2)*tangent,nthreads[3]),
+    )
+    blocks_j = (
+        cld(nxp+Int32(2)*tangent,nthreads[1]),
+        cld(nyp+Int32(1),nthreads[2]),
+        cld(nzp+Int32(2)*tangent,nthreads[3]),
+    )
+    blocks_k = (
+        cld(nxp+Int32(2)*tangent,nthreads[1]),
+        cld(nyp+Int32(2)*tangent,nthreads[2]),
+        cld(nzp+Int32(1),nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_i ct_fofc_replace_face_flux_kernel!(
+        Fx,rho_sum_x,block.fofc_flag,block.U,
+        block.Bx_face,block.By_face,block.Bz_face,
+        block.B0x_face,block.B0y_face,block.B0z_face,
+        block.Areai,block.nxi,block.nyi,block.nzi,
+        block.Areaj,block.nxj,block.nyj,block.nzj,
+        block.Areak,block.nxk,block.nyk,block.nzk,
+        nxp,nyp,nzp,ch_glm_current,fallback_meta,record_faces,Val(1),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_j ct_fofc_replace_face_flux_kernel!(
+        Fy,rho_sum_y,block.fofc_flag,block.U,
+        block.Bx_face,block.By_face,block.Bz_face,
+        block.B0x_face,block.B0y_face,block.B0z_face,
+        block.Areai,block.nxi,block.nyi,block.nzi,
+        block.Areaj,block.nxj,block.nyj,block.nzj,
+        block.Areak,block.nxk,block.nyk,block.nzk,
+        nxp,nyp,nzp,ch_glm_current,fallback_meta,record_faces,Val(2),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_k ct_fofc_replace_face_flux_kernel!(
+        Fz,rho_sum_z,block.fofc_flag,block.U,
+        block.Bx_face,block.By_face,block.Bz_face,
+        block.B0x_face,block.B0y_face,block.B0z_face,
+        block.Areai,block.nxi,block.nyi,block.nzi,
+        block.Areaj,block.nxj,block.nyj,block.nzj,
+        block.Areak,block.nxk,block.nyk,block.nzk,
+        nxp,nyp,nzp,ch_glm_current,fallback_meta,record_faces,Val(3),
+    )
+    return nothing
+end
+
+function scale_structured_ct_fofc_transport!(
+    block::Block,Fx,Fy,Fz,Fv_x,Fv_y,Fv_z,
+)
+    @static if !(equation_type == :MHD && ct_mode &&
+                 ct_first_order_flux_correction)
+        return nothing
+    end
+    block.fofc_flag === nothing && return nothing
+    tangent = Int32(STRUCTURED_FLUX_TANGENTIAL_HALO)
+    nxp,nyp,nzp = Int32(block.Nx),Int32(block.Ny),Int32(block.Nz)
+    blocks_i = (
+        cld(nxp+Int32(1),nthreads[1]),
+        cld(nyp+Int32(2)*tangent,nthreads[2]),
+        cld(nzp+Int32(2)*tangent,nthreads[3]),
+    )
+    blocks_j = (
+        cld(nxp+Int32(2)*tangent,nthreads[1]),
+        cld(nyp+Int32(1),nthreads[2]),
+        cld(nzp+Int32(2)*tangent,nthreads[3]),
+    )
+    blocks_k = (
+        cld(nxp+Int32(2)*tangent,nthreads[1]),
+        cld(nyp+Int32(2)*tangent,nthreads[2]),
+        cld(nzp+Int32(1),nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_i ct_fofc_scale_face_flux_kernel!(
+        Fx,Fv_x,block.fofc_flag,nxp,nyp,nzp,Val(1),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_j ct_fofc_scale_face_flux_kernel!(
+        Fy,Fv_y,block.fofc_flag,nxp,nyp,nzp,Val(2),
+    )
+    @gpu_launch threads=nthreads blocks=blocks_k ct_fofc_scale_face_flux_kernel!(
+        Fz,Fv_z,block.fofc_flag,nxp,nyp,nzp,Val(3),
+    )
+    return nothing
+end
+
+function mark_structured_ct_fofc_candidate!(
+    block::Block, Fx, Fy, Fz, Fv_x, Fv_y, Fv_z,
+    dt, rk_a, fallback_meta, fallback_values,
+)
+    @static if !(equation_type == :MHD && ct_mode &&
+                 ct_first_order_flux_correction)
+        return nothing
+    end
+    block.fofc_flag === nothing && return nothing
+    nb = (
+        cld(block.Nx,nthreads[1]),
+        cld(block.Ny,nthreads[2]),
+        cld(block.Nz,nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_mark_fofc_candidate_kernel!(
+        block.fofc_flag,fallback_meta,fallback_values,
+        block.U,block.Un,block.Q,Fx,Fy,Fz,Fv_x,Fv_y,Fv_z,block.Vol,
+        block.Bx_face,block.By_face,block.Bz_face,
+        block.Bx_face_n,block.By_face_n,block.Bz_face_n,
+        block.B0x_face,block.B0y_face,block.B0z_face,
+        block.Ex_edge,block.Ey_edge,block.Ez_edge,
+        block.Areai,block.nxi,block.nyi,block.nzi,
+        block.Areaj,block.nxj,block.nyj,block.nzj,
+        block.Areak,block.nxk,block.nyk,block.nzk,
+        FT(dt),FT(rk_a),FT(γ),FT(density_floor),FT(pressure_floor),
+        Int32(block.Nx),Int32(block.Ny),Int32(block.Nz),
+    )
+    return nothing
+end
+
+function commit_structured_ct_fofc_candidate!(block::Block)
+    @static if !(equation_type == :MHD && ct_mode &&
+                 ct_first_order_flux_correction)
+        return nothing
+    end
+    block.fofc_flag === nothing && return nothing
+    nb = (
+        cld(block.Nx,nthreads[1]),
+        cld(block.Ny,nthreads[2]),
+        cld(block.Nz,nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_commit_fofc_candidate_kernel!(
+        block.fofc_flag,Int32(block.Nx),Int32(block.Ny),Int32(block.Nz),
+    )
     return nothing
 end
 
@@ -1734,7 +1902,7 @@ function compute_structured_face_fluxes!(block::Block, dt, sensor, Fx, Fy, Fz,
         threads_visc_i,threads_visc_j,threads_visc_k,
         rk_stage,pos_meta,pos_values)
     average_structured_point_face_fluxes!(
-        block,sensor,Fx,Fy,Fz,Fv_x,Fv_y,Fv_z)
+        block,sensor,Fx,Fy,Fz,Fv_x,Fv_y,Fv_z,pos_meta)
     compute_structured_diffusive_face_fluxes!(
         block,Fv_x,Fv_y,Fv_z,world_rank,tt,
         threads_visc_i,threads_visc_j,threads_visc_k)
@@ -1793,9 +1961,9 @@ function compute_structured_interior_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, 
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
             ct_weno7_reset_failure!(weno7_fail_meta, weno7_fail_value)
         end
-        @gpu_launch_stream stream threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(1), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
-        @gpu_launch_stream stream threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(1), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
-        @gpu_launch_stream stream threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(1), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
+        @gpu_launch_stream stream threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(1), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0_cell)
+        @gpu_launch_stream stream threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(1), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0_cell)
+        @gpu_launch_stream stream threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(1), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0_cell)
     end
     # Viscous flux interior (viscous stencil >= 2 cells, fully covered by mode=1 range)
     if viscous || (equation_type == :MHD && resistive)
@@ -1854,9 +2022,9 @@ function compute_structured_boundary_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, 
         _bx_ct = ct_mode ? block.Bx_face : block.ϕ
         _by_ct = ct_mode ? block.By_face : block.ϕ
         _bz_ct = ct_mode ? block.Bz_face : block.ϕ
-        @gpu_launch threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
-        @gpu_launch threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
-        @gpu_launch threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0x_cell, block.B0y_cell, block.B0z_cell)
+        @gpu_launch threads=threads_recon_i blocks=nb_conser_i Conser_reconstruct_i(Q, U, ϕ, Areai, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(2), _bx_ct, cache_i, Vol, dt, rk_stage, pos_meta, pos_values, block.B0x_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_j blocks=nb_conser_j Conser_reconstruct_j(Q, U, ϕ, Areaj, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, sj, Δsj, lpj, sRj, ΔsRj, ch_glm_current, Int32(2), _by_ct, cache_j, Vol, dt, rk_stage, pos_meta, pos_values, block.B0y_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_k blocks=nb_conser_k Conser_reconstruct_k(Q, U, ϕ, Areak, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, sk, Δsk, lpk, sRk, ΔsRk, ch_glm_current, Int32(2), _bz_ct, cache_k, Vol, dt, rk_stage, pos_meta, pos_values, block.B0z_face, block.B0_cell)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
             @gpu_launch threads=threads_recon_i blocks=nb_weno_scan_i ct_weno7_validate_finite_kernel!(weno7_fail_meta, weno7_fail_value, cache_i, Int32(1), Int32(1), Int32(nxp+1), Int32(nyp+2NG), Int32(nzp+2NG), Int32(4))
             @gpu_launch threads=threads_recon_j blocks=nb_weno_scan_j ct_weno7_validate_finite_kernel!(weno7_fail_meta, weno7_fail_value, cache_j, Int32(1), Int32(2), Int32(nxp+2NG), Int32(nyp+1), Int32(nzp+2NG), Int32(4))
@@ -1936,7 +2104,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     # Dicts to temporarily hold metrics on CPU for syncing
     temp_metrics_h = Dict{Int, Any}()
     was_computed_h = Dict{Int, Bool}()
+    temp_metric_auxiliary_h = Dict{Int, Any}()
     temp_metrics_pre_h = Dict{Int, Any}()
+    was_computed_pre_h = Dict{Int, Bool}()
+    temp_metric_auxiliary_pre_h = Dict{Int, Any}()
+    metric_mode = structured_metric_mode_setting()
 
     # Load multi-block metadata
     if world_rank == 0
@@ -2045,6 +2217,17 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         end
     end
 
+    canonical_external_bc_count =
+        canonicalize_external_magnetic_bc_parameters!(
+            Main, face_bc, bc_params,
+        )
+    if world_rank == 0 && canonical_external_bc_count > 0
+        println(
+            ">>> External-field BC parameters synchronized from the fixed " *
+            "background model on $canonical_external_bc_count faces",
+        )
+    end
+
     # Keep the Cartesian communicator periodic for rank decomposition, but
     # suppress only the outer wrap on faces owned by another block.  Physical
     # periodic faces remain enabled, including mixed cases where only one side
@@ -2114,7 +2297,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 end
                 _temp_rank_offsets[length(Block_Nprocs) + 1] = Block_to_rank[end] + 1
                 
-                blocks[bid] = load_block(bid, 0, 0, 0, NG, Ncons, Nprim, Nprocs_block, world_rank, face_bc, connectivity, _temp_rank_offsets, temp_metrics_h, was_computed_h)
+                blocks[bid] = load_block(
+                    bid, 0, 0, 0, NG, Ncons, Nprim, Nprocs_block, world_rank,
+                    face_bc, connectivity, _temp_rank_offsets, temp_metrics_h,
+                    was_computed_h, temp_metric_auxiliary_h,
+                )
                 # No sub-domain splitting →use COMM_SELF for intra-block exchange
                 block_comms[bid] = MPI.Cart_create(MPI.COMM_SELF, [1,1,1]; periodic=collect(Iperiodic))
             end
@@ -2141,7 +2328,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         ranky = (local_rank ÷ Nprocs_my_block[3]) % Nprocs_my_block[2]
         rankz = local_rank % Nprocs_my_block[3]
 
-        blocks[my_block_id] = load_block(my_block_id, rankx, ranky, rankz, NG, Ncons, Nprim, Nprocs_my_block, world_rank, face_bc, connectivity, rank_offsets, temp_metrics_h, was_computed_h)
+        blocks[my_block_id] = load_block(
+            my_block_id, rankx, ranky, rankz, NG, Ncons, Nprim,
+            Nprocs_my_block, world_rank, face_bc, connectivity, rank_offsets,
+            temp_metrics_h, was_computed_h, temp_metric_auxiliary_h,
+        )
 
         block_comm = MPI.Comm_split(MPI.COMM_WORLD, my_block_id, local_rank)
         block_comms[my_block_id] = MPI.Cart_create(block_comm, collect(Nprocs_my_block); periodic=collect(Iperiodic))
@@ -2244,10 +2435,37 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     z_pre_h[i, :, :] .= z_inlet
                 end
 
+                precursor_periodic = ntuple(3) do direction
+                    low_face = 2direction - 1
+                    high_face = 2direction
+                    Nprocs_block[direction] == 1 &&
+                        Int32(get(face_bc, (bid + 5, low_face), BC_INTERBLOCK)) ==
+                            Int32(BC_PERIODIC) &&
+                        Int32(get(face_bc, (bid + 5, high_face), BC_INTERBLOCK)) ==
+                            Int32(BC_PERIODIC)
+                end
+                precursor_global_dims = (
+                    Int(Nx_b[bid + 6]), Int(Ny_b[bid + 6]), Int(Nz_b[bid + 6]),
+                )
                 cache_path_pre, was_computed_pre, Areai_pre_h, nxi_pre_h, nyi_pre_h, nzi_pre_h, Areaj_pre_h, nxj_pre_h, nyj_pre_h, nzj_pre_h, Areak_pre_h, nxk_pre_h, nyk_pre_h, nzk_pre_h, Vol_pre_h = load_or_compute_metrics(
-                    bid + 5, rx_pre, ry_pre, rz_pre, x_pre_h, y_pre_h, z_pre_h, nxp_pre, nyp, nzp, NG; cache_metrics=false)
-                
+                    bid + 5, rx_pre, ry_pre, rz_pre,
+                    x_pre_h, y_pre_h, z_pre_h, nxp_pre, nyp, nzp, NG;
+                    cache_metrics=false,
+                    periodic=precursor_periodic,
+                    topology_fingerprint=structured_connectivity_fingerprint(connectivity),
+                    singularity_edges=structured_local_metric_singularity_edges(
+                        bid + 5, face_bc, connectivity,
+                        (ox_pre, b.oy, b.oz), (nxp_pre, nyp, nzp),
+                        precursor_global_dims,
+                    ),
+                    metric_mode=metric_mode,
+                    cell_offsets=(ox_pre, b.oy, b.oz),
+                    block_dims=precursor_global_dims,
+                    metric_auxiliary=temp_metric_auxiliary_pre_h,
+                )
+
                 temp_metrics_pre_h[bid + 5] = (cache_path_pre, Areai_pre_h, nxi_pre_h, nyi_pre_h, nzi_pre_h, Areaj_pre_h, nxj_pre_h, nyj_pre_h, nzj_pre_h, Areak_pre_h, nxk_pre_h, nyk_pre_h, nzk_pre_h, Vol_pre_h)
+                was_computed_pre_h[bid + 5] = was_computed_pre
                 
                 Nx_tot_pre = nxp_pre + 2*NG
                 Ny_tot = nyp + 2*NG
@@ -2339,9 +2557,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     x_pre, y_pre, z_pre, LTS_dt_pre, Un_pre,
                     # CT face-B (precursor blocks — use nothing for now, CT not supported in CEBL)
                     nothing, nothing, nothing, nothing, nothing, nothing,
-                    nothing, nothing, nothing,
-                    nothing, nothing, nothing,
-                    nothing, nothing, nothing,
+                    nothing, nothing, nothing, nothing,
+                    nothing, nothing, nothing, nothing,
                     sbuf_hx_pre, sbuf_dx_pre, rbuf_hx_pre, rbuf_dx_pre,
                     sbuf_hx2_pre, sbuf_dx2_pre, rbuf_hx2_pre, rbuf_dx2_pre,
                     sbuf_hy_pre, sbuf_dy_pre, rbuf_hy_pre, rbuf_dy_pre,
@@ -2372,6 +2589,48 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
 
     # ─── Synchronize metrics for all blocks safely ───
+    initial_metric_coordinates_h = Dict{Int,Any}()
+    metric_interface_gate_enabled = lowercase(get(
+        ENV, "STRUCTURED_METRIC_INTERFACE_GATE", "true",
+    )) in ("true", "1", "yes", "on")
+    metric_interface_relative_tolerance = _structured_metric_gate_tolerance(
+        get(ENV, "STRUCTURED_METRIC_INTERFACE_REL_TOL", "1.0e-10"),
+        "STRUCTURED_METRIC_INTERFACE_REL_TOL",
+    )
+    metric_interface_absolute_tolerance = _structured_metric_gate_tolerance(
+        get(ENV, "STRUCTURED_METRIC_INTERFACE_ABS_TOL", "0.0"),
+        "STRUCTURED_METRIC_INTERFACE_ABS_TOL",
+    )
+
+    function enforce_metric_interface_gate!(
+        label, metric_values, metric_face_bc, metric_connectivity,
+        metric_rank_offsets, metric_Nx_b, metric_Ny_b, metric_Nz_b,
+    )
+        metric_interface_gate_enabled || return (0.0, 0.0)
+        absolute, relative = structured_shared_face_metric_residuals(
+            metric_values, blocks, block_comms,
+            metric_face_bc, metric_connectivity,
+            metric_rank_offsets, Block_Nprocs,
+            metric_Nx_b, metric_Ny_b, metric_Nz_b, NG,
+        )
+        if world_rank == 0
+            @printf(
+                "  %s shared-face metric gate: abs=%.6e rel=%.6e abs_tol=%.6e rel_tol=%.6e\n",
+                label, absolute, relative,
+                metric_interface_absolute_tolerance,
+                metric_interface_relative_tolerance,
+            )
+        end
+        (absolute <= metric_interface_absolute_tolerance ||
+         relative <= metric_interface_relative_tolerance) || error(
+            "$label shared-face metric mismatch: absolute=$absolute, " *
+            "relative=$relative, absolute_tolerance=" *
+            "$metric_interface_absolute_tolerance, relative_tolerance=" *
+            "$metric_interface_relative_tolerance",
+        )
+        return absolute, relative
+    end
+
     if length(temp_metrics_h) > 0
         println("Rank $world_rank: Synchronizing metrics for all main blocks...")
         
@@ -2390,13 +2649,87 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             closure_l2, closure_max = ct_metric_closure_stats(temp_metrics_h, blocks)
             @printf("  CT metric closure before sync: L2=%.6e Linf=%.6e\n", closure_l2, closure_max)
         end
-        if ct_mode
-            ct_sync_rank_metrics!(
-                temp_metrics_h, blocks, block_comms, Block_Nprocs,
+        if metric_mode == STRUCTURED_METRIC_LOCAL_CHART
+            length(temp_metric_auxiliary_h) == length(temp_metrics_h) || error(
+                "local-chart metric mode requires an edge workspace for every local block",
+            )
+            local_recompute = any(values(was_computed_h)) ? 1 : 0
+            global_recompute = MPI.Allreduce(
+                local_recompute, MPI.MAX, MPI.COMM_WORLD,
+            ) != 0
+            if global_recompute
+                for (bid, auxiliary) in collect(temp_metric_auxiliary_h)
+                    auxiliary[2] !== nothing && continue
+                    coordinates, metrics = auxiliary[1], auxiliary[3]
+                    block = blocks[bid]
+                    workspace = compute_scmm_edge_potentials(
+                        coordinates.x, coordinates.y, coordinates.z,
+                        block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    temp_metric_auxiliary_h[bid] =
+                        (coordinates, workspace, metrics)
+                    was_computed_h[bid] = true
+                end
+                sync_all_interface_metric_edges!(
+                    collect(keys(temp_metrics_h)), temp_metric_auxiliary_h,
+                    face_bc, connectivity, _rank_offsets_setup, Block_Nprocs,
+                    Nx_b, Ny_b, Nz_b, NG,
+                )
+                main_block_ids = Set(0:Nblocks-1)
+                metric_main_blocks = Dict(
+                    bid => block for (bid, block) in blocks if bid in main_block_ids
+                )
+                metric_main_connectivity = Dict(
+                    endpoint => conn for (endpoint, conn) in connectivity
+                    if endpoint[1] in main_block_ids && conn.src_b in main_block_ids
+                )
+                metric_junction_plan = build_ct_junction_plan(
+                    metric_main_blocks, metric_main_connectivity,
+                    Block_Nprocs, _rank_offsets_setup,
+                    Nx_b, Ny_b, Nz_b,
+                )
+                sync_scmm_junction_metric_edges!(
+                    temp_metric_auxiliary_h, metric_main_blocks,
+                    metric_junction_plan, NG,
+                )
+                for (bid, auxiliary) in temp_metric_auxiliary_h
+                    coordinates, workspace, metrics = auxiliary
+                    block = blocks[bid]
+                    finalize_scmm_face_metrics!(
+                        metrics, workspace, block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    finalize_scmm_volumes!(
+                        metrics, coordinates.x, coordinates.y, coordinates.z,
+                        block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    periodic = ntuple(3) do direction
+                        isdefined(Main, :Iperiodic) && Main.Iperiodic[direction] &&
+                            Block_Nprocs[bid + 1][direction] == 1
+                    end
+                    _enforce_periodic_metric_ghosts!(
+                        structured_metrics_tuple(metrics)...,
+                        block.Nx, block.Ny, block.Nz, NG, periodic,
+                    )
+                end
+                ct_sync_rank_metric_halos_only!(
+                    temp_metrics_h, blocks, block_comms, Block_Nprocs,
+                )
+            elseif world_rank == 0
+                println("Rank 0: All local-chart metric caches are valid.")
+            end
+        else
+            if ct_mode
+                ct_sync_rank_metrics!(
+                    temp_metrics_h, blocks, block_comms, Block_Nprocs,
+                )
+            end
+            _tmp_Block_Nprocs[] = Block_Nprocs
+            sync_all_interface_metrics!(
+                collect(keys(temp_metrics_h)), sync_dict, 0, 0, 0,
+                face_bc, connectivity, _rank_offsets_setup,
+                Nx_b, Ny_b, Nz_b, NG,
             )
         end
-        _tmp_Block_Nprocs[] = Block_Nprocs
-        sync_all_interface_metrics!(collect(keys(temp_metrics_h)), sync_dict, 0, 0, 0, face_bc, connectivity, _rank_offsets_setup, Nx_b, Ny_b, Nz_b, NG)
         if ct_mode && debug_metric_closure
             closure_l2, closure_max = ct_metric_closure_stats(temp_metrics_h, blocks)
             @printf("  CT metric closure after sync:  L2=%.6e Linf=%.6e\n", closure_l2, closure_max)
@@ -2420,14 +2753,18 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     "relative Linf=$(closure_rel_max), tolerance=$(closure_tolerance)",
                 )
         end
-        
+        enforce_metric_interface_gate!(
+            "main-domain", temp_metrics_h, face_bc, connectivity,
+            _rank_offsets_setup, Nx_b, Ny_b, Nz_b,
+        )
+
         for (bid, val) in temp_metrics_h
             cache_path = val[1]
             Areai_h, nxi_h, nyi_h, nzi_h = sync_dict[bid][1:4]
             Areaj_h, nxj_h, nyj_h, nzj_h = sync_dict[bid][5:8]
             Areak_h, nxk_h, nyk_h, nzk_h = sync_dict[bid][9:12]
             Vol_h = val[14]
-            
+
             if cache_metrics && get(was_computed_h, bid, false)
                 println("    Saving synchronized metrics cache to $cache_path")
                 save_metrics_to_h5(cache_path, Areai_h, nxi_h, nyi_h, nzi_h, Areaj_h, nxj_h, nyj_h, nzj_h, Areak_h, nxk_h, nyk_h, nzk_h, Vol_h)
@@ -2436,14 +2773,25 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             copyto!(blocks[bid].Areai, Areai_h); copyto!(blocks[bid].nxi, nxi_h); copyto!(blocks[bid].nyi, nyi_h); copyto!(blocks[bid].nzi, nzi_h)
             copyto!(blocks[bid].Areaj, Areaj_h); copyto!(blocks[bid].nxj, nxj_h); copyto!(blocks[bid].nyj, nyj_h); copyto!(blocks[bid].nzj, nzj_h)
             copyto!(blocks[bid].Areak, Areak_h); copyto!(blocks[bid].nxk, nxk_h); copyto!(blocks[bid].nyk, nyk_h); copyto!(blocks[bid].nzk, nzk_h)
+            copyto!(blocks[bid].Vol, Vol_h)
         end
+
+        for (bid, auxiliary) in temp_metric_auxiliary_h
+            initial_metric_coordinates_h[bid] = auxiliary[1]
+        end
+        # SCMM workspaces and synchronized host metrics are startup-only.
+        # Keep only coordinates until vector-potential CT initialization has
+        # formed one canonical line integral per physical edge.
+        empty!(temp_metric_auxiliary_h)
+        empty!(temp_metrics_h)
+        empty!(was_computed_h)
     end
 
     if isdefined(Main, :cebl_forcing) && Main.cebl_forcing
         if world_rank == 0
             println("Rank 0: Synchronizing metrics for all precursor blocks (collective call)...")
         end
-        
+
         sync_dict_pre = Dict{Int, Any}()
         for (bid, val) in temp_metrics_pre_h
             sync_dict_pre[bid] = (val[2], val[3], val[4], val[5], val[6], val[7], val[8], val[9], val[10], val[11], val[12], val[13])
@@ -2451,13 +2799,13 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         
         face_bc_pre = copy(face_bc)
         for (bid, val) in temp_metrics_pre_h
-            face_bc_pre[(bid, 1)] = BC_PERIODIC
-            face_bc_pre[(bid, 2)] = BC_PERIODIC
             for fid in 1:6
                 if haskey(face_bc, (bid-5, fid))
                     face_bc_pre[(bid, fid)] = face_bc[(bid-5, fid)]
                 end
             end
+            face_bc_pre[(bid, 1)] = BC_PERIODIC
+            face_bc_pre[(bid, 2)] = BC_PERIODIC
         end
 
         _rank_offsets_pre = copy(_rank_offsets_setup)
@@ -2470,10 +2818,101 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             _rank_offsets_pre[11] = end_bound
         end
         Nx_b_pre = (Main.Nx_b..., ntuple(i -> Main.cebl_Nx, 5)...)
+        Ny_b_pre = (Main.Ny_b..., Main.Ny_b...)
+        Nz_b_pre = (Main.Nz_b..., Main.Nz_b...)
         _tmp_Block_Nprocs[] = Block_Nprocs
-        
-        # Called by ALL ranks collectively
-        sync_all_interface_metrics!(collect(keys(temp_metrics_pre_h)), sync_dict_pre, 0, 0, 0, face_bc_pre, connectivity, _rank_offsets_pre, Nx_b_pre, (Main.Ny_b..., Main.Ny_b...), (Main.Nz_b..., Main.Nz_b...), NG)
+
+        if metric_mode == STRUCTURED_METRIC_LOCAL_CHART
+            length(temp_metric_auxiliary_pre_h) == length(temp_metrics_pre_h) ||
+                error(
+                    "local-chart metric mode requires an edge workspace for " *
+                    "every local CEBL precursor block",
+                )
+            local_recompute_pre = any(values(was_computed_pre_h)) ? 1 : 0
+            global_recompute_pre = MPI.Allreduce(
+                local_recompute_pre, MPI.MAX, MPI.COMM_WORLD,
+            ) != 0
+            if global_recompute_pre
+                for (bid, auxiliary) in collect(temp_metric_auxiliary_pre_h)
+                    auxiliary[2] !== nothing && continue
+                    coordinates, metrics = auxiliary[1], auxiliary[3]
+                    block = blocks[bid]
+                    workspace = compute_scmm_edge_potentials(
+                        coordinates.x, coordinates.y, coordinates.z,
+                        block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    temp_metric_auxiliary_pre_h[bid] =
+                        (coordinates, workspace, metrics)
+                    was_computed_pre_h[bid] = true
+                end
+                sync_all_interface_metric_edges!(
+                    collect(keys(temp_metrics_pre_h)),
+                    temp_metric_auxiliary_pre_h, face_bc_pre, connectivity,
+                    _rank_offsets_pre, Block_Nprocs,
+                    Nx_b_pre, Ny_b_pre, Nz_b_pre, NG,
+                )
+                precursor_block_ids = Set(Nblocks:2Nblocks-1)
+                metric_precursor_blocks = Dict(
+                    bid => block for (bid, block) in blocks
+                    if bid in precursor_block_ids
+                )
+                metric_precursor_connectivity = Dict(
+                    endpoint => conn for (endpoint, conn) in connectivity
+                    if endpoint[1] in precursor_block_ids &&
+                        conn.src_b in precursor_block_ids
+                )
+                metric_junction_plan_pre = build_ct_junction_plan(
+                    metric_precursor_blocks, metric_precursor_connectivity,
+                    Block_Nprocs, _rank_offsets_pre,
+                    Nx_b_pre, Ny_b_pre, Nz_b_pre,
+                )
+                sync_scmm_junction_metric_edges!(
+                    temp_metric_auxiliary_pre_h, metric_precursor_blocks,
+                    metric_junction_plan_pre, NG,
+                )
+                for (bid, auxiliary) in temp_metric_auxiliary_pre_h
+                    coordinates, workspace, metrics = auxiliary
+                    block = blocks[bid]
+                    finalize_scmm_face_metrics!(
+                        metrics, workspace,
+                        block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    finalize_scmm_volumes!(
+                        metrics, coordinates.x, coordinates.y, coordinates.z,
+                        block.Nx, block.Ny, block.Nz, NG,
+                    )
+                    periodic = ntuple(3) do direction
+                        low_face = 2direction - 1
+                        high_face = 2direction
+                        Block_Nprocs[bid + 1][direction] == 1 &&
+                            Int32(get(face_bc_pre, (bid, low_face), BC_INTERBLOCK)) ==
+                                Int32(BC_PERIODIC) &&
+                            Int32(get(face_bc_pre, (bid, high_face), BC_INTERBLOCK)) ==
+                                Int32(BC_PERIODIC)
+                    end
+                    _enforce_periodic_metric_ghosts!(
+                        structured_metrics_tuple(metrics)...,
+                        block.Nx, block.Ny, block.Nz, NG, periodic,
+                    )
+                end
+                ct_sync_rank_metric_halos_only!(
+                    temp_metrics_pre_h, blocks, block_comms, Block_Nprocs,
+                )
+            elseif world_rank == 0
+                println("Rank 0: All CEBL local-chart metric caches are valid.")
+            end
+        else
+            # Called by ALL ranks collectively.
+            sync_all_interface_metrics!(
+                collect(keys(temp_metrics_pre_h)), sync_dict_pre, 0, 0, 0,
+                face_bc_pre, connectivity, _rank_offsets_pre,
+                Nx_b_pre, Ny_b_pre, Nz_b_pre, NG,
+            )
+        end
+        enforce_metric_interface_gate!(
+            "CEBL-precursor", temp_metrics_pre_h, face_bc_pre, connectivity,
+            _rank_offsets_pre, Nx_b_pre, Ny_b_pre, Nz_b_pre,
+        )
         
         for (bid, val) in temp_metrics_pre_h
             Areai_pre_h, nxi_pre_h, nyi_pre_h, nzi_pre_h = sync_dict_pre[bid][1:4]
@@ -2483,7 +2922,11 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             copyto!(blocks[bid].Areai, Areai_pre_h); copyto!(blocks[bid].nxi, nxi_pre_h); copyto!(blocks[bid].nyi, nyi_pre_h); copyto!(blocks[bid].nzi, nzi_pre_h)
             copyto!(blocks[bid].Areaj, Areaj_pre_h); copyto!(blocks[bid].nxj, nxj_pre_h); copyto!(blocks[bid].nyj, nyj_pre_h); copyto!(blocks[bid].nzj, nzj_pre_h)
             copyto!(blocks[bid].Areak, Areak_pre_h); copyto!(blocks[bid].nxk, nxk_pre_h); copyto!(blocks[bid].nyk, nyk_pre_h); copyto!(blocks[bid].nzk, nzk_pre_h)
+            copyto!(blocks[bid].Vol, val[14])
         end
+        empty!(temp_metric_auxiliary_pre_h)
+        empty!(temp_metrics_pre_h)
+        empty!(was_computed_pre_h)
     end
 
 
@@ -3005,16 +3448,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b,
     ) : nothing
     ct_derivation_halo_plan = nothing
-    ct_physical_faces = Dict{Int,NTuple{6,Bool}}()
     @static if equation_type == :MHD && ct_mode
         maximum(keys(blocks)) + 1 <= minimum((
             length(Nx_b), length(Ny_b), length(Nz_b), length(Block_Nprocs),
         )) || throw(DimensionMismatch(
             "missing global block dimensions for CT derivation halo",
         ))
-        derivation_point6 =
-            ct_primitive_recovery == CT_PRIMITIVE_POINT6
-        derivation_reach = derivation_point6 ? (2, 2, 2) : (0, 0, 0)
         ct_block_dimensions = [
             (Int(Nx_b[index]), Int(Ny_b[index]), Int(Nz_b[index]))
             for index in eachindex(Block_Nprocs)
@@ -3023,32 +3462,31 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             blocks, ct_block_dimensions, face_bc, connectivity,
             Block_Nprocs, rank_offsets;
             world_rank=world_rank, ng=NG, communicator=MPI.COMM_WORLD,
-            conservative_components=derivation_point6 ? 5 : 0,
-            include_cell_data=derivation_point6,
-            cell_reach=derivation_reach,
-            face_reach=derivation_reach,
+            conservative_components=5,
+            cell_reach=ct_primitive_recovery == CT_PRIMITIVE_POINT6 ?
+                (2,2,2) : (0,0,0),
+            face_reach=ct_primitive_recovery == CT_PRIMITIVE_POINT6 ?
+                (2,2,2) : (0,0,0),
         )
         refresh_ct_derivation_static!(ct_derivation_halo_plan, blocks)
-        for (bid, block) in blocks
-            rank_coordinates = (Int(block.rx), Int(block.ry), Int(block.rz))
-            rank_dimensions = Tuple(Int.(Block_Nprocs[bid + 1]))
-            ct_physical_faces[bid] = ntuple(Val(6)) do face_id
-                direction = fld(face_id + 1, 2)
-                owns_face = isodd(face_id) ?
-                    rank_coordinates[direction] == 0 :
-                    rank_coordinates[direction] == rank_dimensions[direction] - 1
-                boundary_type = Int32(get(
-                    face_bc, (bid, face_id), BC_INTERBLOCK,
-                ))
-                owns_face && _ct_is_physical_boundary_type(boundary_type)
+        if ct_primitive_recovery == CT_PRIMITIVE_POINT6
+            ct_physical_faces = Dict{Int,NTuple{6,Bool}}()
+            for (bid, block) in blocks
+                rank_coordinates = (Int(block.rx), Int(block.ry), Int(block.rz))
+                rank_dimensions = Tuple(Int.(Block_Nprocs[bid + 1]))
+                ct_physical_faces[bid] = ntuple(Val(6)) do face_id
+                    direction = fld(face_id + 1, 2)
+                    owns_face = isodd(face_id) ?
+                        rank_coordinates[direction] == 0 :
+                        rank_coordinates[direction] == rank_dimensions[direction] - 1
+                    boundary_type = Int32(get(
+                        face_bc, (bid, face_id), BC_INTERBLOCK,
+                    ))
+                    owns_face && _ct_is_physical_boundary_type(boundary_type)
+                end
             end
-        end
-        materialize_ct_derivation_static_ghosts!(
-            ct_derivation_halo_plan, blocks, ct_physical_faces,
-        )
-        if !derivation_point6
-            release_direct_ct_derivation_static_storage!(
-                ct_derivation_halo_plan,
+            materialize_ct_derivation_static_ghosts!(
+                ct_derivation_halo_plan, blocks, ct_physical_faces,
             )
         end
         ct_derivation_bytes = MPI.Allreduce(
@@ -3056,8 +3494,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             MPI.COMM_WORLD,
         )
         world_rank == 0 && println(
-            ">>> CT $(derivation_point6 ? "POINT6" : "direct") " *
-            "derivation storage: " *
+            ">>> CT derivation storage ($(ct_primitive_recovery == CT_PRIMITIVE_POINT6 ? "POINT6" : "DIRECT")): " *
             "$(round(ct_derivation_bytes/1024^2; digits=2)) MiB total " *
             "(packed shells + communication staging)",
         )
@@ -3077,47 +3514,50 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         cfg_state_left_i = auto_tune_kernel("CTMHD_charL_i", ct_mhd_characteristic_reconstruct_left_i_kernel!,
             first_b.Q, shared_Fx,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi, first_b.Bx_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_i = auto_tune_kernel("CTMHD_charR_i", ct_mhd_characteristic_reconstruct_right_i_kernel!,
             first_b.Q, shared_Fvx,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi, first_b.Bx_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_i = auto_tune_kernel("CTMHD_hlld_i", ct_mhd_hlld_flux_i_kernel!,
             shared_Fx, shared_Fvx, shared_Fx, shared_rho_sum_x,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi,
-            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta;
+            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
+            first_b.B0x_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_left_j = auto_tune_kernel("CTMHD_charL_j", ct_mhd_characteristic_reconstruct_left_j_kernel!,
             first_b.Q, shared_Fy,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj, first_b.By_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_j = auto_tune_kernel("CTMHD_charR_j", ct_mhd_characteristic_reconstruct_right_j_kernel!,
             first_b.Q, shared_Fvy,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj, first_b.By_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_j = auto_tune_kernel("CTMHD_hlld_j", ct_mhd_hlld_flux_j_kernel!,
             shared_Fy, shared_Fvy, shared_Fy, shared_rho_sum_y,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj,
-            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta;
+            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
+            first_b.B0y_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_left_k = auto_tune_kernel("CTMHD_charL_k", ct_mhd_characteristic_reconstruct_left_k_kernel!,
             first_b.Q, shared_Fz,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk, first_b.Bz_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_k = auto_tune_kernel("CTMHD_charR_k", ct_mhd_characteristic_reconstruct_right_k_kernel!,
             first_b.Q, shared_Fvz,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk, first_b.Bz_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_k = auto_tune_kernel("CTMHD_hlld_k", ct_mhd_hlld_flux_k_kernel!,
             shared_Fz, shared_Fvz, shared_Fz, shared_rho_sum_z,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk,
-            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta;
+            nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
+            first_b.B0z_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         push!(tune_configs,
             cfg_state_left_i, cfg_state_right_i,
@@ -3152,8 +3592,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             ct_mode ? first_b.Bx_face : first_b.ϕ,
             cache_i, first_b.Vol, current_dt,
             Int32(1), shared_ct_pos_meta, shared_ct_pos_values,
-            first_b.B0x_face,
-            first_b.B0x_cell, first_b.B0y_cell, first_b.B0z_cell;
+            first_b.B0x_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_j = auto_tune_kernel("Conser_recon_j", Conser_reconstruct_j,
             first_b.Q, first_b.U, first_b.ϕ, first_b.Areaj,
@@ -3164,8 +3603,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             ct_mode ? first_b.By_face : first_b.ϕ,
             cache_j, first_b.Vol, current_dt,
             Int32(1), shared_ct_pos_meta, shared_ct_pos_values,
-            first_b.B0y_face,
-            first_b.B0x_cell, first_b.B0y_cell, first_b.B0z_cell;
+            first_b.B0y_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_k = auto_tune_kernel("Conser_recon_k", Conser_reconstruct_k,
             first_b.Q, first_b.U, first_b.ϕ, first_b.Areak,
@@ -3176,8 +3614,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             ct_mode ? first_b.Bz_face : first_b.ϕ,
             cache_k, first_b.Vol, current_dt,
             Int32(1), shared_ct_pos_meta, shared_ct_pos_values,
-            first_b.B0z_face,
-            first_b.B0x_cell, first_b.B0y_cell, first_b.B0z_cell;
+            first_b.B0z_face, first_b.B0_cell;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
     end
     push!(tune_configs, cfg_recon_i)
@@ -3314,41 +3751,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         equation_type == :MHD && ct_mode &&
         isdefined(Main, :external_magnetic_background_splitting) &&
         Bool(Main.external_magnetic_background_splitting)
-    validate_ct_background_split_configuration(
-        enabled=ct_background_split_enabled,
-        equation=equation_type,
-        ct_enabled=ct_mode,
-        split_method=splitMethodID,
-        eigen_reconstruction_enabled=eigen_reconstruction,
-        resistive_enabled=resistive,
-    )
     ct_background_ready = Ref(false)
-
-    function refresh_ct_topological_face_ghosts!()
-        ct_derivation_halo_plan === nothing && return nothing
-        refresh_ct_derivation_dynamic!(ct_derivation_halo_plan, blocks)
-        materialize_ct_derivation_dynamic_ghosts!(
-            ct_derivation_halo_plan, blocks, ct_physical_faces,
-        )
-        return nothing
-    end
-
-    function release_ct_fixed_background_halo_storage!()
-        ct_derivation_halo_plan === nothing && return nothing
-        local_released = release_ct_derivation_background_storage!(
-            ct_derivation_halo_plan,
-        )
-        global_released = MPI.Allreduce(
-            local_released, MPI.SUM, MPI.COMM_WORLD,
-        )
-        if world_rank == 0 && global_released > 0
-            println(
-                ">>> CT fixed-background derivation storage released: " *
-                "$(round(global_released/1024^2; digits=2)) MiB",
-            )
-        end
-        return nothing
-    end
 
     function activate_ct_background_split!()
         ct_background_split_enabled || return nothing
@@ -3364,19 +3767,13 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             fill!(b.By_face_n, zero(FT))
             fill!(b.Bz_face_n, zero(FT))
         end
-        refresh_ct_topological_face_ghosts!()
         for (_, b) in blocks
-            b.B0x_face === nothing && continue
-            initialized = isdefined(Main, :external_magnetic_field_model) &&
-                ct_initialize_background_cell_b_from_model!(
-                    b, Main.external_magnetic_field_model,
-                )
-            initialized || ct_recover_background_cell_b!(
-                b, b.Nx, b.Ny, b.Nz,
+            b.B0_cell === nothing && continue
+            ct_recover_background_cell_b!(
+                b,b.Nx,b.Ny,b.Nz; include_ghosts=true,
             )
         end
         gpu_sync()
-        release_ct_fixed_background_halo_storage!()
         ct_background_ready[] = true
         return nothing
     end
@@ -3405,123 +3802,21 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         ct_sync_interface_sheets!(
             blocks, ct_sync_plan; sync_face_flux=true, sync_edges=false,
         )
-        refresh_ct_topological_face_ghosts!()
+        # A checkpoint stores only physical-domain B0 faces. Reconstruct the
+        # analytic physical-boundary halo while the active face pointers refer
+        # to B0, but preserve the checkpointed physical normal face itself.
+        apply_external_ct_face_b_boundaries!(;
+            include_normal_face=false,
+            background_splitting=false,
+        )
         for (bid, b) in blocks
             haskey(saved, bid) || continue
             b.Bx_face, b.By_face, b.Bz_face = saved[bid]
-            initialized = isdefined(Main, :external_magnetic_field_model) &&
-                ct_initialize_background_cell_b_from_model!(
-                    b, Main.external_magnetic_field_model,
-                )
-            initialized || ct_recover_background_cell_b!(
-                b, b.Nx, b.Ny, b.Nz,
+            ct_recover_background_cell_b!(
+                b,b.Nx,b.Ny,b.Nz; include_ghosts=true,
             )
         end
         gpu_sync()
-        release_ct_fixed_background_halo_storage!()
-        return nothing
-    end
-
-    function report_ct_background_split_diagnostics!(label)
-        (ct_background_split_enabled && debug_sync) || return nothing
-        for (bid, b) in sort!(collect(blocks); by=first)
-            b.B0x_cell === nothing && continue
-            q = Array(b.Q)
-            b0x = Array(b.B0x_cell)
-            b0y = Array(b.B0y_cell)
-            b0z = Array(b.B0z_cell)
-            perturbation = sqrt.(
-                (q[:, :, :, QBX] .- b0x).^2 .+
-                (q[:, :, :, QBY] .- b0y).^2 .+
-                (q[:, :, :, QBZ] .- b0z).^2
-            )
-            full_value, full_index = findmax(perturbation)
-            interior = @view perturbation[
-                NG+1:NG+b.Nx, NG+1:NG+b.Ny, NG+1:NG+b.Nz,
-            ]
-            interior_value, interior_local_index = findmax(interior)
-            interior_index = Tuple(interior_local_index) .+ NG
-            tangential_halo = Int(STRUCTURED_FLUX_TANGENTIAL_HALO)
-            i_tangent = (NG + 1 - tangential_halo):(NG + b.Nx + tangential_halo)
-            j_tangent = (NG + 1 - tangential_halo):(NG + b.Ny + tangential_halo)
-            k_tangent = (NG + 1 - tangential_halo):(NG + b.Nz + tangential_halo)
-            x_support = @view perturbation[:, j_tangent, k_tangent]
-            y_support = @view perturbation[i_tangent, :, k_tangent]
-            z_support = @view perturbation[i_tangent, j_tangent, :]
-            x_support_value, x_support_local = findmax(x_support)
-            y_support_value, y_support_local = findmax(y_support)
-            z_support_value, z_support_local = findmax(z_support)
-            x_support_index = (
-                x_support_local[1],
-                x_support_local[2] + first(j_tangent) - 1,
-                x_support_local[3] + first(k_tangent) - 1,
-            )
-            y_support_index = (
-                y_support_local[1] + first(i_tangent) - 1,
-                y_support_local[2],
-                y_support_local[3] + first(k_tangent) - 1,
-            )
-            z_support_index = (
-                z_support_local[1] + first(i_tangent) - 1,
-                z_support_local[2] + first(j_tangent) - 1,
-                z_support_local[3],
-            )
-            active_support = (
-                (x_support_value, x_support_index, :x),
-                (y_support_value, y_support_index, :y),
-                (z_support_value, z_support_index, :z),
-            )
-            active_value, active_index, active_axis = active_support[
-                argmax(first.(active_support))
-            ]
-            active_q = SVector(
-                q[active_index..., QBX], q[active_index..., QBY],
-                q[active_index..., QBZ],
-            )
-            active_b0 = SVector(
-                b0x[active_index...], b0y[active_index...],
-                b0z[active_index...],
-            )
-            x_nodes = Array(b.x)
-            y_nodes = Array(b.y)
-            z_nodes = Array(b.z)
-            active_center = structured_cell_center_coordinates(
-                x_nodes, y_nodes, z_nodes, active_index...,
-            )
-            face_values = map(
-                field -> findmax(abs.(Array(field))),
-                (b.Bx_face, b.By_face, b.Bz_face),
-            )
-            speed = sqrt.(
-                q[:, :, :, 2].^2 .+ q[:, :, :, 3].^2 .+
-                q[:, :, :, 4].^2
-            )
-            speed_value, speed_index = findmax(speed)
-            rho_extrema = extrema(q[:, :, :, 1])
-            pressure_extrema = extrema(q[:, :, :, 5])
-            @printf(
-                ">>> CT background diagnostic %s block=%d max|Q_B-B0_cell| full=%.6e at %s interior=%.6e at %s max|b_face_flux|=(%.6e,%.6e,%.6e) at (%s,%s,%s)\n",
-                string(label), bid, full_value, string(Tuple(full_index)),
-                interior_value, string(interior_index),
-                face_values[1][1], face_values[2][1], face_values[3][1],
-                string(Tuple(face_values[1][2])),
-                string(Tuple(face_values[2][2])),
-                string(Tuple(face_values[3][2])),
-            )
-            @printf(
-                ">>> CT background active support %s block=%d max|Q_B-B0_cell|=%.6e axis=%s at %s Q_B=%s B0=%s xyz=%s directional=(%.6e,%.6e,%.6e)\n",
-                string(label), bid, active_value, string(active_axis),
-                string(active_index), string(active_q), string(active_b0),
-                string(active_center), x_support_value, y_support_value,
-                z_support_value,
-            )
-            @printf(
-                ">>> CT background hydro %s block=%d max|u|=%.6e at %s rho=(%.6e,%.6e) p=(%.6e,%.6e)\n",
-                string(label), bid, speed_value,
-                string(Tuple(speed_index)), rho_extrema[1], rho_extrema[2],
-                pressure_extrema[1], pressure_extrema[2],
-            )
-        end
         return nothing
     end
 
@@ -3550,6 +3845,40 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             Nx_b, Ny_b, Nz_b, :Q, nvariables, ghost_pool;
             full_range=true, delta_mode=true,
         )
+        return nothing
+    end
+
+    function sync_ct_fofc_flags!()
+        @static if !(equation_type == :MHD && ct_mode &&
+                     ct_first_order_flux_correction)
+            return nothing
+        end
+        gpu_sync()
+        copy_ghost_face!(
+            blocks,connectivity,Block_Nprocs,rank_offsets,
+            Nx_b,Ny_b,Nz_b,:fofc_flag,1,ghost_pool;
+            full_range=false,
+        )
+        for (bid,b) in blocks
+            b.fofc_flag === nothing && continue
+            exchange_ghost(
+                b.fofc_flag,1,block_comms[bid],b.Nx,b.Ny,b.Nz,
+                b.sbuf_hx,b.sbuf_dx,b.rbuf_hx,b.rbuf_dx,
+                b.sbuf_hy,b.sbuf_dy,b.rbuf_hy,b.rbuf_dy,
+                b.sbuf_hz,b.sbuf_dz,b.rbuf_hz,b.rbuf_dz;
+                sbuf_hx2=b.sbuf_hx2,sbuf_dx2=b.sbuf_dx2,
+                rbuf_hx2=b.rbuf_hx2,rbuf_dx2=b.rbuf_dx2,
+                periodic_faces=_structured_periodic_face_mask(bid),
+                rank_coords=(b.rx,b.ry,b.rz),
+                rank_dims=Tuple(Block_Nprocs[bid+1]),
+            )
+        end
+        copy_ghost_face!(
+            blocks,connectivity,Block_Nprocs,rank_offsets,
+            Nx_b,Ny_b,Nz_b,:fofc_flag,1,ghost_pool;
+            full_range=true,delta_mode=true,
+        )
+        gpu_sync()
         return nothing
     end
 
@@ -3597,40 +3926,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         ct_derivation_halo_plan === nothing && error(
             "CT derivation halo was not initialized",
         )
-        refresh_ct_topological_face_ghosts!()
+        refresh_ct_derivation_dynamic!(ct_derivation_halo_plan, blocks)
         for (bid, b) in blocks
             b.Bx_face === nothing && continue
-            # Recover only after every topological face halo is materialized.
-            # POINT6 uses bounded LSQ2 in the padded ghost region and retains
-            # its high-order recovery in the interior.
-            ct_recover_cell_b!(
-                b, b.Nx, b.Ny, b.Nz; include_ghosts=true,
-            )
-            if ct_background_split_enabled
-                physical_faces = ct_physical_faces[bid]
-                prescribed_faces = ntuple(Val(6)) do face_id
-                    physical_faces[face_id] &&
-                    is_prescribed_external_magnetic_field_bc(Int32(get(
-                        face_bc, (bid, face_id), BC_INTERBLOCK,
-                    )))
-                end
-                ct_restore_prescribed_background_ghost_b!(
-                    b, b.Nx, b.Ny, b.Nz;
-                    prescribed_faces=prescribed_faces,
-                )
-            end
-            @static if ct_primitive_recovery != CT_PRIMITIVE_POINT6
-                # Direct CT derives ghost hydro primitives from synchronized U
-                # while retaining the magnetic state recovered above.
-                nb_ghost = (
-                    cld(b.Nx+2*NG, nthreads[1]),
-                    cld(b.Ny+2*NG, nthreads[2]),
-                    cld(b.Nz+2*NG, nthreads[3]),
-                )
-                @gpu_launch threads=nthreads blocks=nb_ghost c2Prim_ghost(
-                    b.U, b.Q, b.Nx, b.Ny, b.Nz,
-                )
-            end
+            ct_recover_cell_b!(b, b.Nx, b.Ny, b.Nz)
             @static if isothermal_mhd
                 # U[5] is a compatibility carrier in the isothermal closure.
                 # Rebuild it only after the authoritative face-B is complete.
@@ -3646,16 +3945,41 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 b.U, b.Q, b.Vol, shared_positivity_count,
                 shared_conservation_delta, Int32(b.Nx), Int32(b.Ny),
                 Int32(b.Nz))
+            rank_coordinates = (Int(b.rx), Int(b.ry), Int(b.rz))
+            rank_dimensions = Tuple(Int.(Block_Nprocs[bid + 1]))
+            physical_faces = ntuple(Val(6)) do face_id
+                direction = fld(face_id + 1, 2)
+                owns_face = isodd(face_id) ?
+                    rank_coordinates[direction] == 0 :
+                    rank_coordinates[direction] == rank_dimensions[direction] - 1
+                boundary_type = Int32(get(
+                    face_bc, (bid, face_id), BC_INTERBLOCK,
+                ))
+                owns_face && _ct_is_physical_boundary_type(boundary_type)
+            end
             @static if ct_primitive_recovery == CT_PRIMITIVE_POINT6
-                ct_update_q_b!(b, b.Nx, b.Ny, b.Nz)
-                physical_faces = ct_physical_faces[bid]
+                ct_update_q_b!(
+                    b,b.Nx,b.Ny,b.Nz;
+                    positivity_meta=shared_ct_pos_meta,
+                )
                 ct_derive_q_point6_topological_active!(
                     b, ct_derivation_halo_plan.halos[bid],
-                    b.Nx, b.Ny, b.Nz; physical_faces=physical_faces,
+                    b.Nx,b.Ny,b.Nz;
+                    physical_faces=physical_faces,
+                    positivity_meta=shared_ct_pos_meta,
                 )
                 ct_derive_q_point6_ghost!(
                     b, ct_derivation_halo_plan.halos[bid],
-                    b.Nx, b.Ny, b.Nz; physical_faces=physical_faces,
+                    b.Nx,b.Ny,b.Nz;
+                    physical_faces=physical_faces,
+                    positivity_meta=shared_ct_pos_meta,
+                )
+            else
+                ct_derive_q_direct_ghost!(
+                    b, ct_derivation_halo_plan.halos[bid],
+                    b.Nx, b.Ny, b.Nz;
+                    gamma=structured_task_gamma, gas_constant=FT(Rg),
+                    physical_faces=physical_faces,
                 )
             end
             gpu_sync()
@@ -3666,7 +3990,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
             @static if POSITIVITY_STRICT &&
                        !(strict_ct_positivity && ct_mode && splitMethodID == 4)
-                ct_reset_positivity!(
+                ct_reset_positivity_violation!(
                     shared_ct_pos_meta, shared_ct_pos_values)
                 @gpu_launch threads=nthreads blocks=nb ct_check_cell_floor_positivity_kernel!(
                     shared_ct_pos_meta, shared_ct_pos_values,
@@ -3752,6 +4076,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         boundary_axis, side, boundary_parameters[face_id],
                         include_normal_face=include_normal_face,
                         background_splitting=background_splitting,
+                        preserve_perturbation=
+                            external_magnetic_split_preserves_perturbation(
+                                boundary_types[face_id],
+                            ),
                     )
                     launched = true
                 end
@@ -3843,7 +4171,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 if b.Bx_face === nothing
                     continue
                 end
-                ct_reset_positivity!(
+                ct_reset_positivity_violation!(
                     shared_ct_pos_meta, shared_ct_pos_values)
                 nb = (
                     cld(b.Nx, nthreads[1]),
@@ -3858,8 +4186,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     b.Areak, b.nxk, b.nyk, b.nzk, FT(γ),
                     ct_cell_b_recovery,
                     Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
-                    b.B0x_face, b.B0y_face, b.B0z_face,
-                    b.B0x_cell, b.B0y_cell, b.B0z_cell)
+                    b.B0x_face, b.B0y_face, b.B0z_face)
                 gpu_sync()
                 ct_check_positivity_or_abort!(
                     shared_ct_pos_meta, shared_ct_pos_values;
@@ -3946,7 +4273,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     end
 
     function finalize_local_ct_edge_emf!(bid, b)
-        ct_enforce_physical_edge_emf!(b, bid, face_bc, bc_params)
+        ct_enforce_physical_edge_emf!(b, bid, face_bc)
         local_periodic = ct_local_periodic_directions(
             bid,face_bc,Block_Nprocs,BC_PERIODIC,
         )
@@ -4082,16 +4409,45 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                (stage == 3 ? FT(2) / FT(3) : one(FT))
     end
 
+    function _structured_rk_fofc_iteration(node)
+        match_result = match(r"_fofc_iter([0-9]+)_",String(node.id))
+        match_result === nothing && return nothing
+        return parse(Int,match_result.captures[1])
+    end
+
+    _structured_rk_is_fofc_auxiliary(node) =
+        _structured_rk_fofc_iteration(node) !== nothing
+
+    function _structured_rk_fofc_task_active(node)
+        iteration = _structured_rk_fofc_iteration(node)
+        iteration === nothing && return true
+        iteration == 0 && return true
+        state = structured_rk_task_state[]
+        stage = _structured_rk_stage_from_node(node)
+        return state[:fofc_next_iteration][stage] == iteration
+    end
+
+    function _structured_rk_junction_epoch(node,state)
+        iteration = _structured_rk_fofc_iteration(node)
+        iteration === nothing && return (state[:tt],
+                                         _structured_rk_stage_from_node(node))
+        stage = _structured_rk_stage_from_node(node)
+        return (state[:tt],1000+100*stage+iteration)
+    end
+
     structured_rk_task_callbacks = Dict{Symbol,Function}()
     structured_rk_task_callbacks[:rk_prepare] =
         (ctx, rt, node) -> begin
             state = structured_rk_task_state[]
             tt_stage = state[:tt]
+            fill!(state[:fofc_next_iteration],0)
+            fill!(state[:fofc_last_iteration],0)
             @static if strict_ct_positivity
                 ct_reset_positivity!(shared_ct_pos_meta, shared_ct_pos_values)
             end
             for (_, b) in blocks
                 copyto!(b.Un, b.U)
+                b.fofc_flag === nothing || fill!(b.fofc_flag,-one(FT))
             end
 
             state[:ct_energy_budget_stage_start] = Dict{Int,Vector{Float64}}()
@@ -4225,8 +4581,85 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         end
     structured_rk_task_callbacks[:rk_stage_prepare] =
         (ctx, rt, node) -> begin
+            state = structured_rk_task_state[]
+            stage = _structured_rk_stage_from_node(node)
+            state[:fofc_next_iteration][stage] = 0
+            state[:fofc_last_iteration][stage] = 0
             @static if strict_ct_positivity
                 ct_reset_positivity!(shared_ct_pos_meta, shared_ct_pos_values)
+            end
+            for (_,b) in blocks
+                b.fofc_flag === nothing || fill!(b.fofc_flag,-one(FT))
+            end
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_iteration_begin] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            ct_reset_fofc_iteration!(
+                shared_ct_pos_meta,shared_ct_pos_values,
+            )
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_iteration_finalize] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            state = structured_rk_task_state[]
+            stage = _structured_rk_stage_from_node(node)
+            iteration = _structured_rk_fofc_iteration(node)
+            counts = ct_fofc_iteration_counts(shared_ct_pos_meta)
+            global_new = MPI.Allreduce(
+                counts.new_cells,MPI.SUM,MPI.COMM_WORLD,
+            )
+            global_bad = MPI.Allreduce(
+                counts.bad_cells,MPI.SUM,MPI.COMM_WORLD,
+            )
+            global_reduced = MPI.Allreduce(
+                counts.reduced_cells,MPI.SUM,MPI.COMM_WORLD,
+            )
+            global_unrecoverable = MPI.Allreduce(
+                counts.unrecoverable_cells,MPI.SUM,MPI.COMM_WORLD,
+            )
+            state[:fofc_last_iteration][stage] = iteration
+            if world_rank == 0 && global_bad > 0
+                @printf(
+                    "CT_FOFC_CLOSURE step=%d rk=%d iter=%d new=%d reduced=%d bad=%d unrecoverable=%d\n",
+                    state[:tt],stage,iteration,global_new,global_reduced,
+                    global_bad,global_unrecoverable,
+                )
+            end
+            if global_bad == 0
+                state[:fofc_next_iteration][stage] = 0
+            elseif global_unrecoverable == 0 &&
+                   global_new+global_reduced > 0 &&
+                   iteration < Int(ct_fofc_max_iterations)
+                state[:fofc_next_iteration][stage] = iteration+1
+            else
+                if world_rank == 0
+                    reason = global_unrecoverable > 0 ?
+                        "the no-transport RK anchor is inadmissible" :
+                        global_new+global_reduced == 0 ?
+                        "the local convex coefficient cannot be reduced " *
+                        "further" :
+                        "the troubled-cell set did not close within " *
+                        "ct_fofc_max_iterations=$(ct_fofc_max_iterations)"
+                    printstyled(
+                        "CT FOFC closure failed at step=$(state[:tt]) " *
+                        "RK=$stage iteration=$iteration: $reason\n",
+                        color=:red,
+                    )
+                    flush(stdout)
+                end
+                ct_check_positivity_or_abort!(
+                    shared_ct_pos_meta,shared_ct_pos_values;
+                    rank=world_rank,block=-1,step=state[:tt],
+                    rk_stage=stage,
+                )
+                MPI.Abort(MPI.COMM_WORLD,86)
             end
             StructuredTaskDone
         end
@@ -4302,6 +4735,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
     structured_rk_task_callbacks[:rk_flux] =
         (ctx, rt, node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
             stage = _structured_rk_stage_from_node(node)
             bid = _structured_rk_block_from_node(node)
             haskey(blocks, bid) || return StructuredTaskDone
@@ -4341,20 +4776,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     Int32(stage), shared_ct_pos_meta, shared_ct_pos_values,
                 )
             end
-            if ct_background_split_enabled && debug_sync && stage == 1
-                flux_maxima = map(
-                    flux -> ntuple(
-                        component -> maximum(abs, Array(flux)[:, :, :, component]),
-                        Val(4),
-                    ),
-                    (shared_Fx, shared_Fy, shared_Fz),
-                )
-                @printf(
-                    ">>> CT background RK1 flux block=%d max|F[rho,mx,my,mz]| x=%s y=%s z=%s\n",
-                    bid, string(flux_maxima[1]), string(flux_maxima[2]),
-                    string(flux_maxima[3]),
-                )
-            end
             @static if strict_ct_positivity
                 gpu_sync()
                 ct_check_positivity_or_abort!(
@@ -4369,17 +4790,50 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
     structured_rk_task_callbacks[:rk_face_average] =
         (ctx, rt, node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
             bid = _structured_rk_block_from_node(node)
             haskey(blocks,bid) || return StructuredTaskDone
             b=blocks[bid]
             average_structured_point_face_fluxes!(
                 b,b.ϕ,shared_Fx,shared_Fy,shared_Fz,
-                shared_Fvx,shared_Fvy,shared_Fvz)
+                shared_Fvx,shared_Fvy,shared_Fvz,shared_ct_pos_meta)
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_correct] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            bid = _structured_rk_block_from_node(node)
+            haskey(blocks,bid) || return StructuredTaskDone
+            b = blocks[bid]
+            correct_structured_ct_fofc_face_fluxes!(
+                b,shared_Fx,shared_Fy,shared_Fz,
+                shared_rho_sum_x,shared_rho_sum_y,shared_rho_sum_z,
+                shared_ct_pos_meta;
+                record_faces=!_structured_rk_is_fofc_auxiliary(node),
+            )
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_scale] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            bid = _structured_rk_block_from_node(node)
+            haskey(blocks,bid) || return StructuredTaskDone
+            scale_structured_ct_fofc_transport!(
+                blocks[bid],shared_Fx,shared_Fy,shared_Fz,
+                shared_Fvx,shared_Fvy,shared_Fvz,
+            )
             StructuredTaskDone
         end
 
     structured_rk_task_callbacks[:rk_diffusive_flux] =
         (ctx, rt, node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
             stage=_structured_rk_stage_from_node(node)
             bid=_structured_rk_block_from_node(node)
             haskey(blocks,bid) || return StructuredTaskDone
@@ -4389,7 +4843,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 b,shared_Fvx,shared_Fvy,shared_Fvz,
                 world_rank,state[:tt],
                 threads_visc_i,threads_visc_j,threads_visc_k)
-            if _ct_energy_budget_enabled
+            if _ct_energy_budget_enabled &&
+               !_structured_rk_is_fofc_auxiliary(node)
                 gpu_sync()
                 s=ct_energy_budget_scratch[bid]
                 ct_energy_budget_reset_flux!(s.flux)
@@ -4402,7 +4857,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             @static if equation_type == :MHD && ct_mode && resistive &&
                        ct_resistive_main_explicit
                 set_resistive_ct_face_energy!(b;additive=true)
-                if _ct_energy_budget_enabled
+                if _ct_energy_budget_enabled &&
+                   !_structured_rk_is_fofc_auxiliary(node)
                     s=ct_energy_budget_scratch[bid]
                     ct_energy_budget_accumulate_flux!(
                         s.flux,shared_Fx,shared_Fy,shared_Fz,
@@ -4416,18 +4872,22 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
     structured_rk_task_callbacks[:rk_edge_emf] =
         (ctx, rt, node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
             stage = _structured_rk_stage_from_node(node)
             bid = _structured_rk_block_from_node(node)
             haskey(blocks, bid) || return StructuredTaskDone
             b = blocks[bid]
             state = structured_rk_task_state[]
+            fofc_iteration = _structured_rk_fofc_iteration(node)
             b.Bx_face === nothing && return StructuredTaskDone
             nb_ct = (
                 cld(b.Nx + 1, nthreads[1]),
                 cld(b.Ny + 1, nthreads[2]),
                 cld(b.Nz + 1, nthreads[3]),
             )
-            if stage == 1
+            if stage == 1 &&
+               (!ct_first_order_flux_correction || fofc_iteration == 0)
                 ct_backup_face_b!(b, b.Nx, b.Ny, b.Nz)
             end
             local_periodic = ct_local_periodic_directions(
@@ -4461,6 +4921,35 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     world_rank, bid, Int32(stage), b.Nx, b.Ny, b.Nz,
                     local_periodic,
                 )
+                # Preserve WENO7 in smooth regions, but restore SG07's
+                # multidimensional upwinding on shock- or FOFC-adjacent edges.
+                @gpu_launch threads=nthreads blocks=nb_ct ct_compute_edge_line_emf_from_weno7_cache_kernel!(
+                    b.Ex_edge,b.Ey_edge,b.Ez_edge,
+                    cache_i,cache_j,cache_k,b.U,b.Q,b.x,b.y,b.z,
+                    Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
+                    ct_junction_edge_mask(ct_junction_plan,bid),
+                    ct_weno7_sg07_selective_only,b.ϕ,FT(hybrid_ϕ1),
+                )
+                @static if ct_first_order_flux_correction
+                    # FOFC replaces selected face fluxes after POINT6 averaging.
+                    # Rebuild only those edges from the corrected buffer using
+                    # its actual tangential halo; shock-only SG07 above consumes
+                    # the original HLLD point cache instead.
+                    @gpu_launch threads=nthreads blocks=nb_ct ct_compute_edge_line_emf_kernel!(
+                        b.Ex_edge,b.Ey_edge,b.Ez_edge,
+                        shared_Fx,shared_Fy,shared_Fz,
+                        shared_rho_sum_x,shared_rho_sum_y,shared_rho_sum_z,
+                        b.U,
+                        b.Areai,b.nxi,b.nyi,b.nzi,
+                        b.Areaj,b.nxj,b.nyj,b.nzj,
+                        b.Areak,b.nxk,b.nyk,b.nzk,
+                        b.Vol,b.x,b.y,b.z,state[:current_dt],
+                        Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),b.Q,
+                        ct_junction_edge_mask(ct_junction_plan,bid),
+                        b.fofc_flag,true,nothing,FT(hybrid_ϕ1),
+                        Int32(STRUCTURED_FLUX_TANGENTIAL_HALO),
+                    )
+                end
             else
                 @gpu_launch threads=nthreads blocks=nb_ct ct_compute_edge_line_emf_kernel!(
                     b.Ex_edge, b.Ey_edge, b.Ez_edge,
@@ -4472,19 +4961,85 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     b.Areak, b.nxk, b.nyk, b.nzk,
                     b.Vol, b.x, b.y, b.z, state[:current_dt],
                     Int32(b.Nx), Int32(b.Ny), Int32(b.Nz), b.Q,
+                    ct_junction_edge_mask(ct_junction_plan,bid),
+                )
+            end
+            @static if ct_emf_scheme == CT_EMF_WENO7_SG07
+                if !isempty(ct_junction_plan.topologies)
+                    error(
+                        "generalized junction UCT currently requires " *
+                        "CT_EMF_SG07; WENO7 junction quadrature must not " *
+                        "fall back to a midpoint payload",
+                    )
+                end
+            else
+                ct_pack_generalized_junction_payloads!(
+                    ct_junction_plan,b,
+                    _structured_rk_junction_epoch(node,state),
+                    shared_Fx, shared_Fy, shared_Fz,
+                    shared_rho_sum_x, shared_rho_sum_y, shared_rho_sum_z,
+                    state[:current_dt],
                 )
             end
             @static if resistive && ct_resistive_main_explicit
                 compute_resistive_ct_edge_emf!(
                     b; reset_edges=false, recompute_face_flux=false,
                 )
+                ct_pack_generalized_junction_resistive_payloads!(
+                    ct_junction_plan,b,
+                    _structured_rk_junction_epoch(node,state),
+                    shared_Fvx,shared_Fvy,shared_Fvz,
+                    shared_cc_ex,shared_cc_ey,shared_cc_ez,
+                )
             end
-            ct_enforce_physical_edge_emf!(b, bid, face_bc, bc_params)
+            if b.fofc_flag !== nothing
+                @gpu_launch threads=nthreads blocks=nb_ct ct_scale_edge_line_emf_kernel!(
+                    b.Ex_edge,b.Ey_edge,b.Ez_edge,b.fofc_flag,
+                    Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
+                )
+            end
+            ct_enforce_physical_edge_emf!(b, bid, face_bc)
             @gpu_launch threads=nthreads blocks=nb_ct ct_sync_periodic_edge_emf_kernel!(
                 b.Ex_edge, b.Ey_edge, b.Ez_edge,
                 local_periodic[1], local_periodic[2], local_periodic[3],
                 Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
             )
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_detect] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            stage = _structured_rk_stage_from_node(node)
+            bid = _structured_rk_block_from_node(node)
+            haskey(blocks,bid) || return StructuredTaskDone
+            b = blocks[bid]
+            state = structured_rk_task_state[]
+            mark_structured_ct_fofc_candidate!(
+                b,shared_Fx,shared_Fy,shared_Fz,
+                shared_Fvx,shared_Fvy,shared_Fvz,
+                state[:current_dt],_structured_rk_a(stage),
+                shared_ct_pos_meta,shared_ct_pos_values,
+            )
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_commit] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            bid = _structured_rk_block_from_node(node)
+            haskey(blocks,bid) || return StructuredTaskDone
+            commit_structured_ct_fofc_candidate!(blocks[bid])
+            StructuredTaskDone
+        end
+
+    structured_rk_task_callbacks[:rk_fofc_flag_sync] =
+        (ctx,rt,node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            sync_ct_fofc_flags!()
             StructuredTaskDone
         end
 
@@ -4685,21 +5240,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
     structured_rk_task_callbacks[:rk_edge_sync] =
         (ctx, rt, node) -> begin
-            state = structured_rk_task_state[]
-            stage = _structured_rk_stage_from_node(node)
-            diagnose_edge_sync = debug_sync && state[:tt] == 1
-            if diagnose_edge_sync
-                residual = ct_local_interface_edge_residual(
-                    blocks, ct_sync_plan,
-                )
-                @printf(
-                    ">>> CT edge residual step=%d RK=%d phase=local-interface abs=%.6e scale=%.6e rel=%.6e interior_abs=%.6e interior_rel=%.6e worst=%s interior_worst=%s\n",
-                    state[:tt], stage, residual.absolute, residual.scale,
-                    residual.relative, residual.interior_absolute,
-                    residual.interior_relative, string(residual.worst),
-                    string(residual.worst_interior),
-                )
-            end
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
             ct_sync_rank_sheets!(
                 blocks, block_comms, Block_Nprocs;
                 sync_face_flux=false, sync_edges=true,
@@ -4708,29 +5250,19 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 blocks, ct_sync_plan;
                 sync_face_flux=false, sync_edges=true,
             )
-            if diagnose_edge_sync
-                residual = ct_local_junction_edge_residual(
-                    blocks, ct_junction_plan,
-                )
-                @printf(
-                    ">>> CT edge residual step=%d RK=%d phase=pre-junction abs=%.6e scale=%.6e rel=%.6e worst=%s\n",
-                    state[:tt], stage, residual.absolute, residual.scale,
-                    residual.relative, string(residual.worst),
-                )
-            end
-            ct_sync_junction_edges!(blocks, ct_junction_plan)
-            if diagnose_edge_sync
-                residual = ct_local_interface_edge_residual(
-                    blocks, ct_sync_plan,
-                )
-                @printf(
-                    ">>> CT edge residual step=%d RK=%d phase=post-junction abs=%.6e scale=%.6e rel=%.6e interior_abs=%.6e interior_rel=%.6e worst=%s interior_worst=%s\n",
-                    state[:tt], stage, residual.absolute, residual.scale,
-                    residual.relative, residual.interior_absolute,
-                    residual.interior_relative, string(residual.worst),
-                    string(residual.worst_interior),
-                )
-            end
+            StructuredTaskDone
+        end
+    structured_rk_task_callbacks[:rk_junction_solve] =
+        (ctx, rt, node) -> begin
+            _structured_rk_fofc_task_active(node) ||
+                return StructuredTaskDone
+            stage = _structured_rk_stage_from_node(node)
+            state = structured_rk_task_state[]
+            ct_solve_generalized_junctions!(
+                blocks,ct_junction_plan,
+                _structured_rk_junction_epoch(node,state);
+                require_resistive=resistive && ct_resistive_main_explicit,
+            )
             StructuredTaskDone
         end
     structured_rk_task_callbacks[:rk_face_b_update] =
@@ -4740,6 +5272,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             b = blocks[bid]
             b.Bx_face === nothing && return StructuredTaskDone
             stage = _structured_rk_stage_from_node(node)
+            ct_assert_generalized_junction_solution_ready!(
+                ct_junction_plan,
+                (structured_rk_task_state[][:tt], stage),
+            )
             nb_ct = (
                 cld(b.Nx + 1, nthreads[1]),
                 cld(b.Ny + 1, nthreads[2]),
@@ -4783,7 +5319,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 state[:active_time];
                 step=state[:tt], rk_stage=stage,
             )
-            report_ct_background_split_diagnostics!(Symbol("rk", stage))
             if stage < 3 && !strict_ct_positivity &&
                !multi_block_mode && length(blocks) == 1 &&
                structured_face_quadrature != STRUCTURED_FACE_POINT6
@@ -4825,13 +5360,48 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 global_hlld_to_hlle = MPI.Allreduce(
                     fallback_counts.hlld_to_hlle, MPI.SUM, MPI.COMM_WORLD,
                 )
+                global_point6_to_ao = MPI.Allreduce(
+                    fallback_counts.point6_to_ao,MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_point6_limited = MPI.Allreduce(
+                    fallback_counts.point6_limited,MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_point6_unrecoverable = MPI.Allreduce(
+                    ct_point6_unrecoverable_count(shared_ct_pos_meta),
+                    MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_face_p2a_to_ao = MPI.Allreduce(
+                    fallback_counts.face_p2a_to_ao,MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_face_p2a_to_midpoint = MPI.Allreduce(
+                    fallback_counts.face_p2a_to_midpoint,
+                    MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_fofc_cells = MPI.Allreduce(
+                    fallback_counts.fofc_cells,MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_fofc_faces = MPI.Allreduce(
+                    fallback_counts.fofc_faces,MPI.SUM,MPI.COMM_WORLD,
+                )
+                global_fofc_limited = MPI.Allreduce(
+                    fallback_counts.fofc_limited,MPI.SUM,MPI.COMM_WORLD,
+                )
                 if world_rank == 0 &&
                    global_weno_to_plm + global_plm_to_first +
-                   global_hlld_to_hlle > 0
+                   global_hlld_to_hlle + global_point6_to_ao +
+                   global_point6_limited + global_point6_unrecoverable +
+                   global_face_p2a_to_ao +
+                   global_face_p2a_to_midpoint + global_fofc_cells +
+                   global_fofc_faces + global_fofc_limited > 0
                     @printf(
-                        "CT_FALLBACK taskgraph step=%d rk=%d weno_to_plm=%d plm_to_first=%d hlld_to_hlle=%d\n",
+                        "CT_FALLBACK taskgraph step=%d rk=%d weno_to_plm=%d plm_to_first=%d hlld_to_hlle=%d point6_to_ao=%d point6_limited=%d point6_unrecoverable=%d face_p2a_to_ao=%d face_p2a_to_midpoint=%d fofc_cells=%d fofc_faces=%d fofc_limited=%d\n",
                         state[:tt], stage, global_weno_to_plm,
-                        global_plm_to_first, global_hlld_to_hlle,
+                        global_plm_to_first,global_hlld_to_hlle,
+                        global_point6_to_ao,global_point6_limited,
+                        global_point6_unrecoverable,
+                        global_face_p2a_to_ao,global_face_p2a_to_midpoint,
+                        global_fofc_cells,global_fofc_faces,
+                        global_fofc_limited,
                     )
                 end
             end
@@ -4939,6 +5509,27 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         end
     structured_task_callbacks[:ct_point6_state] =
         (ctx, rt, node) -> begin
+            @static if ct_primitive_recovery != CT_PRIMITIVE_POINT6
+                for (_, b) in blocks
+                    b.Bx_face === nothing && continue
+                    ct_recover_cell_b!(
+                        b, b.Nx, b.Ny, b.Nz; include_ghosts=true,
+                    )
+                end
+                gpu_sync()
+                for (_, b) in blocks
+                    b.Bx_face === nothing && continue
+                    nb_loc = (
+                        cld(b.Nx+2*NG, nthreads[1]),
+                        cld(b.Ny+2*NG, nthreads[2]),
+                        cld(b.Nz+2*NG, nthreads[3]),
+                    )
+                    @gpu_launch threads=nthreads blocks=nb_loc c2Prim_ghost(
+                        b.U, b.Q, b.Nx, b.Ny, b.Nz,
+                    )
+                end
+                gpu_sync()
+            end
             state = structured_task_sync_state[]
             finalize_ct_interior_state!(
                 step=state.step, rk_stage=state.rk_stage,
@@ -4962,37 +5553,64 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             gpu_sync()
             StructuredTaskDone
         end
-    structured_task_callbacks[:ct_positivity] =
+    structured_task_callbacks[:ct_physical_state] =
         (ctx, rt, node) -> begin
-            state = structured_task_sync_state[]
             for (bid, b) in blocks
                 b.Bx_face === nothing && continue
                 Nprocs_b = Block_Nprocs[bid + 1]
-                rx_b = multi_block_mode ? 0 : rankx
-                ry_b = multi_block_mode ? 0 : ranky
-                rz_b = multi_block_mode ? 0 : rankz
+                rx_b = Int(b.rx)
+                ry_b = Int(b.ry)
+                rz_b = Int(b.rz)
+                rank_coordinates = (rx_b,ry_b,rz_b)
+                rank_dimensions = Tuple(Int.(Nprocs_b))
+                physical_faces = ntuple(Val(6)) do face_id
+                    direction = fld(face_id+1,2)
+                    owns_face = isodd(face_id) ?
+                        rank_coordinates[direction] == 0 :
+                        rank_coordinates[direction] == rank_dimensions[direction]-1
+                    boundary_type = Int32(get(
+                        face_bc,(bid,face_id),BC_INTERBLOCK,
+                    ))
+                    owns_face && _ct_is_physical_boundary_type(boundary_type)
+                end
+                ct_recover_physical_ghost_b!(
+                    b,b.Nx,b.Ny,b.Nz; physical_faces=physical_faces,
+                )
                 finalize_structured_ct_physical_ghost_energy!(
                     b.U, b.Q, rx_b, ry_b, rz_b, b.id,
                     b.Nx, b.Ny, b.Nz, Nprocs_b, face_bc, bc_params,
+                    background_cell=b.B0_cell,
                 )
             end
             gpu_sync()
+            StructuredTaskDone
+        end
+    structured_task_callbacks[:ct_positivity] =
+        (ctx, rt, node) -> begin
+            state = structured_task_sync_state[]
             check_ct_sync_transition!(state.step, state.rk_stage)
             @static if strict_ct_positivity && ct_mode && splitMethodID == 4
                 for (bid, b) in blocks
-                    ct_reset_positivity!(
+                    ct_reset_positivity_violation!(
                         shared_ct_pos_meta, shared_ct_pos_values)
                     nb_loc = (
                         cld(b.Nx+2*NG, nthreads[1]),
                         cld(b.Ny+2*NG, nthreads[2]),
                         cld(b.Nz+2*NG, nthreads[3]),
                     )
-                    @gpu_launch threads=nthreads blocks=nb_loc ct_check_cell_positivity_kernel!(
-                        shared_ct_pos_meta, shared_ct_pos_values,
-                        b.U, b.Q, structured_task_gamma,
-                        CT_POS_SITE_GHOST_REFRESH, Int32(1),
-                        Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
-                    )
+                    @static if ct_primitive_recovery == CT_PRIMITIVE_POINT6
+                        @gpu_launch threads=nthreads blocks=nb_loc ct_check_point_primitive_positivity_kernel!(
+                            shared_ct_pos_meta,shared_ct_pos_values,b.Q,
+                            structured_task_gamma,CT_POS_SITE_GHOST_REFRESH,
+                            Int32(1),Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
+                        )
+                    else
+                        @gpu_launch threads=nthreads blocks=nb_loc ct_check_cell_positivity_kernel!(
+                            shared_ct_pos_meta,shared_ct_pos_values,b.U,b.Q,
+                            structured_task_gamma,CT_POS_SITE_GHOST_REFRESH,
+                            Int32(1),Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
+                        )
+                    end
                     gpu_sync()
                     ct_check_positivity_or_abort!(
                         shared_ct_pos_meta, shared_ct_pos_values;
@@ -5286,11 +5904,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
 
             # Reuse LTS_dt as a transient, same-shape reduction buffer.  This
             # avoids allocating one full-field entropy array per diagnostic.
-            # This diagnostic uses the adiabatic mathematical entropy and its
-            # pressure recovery is undefined at gamma=1. Isothermal MHD has a
-            # different entropy functional, so do not emit a false NaN here.
-            entropy_enabled = !isothermal_mhd &&
-                (step % 100 == 0 || step <= 20)
+            entropy_enabled = step % 100 == 0 || step <= 20
             if entropy_enabled
                 local_entropy = 0.0
                 for (_, b) in blocks
@@ -5302,7 +5916,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         cld(Int32(b.Nz + 2*NG), threads_entropy[3]),
                     )
                     @gpu_launch threads=threads_entropy blocks=blocks_entropy entropy_total_kernel!(
-                        b.LTS_dt, b.U, b.Vol, FT(γ), Int32(NG),
+                        b.LTS_dt, b.U, b.Vol, FT(γ),
+                        FT(entropy_reference_density), Int32(NG),
                         Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
                     )
                     local_entropy += Float64(sum(b.LTS_dt))
@@ -5377,8 +5992,16 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         state[:fringe_residual],
                     )
                 end
-                haskey(state, :entropy) &&
-                    @printf("  entropy = %.8e\n", state[:entropy])
+                if haskey(state, :entropy)
+                    @static if equation_type == :MHD && isothermal_mhd
+                        @printf(
+                            "  entropy = %.8e (isothermal free energy, J)\n",
+                            state[:entropy],
+                        )
+                    else
+                        @printf("  entropy = %.8e\n", state[:entropy])
+                    end
+                end
                 flush(stdout)
             end
             StructuredTaskDone
@@ -5495,7 +6118,9 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         task_graph = build_structured_explicit_rk3_task_graph(
             0:(Int(Nblocks) - 1);
             ct_mode=structured_task_ct_active,
-            background_split=ct_background_split_enabled,
+            fofc=structured_task_ct_active &&
+                 ct_first_order_flux_correction,
+            fofc_iterations=Int(ct_fofc_max_iterations),
             resistive_pre=structured_task_ct_active && resistive &&
                           ct_resistive_main_explicit,
             defer_trailing_split=structured_task_ct_active &&
@@ -5513,7 +6138,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             shared_dU_forced),
             runtime_options=(equation_type=equation_type,
                              ct_mode=structured_task_ct_active,
-                             background_split=ct_background_split_enabled,
                              block_count=length(blocks)),
         )
         graph_min = MPI.Allreduce(task_graph.signature, MPI.MIN, MPI.COMM_WORLD)
@@ -5552,18 +6176,14 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             :hit_By_mean => zero(FT),
             :hit_Bz_mean => zero(FT),
             :split_source_active => false,
+            :fofc_next_iteration => zeros(Int,3),
+            :fofc_last_iteration => zeros(Int,3),
             :ct_energy_budget_stage_start => Dict{Int,Vector{Float64}}(),
             :ct_energy_budget_prediv => Dict{Int,Vector{Float64}}(),
         )
         structured_rk_task_state[] = state
         seed_resources = Symbol[:RK_Q_HALO_0, :RK_U_ACTIVE_0]
         structured_task_ct_active && push!(seed_resources, :RK_FACE_B_0)
-        if ct_background_split_enabled
-            ct_background_ready[] || error(
-                "CT background cache is not ready before RK flux evaluation",
-            )
-            push!(seed_resources, STRUCTURED_TASK_CT_BACKGROUND_READY)
-        end
         begin_structured_task_stage!(
             structured_rk_task_context,
             StructuredTaskEpoch(Int(tt_val), 0, 0);
@@ -5639,6 +6259,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         global_restored_ct_faces, global_ct_face_blocks,
     )
     all_ct_faces_restored = ct_face_restore_mode == :complete
+    if all_ct_faces_restored && ct_background_split_enabled
+        # A split-field checkpoint already stores b_face and B0_face
+        # separately. Boundary preparation must therefore preserve the
+        # restored perturbation instead of treating b_face as the total field.
+        ct_background_ready[] = true
+    end
 
     # Fresh cell-centered magnetic initial data needs gas/U ghosts before the
     # first face construction. A modern CT restart skips this Q-based pass and
@@ -5657,22 +6283,90 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         end
         for (bid, b) in blocks
             if b.Bx_face !== nothing && !(bid in restored_ct_face_b)
-                ct_init_face_b!(b, b.Nx, b.Ny, b.Nz)
+                boundary_types, _ = _structured_face_boundary_data(
+                    face_bc, bc_params, bid,
+                )
+                rank_coordinates = (Int(b.rx), Int(b.ry), Int(b.rz))
+                rank_dimensions = Tuple(Int.(Block_Nprocs[bid + 1]))
+                physical_face_mask = Int32(0)
+                for face_id in 1:6
+                    direction = fld(face_id + 1, 2)
+                    owns_face = isodd(face_id) ?
+                        rank_coordinates[direction] == 0 :
+                        rank_coordinates[direction] == rank_dimensions[direction] - 1
+                    if owns_face &&
+                       _ct_is_physical_boundary_type(boundary_types[face_id])
+                        physical_face_mask |= Int32(1) << (face_id - 1)
+                    end
+                end
+                ct_init_face_b!(
+                    b, b.Nx, b.Ny, b.Nz;
+                    physical_face_mask=physical_face_mask,
+                )
             end
         end
         used_initial_face_flux_hook = false
+        used_initial_edge_integral_hook = false
         if !all_ct_faces_restored
-            used_initial_face_flux_hook =
-                _run_configured_external_magnetic_field_process!(Main, blocks)
-            used_initial_face_flux_hook |= _run_initial_ct_face_flux_process!(
-                Main, blocks, world_rank, Block_Nprocs, block_comms,
-            )
-            if !used_initial_face_flux_hook
+            used_initial_edge_integral_hook =
+                _run_configured_external_magnetic_field_process!(
+                    Main, blocks;
+                    junction_masks=ct_junction_plan.junction_masks,
+                    metric_coordinates=initial_metric_coordinates_h,
+                )
+            if !used_initial_edge_integral_hook
+                used_initial_edge_integral_hook =
+                    _run_initial_ct_edge_integral_process!(
+                        Main, blocks, world_rank, Block_Nprocs, block_comms,
+                        initial_metric_coordinates_h,
+                    )
+            end
+            if !used_initial_edge_integral_hook
+                used_initial_face_flux_hook =
+                    _run_initial_ct_face_flux_process!(
+                        Main, blocks, world_rank, Block_Nprocs, block_comms,
+                    )
+            end
+            if !used_initial_edge_integral_hook &&
+               !used_initial_face_flux_hook
+                for (bid, b) in blocks
+                    b.Bx_face === nothing && continue
+                    used_initial_edge_integral_hook |=
+                        structured_initialize_orszag_tang_edge_integrals!(
+                            b;
+                            junction_edge_mask=ct_junction_edge_mask(
+                                ct_junction_plan, bid,
+                            ),
+                            coordinates=get(
+                                initial_metric_coordinates_h, bid, nothing,
+                            ),
+                        )
+                end
+            end
+            if used_initial_edge_integral_hook
+                # Initial vector-potential integrals are one topological value
+                # per physical edge. Select the same canonical pre-curl value
+                # used by SCMM. Runtime edge EMFs keep the default mean merge.
+                ct_sync_rank_sheets!(
+                    blocks, block_comms, Block_Nprocs;
+                    sync_face_flux=false, sync_edges=true,
+                    edge_merge=CT_EDGE_MERGE_CANONICAL,
+                )
+                ct_sync_interface_sheets!(
+                    blocks, ct_sync_plan;
+                    sync_face_flux=false, sync_edges=true,
+                    edge_merge=CT_EDGE_MERGE_CANONICAL,
+                )
+                ct_sync_junction_edges!(
+                    blocks, ct_junction_plan;
+                    edge_merge=CT_EDGE_MERGE_CANONICAL,
+                )
                 for (_, b) in blocks
                     b.Bx_face === nothing && continue
-                    used_initial_face_flux_hook |=
-                        structured_initialize_orszag_tang_face_flux!(b)
+                    ct_face_flux_from_edge_integrals!(b)
                 end
+                gpu_sync()
+                used_initial_face_flux_hook = true
             end
         end
         ct_sync_rank_sheets!(
@@ -5700,7 +6394,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         )
         apply_external_ct_face_b_boundaries!(;
             include_normal_face=initial_include_normal_face,
-            background_splitting=false,
+            background_splitting=ct_background_ready[],
         )
         local_initial_divb = maximum(
             ct_initial_relative_face_divergence(b) for b in values(blocks)
@@ -5787,7 +6481,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         ct_face_state_ready[] = true
         initialize_structured_task_context!()
         sync_blocks!(zero(FT); step=tt, rk_stage=0)
-        report_ct_background_split_diagnostics!(:initial)
         if world_rank == 0
             @printf(
                 ">>> CT: Face-centered B initialized; relative divB=%.6e.\n",
@@ -5795,6 +6488,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             )
         end
     end
+
+    empty!(initial_metric_coordinates_h)
 
     # HIT forcing state
     hit_u_mean = zero(FT)
@@ -5965,10 +6660,17 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             cld(b.Ny, nthreads[2]),
                             cld(b.Nz, nthreads[3]),
                         )
-                        @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
-                            shared_ct_pos_meta, shared_ct_pos_values,
-                            b.U, b.Q, FT(γ), CT_POS_SITE_POST_CT_SYNC,
-                            Int32(0), Int32(b.Nx), Int32(b.Ny), Int32(b.Nz))
+                        @static if ct_primitive_recovery == CT_PRIMITIVE_POINT6
+                            @gpu_launch threads=nthreads blocks=nb_cell ct_check_point_primitive_positivity_kernel!(
+                                shared_ct_pos_meta, shared_ct_pos_values,
+                                b.Q, FT(γ), CT_POS_SITE_POST_CT_SYNC,
+                                Int32(0), Int32(b.Nx), Int32(b.Ny), Int32(b.Nz))
+                        else
+                            @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
+                                shared_ct_pos_meta, shared_ct_pos_values,
+                                b.U, b.Q, FT(γ), CT_POS_SITE_POST_CT_SYNC,
+                                Int32(0), Int32(b.Nx), Int32(b.Ny), Int32(b.Nz))
+                        end
                     end
                     gpu_sync()
                     ct_check_positivity_or_abort!(
@@ -6084,12 +6786,21 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             cld(b.Ny, nthreads[2]),
                             cld(b.Nz, nthreads[3]),
                         )
-                        @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
-                            shared_ct_pos_meta, shared_ct_pos_values,
-                            b.U, b.Q, structured_task_gamma,
-                            CT_POS_SITE_POST_CT_SYNC, Int32(0),
-                            Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
-                        )
+                        @static if ct_primitive_recovery == CT_PRIMITIVE_POINT6
+                            @gpu_launch threads=nthreads blocks=nb_cell ct_check_point_primitive_positivity_kernel!(
+                                shared_ct_pos_meta, shared_ct_pos_values,
+                                b.Q, structured_task_gamma,
+                                CT_POS_SITE_POST_CT_SYNC, Int32(0),
+                                Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+                            )
+                        else
+                            @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
+                                shared_ct_pos_meta, shared_ct_pos_values,
+                                b.U, b.Q, structured_task_gamma,
+                                CT_POS_SITE_POST_CT_SYNC, Int32(0),
+                                Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+                            )
+                        end
                     end
                     gpu_sync()
                     ct_check_positivity_or_abort!(
@@ -6209,12 +6920,21 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     cld(b.Ny, nthreads[2]),
                     cld(b.Nz, nthreads[3]),
                 )
-                @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
-                    shared_ct_pos_meta, shared_ct_pos_values,
-                    b.U, b.Q, structured_task_gamma,
-                    CT_POS_SITE_POST_CT_SYNC, Int32(0),
-                    Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
-                )
+                @static if ct_primitive_recovery == CT_PRIMITIVE_POINT6
+                    @gpu_launch threads=nthreads blocks=nb_cell ct_check_point_primitive_positivity_kernel!(
+                        shared_ct_pos_meta, shared_ct_pos_values,
+                        b.Q, structured_task_gamma,
+                        CT_POS_SITE_POST_CT_SYNC, Int32(0),
+                        Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+                    )
+                else
+                    @gpu_launch threads=nthreads blocks=nb_cell ct_check_cell_positivity_kernel!(
+                        shared_ct_pos_meta, shared_ct_pos_values,
+                        b.U, b.Q, structured_task_gamma,
+                        CT_POS_SITE_POST_CT_SYNC, Int32(0),
+                        Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+                    )
+                end
             end
             gpu_sync()
             ct_check_positivity_or_abort!(

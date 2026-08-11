@@ -14,9 +14,9 @@ const STRUCTURED_TASK_U_HALO_FILTERED = :U_HALO_FILTERED
 const STRUCTURED_TASK_FACE_B_HALO = :FACE_B_HALO
 const STRUCTURED_TASK_Q_PROVISIONAL = :Q_PROVISIONAL
 const STRUCTURED_TASK_Q_POINT = :Q_POINT
+const STRUCTURED_TASK_Q_PHYSICAL = :Q_PHYSICAL
 const STRUCTURED_TASK_Q_HALO = :Q_HALO
 const STRUCTURED_TASK_CT_DERIVATION_HALO = :CT_DERIVATION_HALO
-const STRUCTURED_TASK_CT_BACKGROUND_READY = :CT_BACKGROUND_READY
 const STRUCTURED_TASK_POSITIVITY = :POSITIVITY
 
 # End-of-step resources.  These are intentionally separate from the RK stage
@@ -145,9 +145,14 @@ function build_structured_ghost_ct_task_graph(;
                     STRUCTURED_TASK_CT_DERIVATION_HALO],
             exclusive=[:MPI_REQUESTS, :CT_DERIVATION_SCRATCH],
             start! = callback(final_state))
-        add_structured_task!(builder, :ct_positivity;
+        add_structured_task!(builder, :ct_physical_state;
             depends=[final_state],
             reads=[STRUCTURED_TASK_Q_POINT, final_u_resource],
+            writes=[STRUCTURED_TASK_Q_PHYSICAL],
+            start! = callback(:ct_physical_state))
+        add_structured_task!(builder, :ct_positivity;
+            depends=[:ct_physical_state],
+            reads=[STRUCTURED_TASK_Q_PHYSICAL, final_u_resource],
             writes=[STRUCTURED_TASK_POSITIVITY],
             start! = callback(:ct_positivity))
     else
@@ -397,7 +402,8 @@ end
 function build_structured_explicit_rk3_task_graph(
     block_ids;
     ct_mode::Bool=false,
-    background_split::Bool=false,
+    fofc::Bool=false,
+    fofc_iterations::Integer=1,
     resistive_pre::Bool=false,
     defer_trailing_split::Bool=false,
     callbacks=Dict{Symbol,Function}(),
@@ -406,9 +412,13 @@ function build_structured_explicit_rk3_task_graph(
     isempty(ids) && throw(ArgumentError(
         "explicit RK3 task graph requires at least one block",
     ))
-    background_split && !ct_mode && throw(ArgumentError(
-        "CT background splitting requires ct_mode=true",
+    fofc && !ct_mode && throw(ArgumentError(
+        "first-order flux correction requires the CT task graph",
     ))
+    fofc && fofc_iterations < 1 && throw(ArgumentError(
+        "FOFC requires at least one corrected-candidate closure pass",
+    ))
+    fofc_iterations_int = Int(fofc_iterations)
 
     callback(id) = get(callbacks, id, _structured_task_noop_callback)
     builder = StructuredTaskGraphBuilder()
@@ -421,9 +431,6 @@ function build_structured_explicit_rk3_task_graph(
     declare_structured_resource!(builder, initial_q)
     declare_structured_resource!(builder, initial_u)
     ct_mode && declare_structured_resource!(builder, initial_face)
-    background_split && declare_structured_resource!(
-        builder, STRUCTURED_TASK_CT_BACKGROUND_READY; persistent=true,
-    )
 
     previous_barrier = nothing
     for stage in 1:3
@@ -499,6 +506,211 @@ function build_structured_explicit_rk3_task_graph(
                 start! = callback(:rk_resistive_pre_barrier))
         end
 
+        final_pre_barrier = pre_barrier
+        if ct_mode && fofc
+            for iteration in 0:fofc_iterations_int
+                prefix = Symbol("rk",stage,"_fofc_iter",iteration)
+                resource_prefix =
+                    Symbol("RK_FOFC_",stage,"_I",iteration)
+                flag_input = iteration == 0 ? nothing :
+                    Symbol("RK_FOFC_FLAG_HALO_",stage,"_I",iteration-1)
+                iteration_begin = Symbol(prefix,"_begin")
+                begin_reads = Symbol[q_in,u_in,face_in]
+                flag_input === nothing || push!(begin_reads,flag_input)
+                add_structured_task!(builder,iteration_begin;
+                    depends=[final_pre_barrier],reads=begin_reads,
+                    writes=[Symbol(resource_prefix,"_STARTED")],
+                    start! = callback(:rk_fofc_iteration_begin))
+
+                # Phase A retains one edge array per block, then canonicalizes
+                # those edges before any candidate cell is classified. Shared
+                # face-flux buffers are serialized and may be overwritten.
+                edge_ids = Symbol[]
+                edge_resources = Symbol[]
+                payload_resources = Symbol[]
+                previous_edge = nothing
+                for bid in ids
+                    edge_flux = Symbol(prefix,"_edge_flux_b",bid)
+                    edge_average = Symbol(prefix,"_edge_average_b",bid)
+                    edge_diffusive = Symbol(prefix,"_edge_diffusive_b",bid)
+                    edge_correct = Symbol(prefix,"_edge_correct_b",bid)
+                    edge_emf = Symbol(prefix,"_edge_emf_b",bid)
+                    point_resource =
+                        Symbol(resource_prefix,"_EDGE_POINT_B",bid)
+                    average_resource =
+                        Symbol(resource_prefix,"_EDGE_AVERAGE_B",bid)
+                    diffusive_resource =
+                        Symbol(resource_prefix,"_EDGE_DIFFUSIVE_B",bid)
+                    corrected_resource =
+                        Symbol(resource_prefix,"_EDGE_CORRECTED_B",bid)
+                    edge_resource = Symbol(resource_prefix,"_EDGE_B",bid)
+                    payload_resource =
+                        Symbol(resource_prefix,"_PAYLOAD_B",bid)
+                    edge_dep = Symbol[iteration_begin]
+                    previous_edge === nothing ||
+                        push!(edge_dep,previous_edge)
+                    add_structured_task!(builder,edge_flux;
+                        depends=edge_dep,
+                        reads=[q_in,Symbol("RK_SHOCK_HALO_",stage)],
+                        writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_flux))
+                    add_structured_task!(builder,edge_average;
+                        depends=[edge_flux],reads=[point_resource],
+                        writes=[average_resource],exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_face_average))
+                    final_average_id = edge_average
+                    final_average_resource = average_resource
+                    if iteration > 0
+                        add_structured_task!(builder,edge_correct;
+                            depends=[edge_average],
+                            reads=[average_resource,flag_input],
+                            writes=[corrected_resource],
+                            exclusive=[:RK_SHARED_FLUX],
+                            start! = callback(:rk_fofc_correct))
+                        final_average_id = edge_correct
+                        final_average_resource = corrected_resource
+                    end
+                    add_structured_task!(builder,edge_diffusive;
+                        depends=[edge_average],reads=[q_in,average_resource],
+                        writes=[diffusive_resource],
+                        exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_diffusive_flux))
+                    add_structured_task!(builder,edge_emf;
+                        depends=[final_average_id,edge_diffusive],
+                        reads=[final_average_resource,diffusive_resource],
+                        writes=[edge_resource,payload_resource],
+                        exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_edge_emf))
+                    push!(edge_ids,edge_emf)
+                    push!(edge_resources,edge_resource)
+                    push!(payload_resources,payload_resource)
+                    previous_edge = edge_emf
+                end
+
+                edge_sync = Symbol(prefix,"_edge_sync")
+                canonical_resource =
+                    Symbol(resource_prefix,"_EDGE_CANONICAL")
+                add_structured_task!(builder,edge_sync;
+                    depends=edge_ids,reads=edge_resources,
+                    writes=[canonical_resource],exclusive=[:RK_CT_MPI],
+                    collective_sequence=stage,
+                    start! = callback(:rk_edge_sync))
+                junction_solve = Symbol(prefix,"_junction_solve")
+                junction_resource =
+                    Symbol(resource_prefix,"_EDGE_JUNCTION_READY")
+                add_structured_task!(builder,junction_solve;
+                    depends=[edge_sync],
+                    reads=[canonical_resource,payload_resources...],
+                    writes=[junction_resource],exclusive=[:RK_CT_MPI],
+                    collective_sequence=stage,
+                    start! = callback(:rk_junction_solve))
+
+                # Phase B rebuilds the shared face flux for each block and
+                # combines it with the now-canonical edge candidate. Flags are
+                # monotone, so each pass can only enlarge the corrected set.
+                commit_ids = Symbol[]
+                local_flag_resources = Symbol[]
+                previous_detect = nothing
+                for bid in ids
+                    detect_flux = Symbol(prefix,"_detect_flux_b",bid)
+                    detect_average = Symbol(prefix,"_detect_average_b",bid)
+                    detect_diffusive =
+                        Symbol(prefix,"_detect_diffusive_b",bid)
+                    detect_correct = Symbol(prefix,"_detect_correct_b",bid)
+                    detect_scale = Symbol(prefix,"_detect_scale_b",bid)
+                    detect = Symbol(prefix,"_detect_b",bid)
+                    detect_commit = Symbol(prefix,"_commit_b",bid)
+                    point_resource =
+                        Symbol(resource_prefix,"_DETECT_POINT_B",bid)
+                    average_resource =
+                        Symbol(resource_prefix,"_DETECT_AVERAGE_B",bid)
+                    diffusive_resource =
+                        Symbol(resource_prefix,"_DETECT_DIFFUSIVE_B",bid)
+                    corrected_resource =
+                        Symbol(resource_prefix,"_DETECT_CORRECTED_B",bid)
+                    scaled_resource =
+                        Symbol(resource_prefix,"_DETECT_SCALED_B",bid)
+                    proposal_resource =
+                        Symbol(resource_prefix,"_FLAG_PROPOSAL_B",bid)
+                    flag_resource =
+                        Symbol(resource_prefix,"_FLAG_LOCAL_B",bid)
+                    detect_dep = Symbol[junction_solve]
+                    previous_detect === nothing ||
+                        push!(detect_dep,previous_detect)
+                    add_structured_task!(builder,detect_flux;
+                        depends=detect_dep,
+                        reads=[q_in,Symbol("RK_SHOCK_HALO_",stage)],
+                        writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_flux))
+                    add_structured_task!(builder,detect_average;
+                        depends=[detect_flux],reads=[point_resource],
+                        writes=[average_resource],exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_face_average))
+                    final_detect_id = detect_average
+                    final_detect_resource = average_resource
+                    if iteration > 0
+                        add_structured_task!(builder,detect_correct;
+                            depends=[detect_average],
+                            reads=[average_resource,flag_input],
+                            writes=[corrected_resource],
+                            exclusive=[:RK_SHARED_FLUX],
+                            start! = callback(:rk_fofc_correct))
+                        final_detect_id = detect_correct
+                        final_detect_resource = corrected_resource
+                    end
+                    add_structured_task!(builder,detect_diffusive;
+                        depends=[detect_average],reads=[q_in,average_resource],
+                        writes=[diffusive_resource],
+                        exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_diffusive_flux))
+                    if iteration > 0
+                        add_structured_task!(builder,detect_scale;
+                            depends=[final_detect_id,detect_diffusive],
+                            reads=[final_detect_resource,diffusive_resource,
+                                   flag_input],
+                            writes=[scaled_resource],
+                            exclusive=[:RK_SHARED_FLUX],
+                            start! = callback(:rk_fofc_scale))
+                        final_detect_id = detect_scale
+                        final_detect_resource = scaled_resource
+                    end
+                    detect_reads = Symbol[
+                        u_in,face_in,final_detect_resource,
+                        diffusive_resource,junction_resource,
+                    ]
+                    flag_input === nothing || push!(detect_reads,flag_input)
+                    add_structured_task!(builder,detect;
+                        depends=[final_detect_id,detect_diffusive],
+                        reads=detect_reads,writes=[proposal_resource],
+                        exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_fofc_detect))
+                    add_structured_task!(builder,detect_commit;
+                        depends=[detect],reads=[proposal_resource],
+                        writes=[flag_resource],
+                        start! = callback(:rk_fofc_commit))
+                    push!(commit_ids,detect_commit)
+                    push!(local_flag_resources,flag_resource)
+                    previous_detect = detect_commit
+                end
+
+                flag_sync = Symbol(prefix,"_flag_sync")
+                flag_output =
+                    Symbol("RK_FOFC_FLAG_HALO_",stage,"_I",iteration)
+                add_structured_task!(builder,flag_sync;
+                    depends=commit_ids,reads=local_flag_resources,
+                    writes=[flag_output],exclusive=[:RK_GHOST_SYNC],
+                    collective_sequence=stage,
+                    start! = callback(:rk_fofc_flag_sync))
+                iteration_finalize = Symbol(prefix,"_finalize")
+                add_structured_task!(builder,iteration_finalize;
+                    depends=[flag_sync],reads=[flag_output],
+                    writes=[Symbol(resource_prefix,"_CLOSED")],
+                    collective_sequence=stage,
+                    start! = callback(:rk_fofc_iteration_finalize))
+                final_pre_barrier = iteration_finalize
+            end
+        end
+
         flux_ids = Symbol[]
         div_ids = Symbol[]
         edge_ids = Symbol[]
@@ -522,19 +734,15 @@ function build_structured_explicit_rk3_task_graph(
             push!(edge_ids, edge_id)
             push!(div_ids, div_id)
 
-            flux_dep = pre_barrier === shock_halo ? [shock_halo] : [pre_barrier]
+            flux_dep = Symbol[final_pre_barrier]
             # RK_SHARED_FLUX is one physical buffer set per rank.  An
             # exclusive resource prevents concurrent callbacks, but does not
             # keep block b's flux alive until its divergence callback consumes
             # it.  Serialize complete per-block pipelines explicitly.
             previous_block_div === nothing || push!(flux_dep, previous_block_div)
-            flux_reads = [q_in, Symbol("RK_SHOCK_HALO_", stage)]
-            background_split && push!(
-                flux_reads, STRUCTURED_TASK_CT_BACKGROUND_READY,
-            )
             add_structured_task!(builder, flux_id;
                 depends=flux_dep,
-                reads=flux_reads,
+                reads=[q_in, Symbol("RK_SHOCK_HALO_", stage)],
                 writes=[point_flux_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_flux))
 
@@ -542,23 +750,60 @@ function build_structured_explicit_rk3_task_graph(
                 depends=[flux_id], reads=[point_flux_resource],
                 writes=[face_average_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_face_average))
+            final_flux_dependency = face_average_id
+            final_flux_resource = face_average_resource
+            if ct_mode && fofc
+                correction_id = Symbol("rk",stage,"_fofc_correct_b",bid)
+                corrected_resource =
+                    Symbol("RK_FOFC_CORRECTED_FLUX_",stage,"_B",bid)
+                add_structured_task!(builder,correction_id;
+                    depends=[face_average_id],
+                    reads=[face_average_resource,
+                           Symbol("RK_FOFC_FLAG_HALO_",stage,"_I",
+                                  fofc_iterations_int)],
+                    writes=[corrected_resource],exclusive=[:RK_SHARED_FLUX],
+                    start! = callback(:rk_fofc_correct))
+                final_flux_dependency = correction_id
+                final_flux_resource = corrected_resource
+            end
             add_structured_task!(builder, diffusive_id;
                 depends=[face_average_id], reads=[q_in,face_average_resource],
                 writes=[diffusive_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_diffusive_flux))
 
             if ct_mode
+                junction_payload_resource =
+                    Symbol("RK_JUNCTION_PAYLOAD_", stage, "_B", bid)
                 add_structured_task!(builder, edge_id;
-                    depends=[flux_id], reads=[point_flux_resource],
-                    writes=[edge_resource], exclusive=[:RK_SHARED_FLUX],
+                    depends=[flux_id,final_flux_dependency,diffusive_id],
+                    reads=[final_flux_resource,diffusive_resource],
+                    writes=[edge_resource,junction_payload_resource],
+                    exclusive=[:RK_SHARED_FLUX],
                     start! = callback(:rk_edge_emf))
-                source_dep = [diffusive_id,edge_id]
-                source_reads = [
-                    face_average_resource,diffusive_resource,edge_resource,
-                ]
+                if fofc
+                    scale_id = Symbol("rk",stage,"_fofc_scale_b",bid)
+                    scaled_transport_resource =
+                        Symbol("RK_FOFC_SCALED_TRANSPORT_",stage,"_B",bid)
+                    add_structured_task!(builder,scale_id;
+                        depends=[edge_id,diffusive_id],
+                        reads=[final_flux_resource,diffusive_resource,
+                               edge_resource,
+                               Symbol("RK_FOFC_FLAG_HALO_",stage,"_I",
+                                      fofc_iterations_int)],
+                        writes=[scaled_transport_resource],
+                        exclusive=[:RK_SHARED_FLUX],
+                        start! = callback(:rk_fofc_scale))
+                    source_dep = [scale_id]
+                    source_reads = [scaled_transport_resource,edge_resource]
+                else
+                    source_dep = [diffusive_id,edge_id]
+                    source_reads = [
+                        final_flux_resource,diffusive_resource,edge_resource,
+                    ]
+                end
             else
                 source_dep = [diffusive_id]
-                source_reads = [face_average_resource,diffusive_resource]
+                source_reads = [final_flux_resource,diffusive_resource]
             end
             add_structured_task!(builder, source_id;
                 depends=source_dep, reads=source_reads,
@@ -566,7 +811,7 @@ function build_structured_explicit_rk3_task_graph(
                 start! = callback(:rk_source))
             add_structured_task!(builder, div_id;
                 depends=[source_id], reads=[
-                    u_in,face_average_resource,diffusive_resource,source_resource,
+                    u_in,source_reads...,source_resource,
                 ],
                 writes=[u_out, div_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_divergence))
@@ -582,6 +827,16 @@ function build_structured_explicit_rk3_task_graph(
                 exclusive=[:RK_CT_MPI], collective_sequence=stage,
                 start! = callback(:rk_edge_sync))
 
+            junction_barrier = Symbol("rk", stage, "_junction_barrier")
+            add_structured_task!(builder, junction_barrier;
+                depends=[edge_barrier], reads=[
+                    Symbol("RK_EDGE_CANONICAL_", stage),
+                    [Symbol("RK_JUNCTION_PAYLOAD_", stage, "_B", bid)
+                     for bid in ids]...,
+                ], writes=[Symbol("RK_EDGE_JUNCTION_READY_", stage)],
+                exclusive=[:RK_CT_MPI], collective_sequence=stage,
+                start! = callback(:rk_junction_solve))
+
             face_ids = Symbol[]
             face_resources = Symbol[]
             for bid in ids
@@ -590,8 +845,9 @@ function build_structured_explicit_rk3_task_graph(
                 push!(face_ids, face_id)
                 push!(face_resources, face_resource)
                 add_structured_task!(builder, face_id;
-                    depends=[edge_barrier, div_ids[findfirst(==(bid), ids)]],
-                    reads=[Symbol("RK_EDGE_CANONICAL_", stage)],
+                    depends=[junction_barrier,
+                             div_ids[findfirst(==(bid), ids)]],
+                    reads=[Symbol("RK_EDGE_JUNCTION_READY_", stage)],
                     writes=[face_resource], exclusive=[:RK_FACE_B_UPDATE],
                     start! = callback(:rk_face_b_update))
             end
