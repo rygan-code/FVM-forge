@@ -144,6 +144,97 @@ end
 if !@isdefined(ct_point6_homogeneous_axes)
     const ct_point6_homogeneous_axes::NTuple{3,Bool} = (false,false,false)
 end
+if !@isdefined(ct_characteristic_ao_high_weight)
+    const ct_characteristic_ao_high_weight::FT = FT(0.85)
+end
+if !@isdefined(ct_characteristic_limiter_iterations)
+    const ct_characteristic_limiter_iterations::Int32 = Int32(16)
+end
+isfinite(ct_characteristic_ao_high_weight) &&
+    zero(FT) < ct_characteristic_ao_high_weight < one(FT) || error(
+        "ct_characteristic_ao_high_weight must lie strictly between zero and one",
+    )
+ct_characteristic_limiter_iterations > Int32(0) || error(
+    "ct_characteristic_limiter_iterations must be positive",
+)
+
+# CT-WENO7 uses one synchronized raw categorical troubled-cell mask. Each
+# consumer queries only the cells in its own stencil, so a normal WENO7
+# support, a tangential face quadrature, and an edge UCT support do not widen
+# one another. Other equation branches retain the legacy continuous pressure
+# sensor and therefore keep their established numerical behavior.
+const CT_TROUBLED_SMOOTH = Int32(0)
+const CT_TROUBLED_RECOVERABLE = Int32(1)
+const CT_TROUBLED_STRONG = Int32(2)
+if !@isdefined(ct_troubled_mask_enabled)
+    const ct_troubled_mask_enabled::Bool =
+        equation_type == :MHD && ct_mode &&
+        ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7
+end
+if !@isdefined(ct_troubled_state_enabled)
+    const ct_troubled_state_enabled::Bool = ct_troubled_mask_enabled
+end
+ct_troubled_state_enabled && !ct_troubled_mask_enabled && error(
+    "ct_troubled_state_enabled requires ct_troubled_mask_enabled",
+)
+
+# Consumer-local switches are diagnostic controls for separating dissipation
+# introduced by the synchronized categorical mask. They do not disable the
+# sensor itself, reconstruction admissibility recovery, FOFC, or junction UCT.
+if !@isdefined(ct_troubled_face_reconstruction_enabled)
+    const ct_troubled_face_reconstruction_enabled::Bool =
+        ct_troubled_mask_enabled
+end
+if !@isdefined(ct_troubled_face_p2a_enabled)
+    const ct_troubled_face_p2a_enabled::Bool = ct_troubled_mask_enabled
+end
+if !@isdefined(ct_troubled_edge_emf_enabled)
+    const ct_troubled_edge_emf_enabled::Bool = ct_troubled_mask_enabled
+end
+for (name,enabled) in (
+    (:ct_troubled_face_reconstruction_enabled,
+     ct_troubled_face_reconstruction_enabled),
+    (:ct_troubled_face_p2a_enabled,ct_troubled_face_p2a_enabled),
+    (:ct_troubled_edge_emf_enabled,ct_troubled_edge_emf_enabled),
+)
+    enabled && !ct_troubled_mask_enabled && error(
+        "$name requires ct_troubled_mask_enabled",
+    )
+end
+
+@inline ct_troubled_consumer_sensor(sensor,::Val{true}) = sensor
+@inline ct_troubled_consumer_sensor(sensor,::Val{false}) = nothing
+
+if !@isdefined(ct_troubled_compression_thresholds)
+    const ct_troubled_compression_thresholds::NTuple{2,FT} =
+        (FT(5.0e-2),FT(2.0e-1))
+end
+if !@isdefined(ct_troubled_pressure_jump_thresholds)
+    const ct_troubled_pressure_jump_thresholds::NTuple{2,FT} =
+        (FT(5.0e-2),FT(2.0e-1))
+end
+if !@isdefined(ct_troubled_pressure_curvature_thresholds)
+    const ct_troubled_pressure_curvature_thresholds::NTuple{2,FT} =
+        (FT(1.0e-1),FT(3.5e-1))
+end
+if !@isdefined(ct_troubled_total_pressure_jump_thresholds)
+    const ct_troubled_total_pressure_jump_thresholds::NTuple{2,FT} =
+        (FT(5.0e-2),FT(2.0e-1))
+end
+if !@isdefined(ct_troubled_total_pressure_curvature_thresholds)
+    const ct_troubled_total_pressure_curvature_thresholds::NTuple{2,FT} =
+        (FT(1.0e-1),FT(3.5e-1))
+end
+for (name,thresholds) in (
+    (:ct_troubled_compression_thresholds,ct_troubled_compression_thresholds),
+    (:ct_troubled_pressure_jump_thresholds,ct_troubled_pressure_jump_thresholds),
+    (:ct_troubled_pressure_curvature_thresholds,ct_troubled_pressure_curvature_thresholds),
+    (:ct_troubled_total_pressure_jump_thresholds,ct_troubled_total_pressure_jump_thresholds),
+    (:ct_troubled_total_pressure_curvature_thresholds,ct_troubled_total_pressure_curvature_thresholds),
+)
+    all(isfinite,thresholds) && zero(FT) <= thresholds[1] < thresholds[2] ||
+        error("$name must contain finite, ordered non-negative thresholds")
+end
 if !@isdefined(ct_first_order_flux_correction)
     const ct_first_order_flux_correction::Bool =
         equation_type == :MHD && ct_mode && strict_ct_positivity

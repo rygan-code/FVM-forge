@@ -41,6 +41,23 @@ end
     return left,right
 end
 
+@inline function _ct_weno_ao53_vector_interface(samples)
+    T=eltype(first(samples))
+    left=SVector{3,T}(ntuple(Val(3)) do component
+        values=SVector{5,T}(ntuple(
+            sample -> samples[sample+1][component],Val(5),
+        ))
+        ct_weno_ao53_point_left(values)
+    end)
+    right=SVector{3,T}(ntuple(Val(3)) do component
+        values=SVector{5,T}(ntuple(
+            sample -> samples[sample+2][component],Val(5),
+        ))
+        ct_weno_ao53_point_right(values)
+    end)
+    return left,right
+end
+
 @inline function ct_background_interface_field(
     background_cell, i, j, k, ss,
     normal_x, normal_y, normal_z, background_bn,
@@ -69,20 +86,22 @@ end
     Q, background_cell, i, j, k, ss,
     normal_x, normal_y, normal_z, background_bn,
     direction::Val{DIRECTION},
+    troubled_level::Int32=CT_TROUBLED_SMOOTH,
 ) where {DIRECTION}
     di = DIRECTION == 1 ? Int32(1) : Int32(0)
     dj = DIRECTION == 2 ? Int32(1) : Int32(0)
     dk = DIRECTION == 3 ? Int32(1) : Int32(0)
-    perturbation_samples = ntuple(Val(8)) do sample
-        offset = Int32(sample-4)
-        perturbation, _ = _ct_background_split_sample(
-            Q,background_cell,
-            i+offset*di,j+offset*dj,k+offset*dk,
-        )
-        perturbation
+    if troubled_level >= CT_TROUBLED_RECOVERABLE
+        perturbation_left,perturbation_right =
+            _ct_background_split_perturbation_weno_ao53(
+                Q,background_cell,i,j,k,di,dj,dk,
+            )
+    else
+        perturbation_left,perturbation_right =
+            _ct_background_split_perturbation_weno7(
+                Q,background_cell,i,j,k,di,dj,dk,ss,
+            )
     end
-    perturbation_left,perturbation_right =
-        _ct_weno7_vector_interface(perturbation_samples,ss)
     background_face = ct_background_interface_field(
         background_cell,i,j,k,ss,
         normal_x,normal_y,normal_z,background_bn,direction,
@@ -91,15 +110,79 @@ end
            background_face+perturbation_right,background_face
 end
 
+@inline function _ct_background_split_perturbation_weno_ao53(
+    Q,background_cell,i,j,k,di,dj,dk,
+)
+    samples=ntuple(Val(8)) do sample
+        offset=Int32(sample-4)
+        perturbation,_=_ct_background_split_sample(
+            Q,background_cell,
+            i+offset*di,j+offset*dj,k+offset*dk,
+        )
+        perturbation
+    end
+    return _ct_weno_ao53_vector_interface(samples)
+end
+
+@inline function _ct_background_split_perturbation_first_order(
+    Q,background_cell,i,j,k,di,dj,dk,
+)
+    left,_ = _ct_background_split_sample(Q,background_cell,i,j,k)
+    right,_ = _ct_background_split_sample(
+        Q,background_cell,i+di,j+dj,k+dk,
+    )
+    return left,right
+end
+
+@inline function _ct_background_split_perturbation_plm(
+    Q,background_cell,i,j,k,di,dj,dk,
+)
+    samples = ntuple(Val(4)) do sample
+        offset = Int32(sample-2)
+        perturbation,_ = _ct_background_split_sample(
+            Q,background_cell,
+            i+offset*di,j+offset*dj,k+offset*dk,
+        )
+        perturbation
+    end
+    left=SVector{3,FT}(ntuple(Val(3)) do component
+        ct_plm_plus(
+            samples[1][component],samples[2][component],samples[3][component],
+        )
+    end)
+    right=SVector{3,FT}(ntuple(Val(3)) do component
+        ct_plm_minus(
+            samples[2][component],samples[3][component],samples[4][component],
+        )
+    end)
+    return left,right
+end
+
+@inline function _ct_background_split_perturbation_weno7(
+    Q,background_cell,i,j,k,di,dj,dk,ss,
+)
+    samples = ntuple(Val(8)) do sample
+        offset = Int32(sample-4)
+        perturbation,_ = _ct_background_split_sample(
+            Q,background_cell,
+            i+offset*di,j+offset*dj,k+offset*dk,
+        )
+        perturbation
+    end
+    return _ct_weno7_vector_interface(samples,ss)
+end
+
 @inline function ct_background_split_interface_states(
     left_state, right_state, Q, background_cell,
     i, j, k, ss, normal_x, normal_y, normal_z, background_bn,
     ::Val{DIRECTION},
+    troubled_level::Int32=CT_TROUBLED_SMOOTH,
 ) where {DIRECTION}
     magnetic_left,magnetic_right,background_face =
         ct_background_split_interface_magnetic(
             Q,background_cell,i,j,k,ss,
             normal_x,normal_y,normal_z,background_bn,Val(DIRECTION),
+            troubled_level,
         )
     left_state = ct_impose_magnetic_preserve_p(
         left_state,magnetic_left,
@@ -173,59 +256,18 @@ end
     end
 end
 
-@inline function _ct_primitive_is_physical(state)
-    return isfinite(state[1]) && state[1] > zero(FT) &&
-           isfinite(state[5]) && state[5] > zero(FT) &&
-           all(isfinite, state)
-end
-
 @inline function _ct_record_characteristic_recovery!(
     pos_meta, recovery_mode::Int32,
 )
     pos_meta === nothing && return nothing
-    if recovery_mode >= Int32(1)
+    if recovery_mode == Int32(2)
+        ct_record_fallback!(pos_meta,CT_POS_CHARACTERISTIC_LIMIT_COUNT)
+    elseif recovery_mode == Int32(3)
         ct_record_fallback!(pos_meta, CT_POS_WENO_TO_PLM_COUNT)
-    end
-    if recovery_mode >= Int32(2)
+    elseif recovery_mode >= Int32(4)
         ct_record_fallback!(pos_meta, CT_POS_PLM_TO_FIRST_COUNT)
     end
     return nothing
-end
-
-@inline function _ct_characteristic_weno7_admissible(
-    stencil::NTuple{7,SVector{9,T}},
-    nx::T, ny::T, nz::T, face_bn::T, gamma::T,
-    ::Val{SIDE},
-) where {T,SIDE}
-    primitive_state = if SIDE == 1
-        ct_mhd_characteristic_weno7_left(
-            stencil..., nx, ny, nz, face_bn, gamma,
-        )
-    else
-        ct_mhd_characteristic_weno7_right(
-            stencil..., nx, ny, nz, face_bn, gamma,
-        )
-    end
-    recovery_mode = Int32(0)
-    if !_ct_primitive_is_physical(primitive_state)
-        recovery_mode = Int32(1)
-        primitive_state = if SIDE == 1
-            ct_mhd_characteristic_plm_plus(
-                stencil[3], stencil[4], stencil[5],
-                nx, ny, nz, face_bn, gamma,
-            )
-        else
-            ct_mhd_characteristic_plm_minus(
-                stencil[3], stencil[4], stencil[5],
-                nx, ny, nz, face_bn, gamma,
-            )
-        end
-        if !_ct_primitive_is_physical(primitive_state)
-            recovery_mode = Int32(2)
-            primitive_state = stencil[4]
-        end
-    end
-    return primitive_state, recovery_mode
 end
 
 @inline function _ct_finalize_characteristic_state!(
@@ -272,8 +314,8 @@ end
     right_state = SVector{9,FT}(
         ntuple(n -> @inbounds(right_states[fi, fj, fk, n]), Val(9)),
     )
-    flux_value = HLLD_Flux(
-        left_state, right_state, nx, ny, nz, ch_glm, pos_meta,
+    flux_value=HLLD_Flux(
+        left_state,right_state,nx,ny,nz,ch_glm,pos_meta,
     )
     if background !== nothing
         flux_value = ct_remove_background_maxwell_stress(
@@ -287,10 +329,54 @@ end
     return
 end
 
+@inline function _ct_mask_level(value)
+    if !isfinite(value) || value >= typeof(value)(CT_TROUBLED_STRONG)
+        return CT_TROUBLED_STRONG
+    elseif value >= typeof(value)(CT_TROUBLED_RECOVERABLE)
+        return CT_TROUBLED_RECOVERABLE
+    end
+    return CT_TROUBLED_SMOOTH
+end
+
+@inline function ct_face_troubled_level(
+    ::Nothing,i,j,k,::Val{DIRECTION},
+) where {DIRECTION}
+    return CT_TROUBLED_SMOOTH
+end
+
+@inline function ct_face_troubled_level(
+    sensor,i,j,k,::Val{DIRECTION},
+) where {DIRECTION}
+    di=DIRECTION == 1 ? Int32(1) : Int32(0)
+    dj=DIRECTION == 2 ? Int32(1) : Int32(0)
+    dk=DIRECTION == 3 ? Int32(1) : Int32(0)
+    @inbounds left=sensor[i,j,k]
+    @inbounds right=sensor[i+di,j+dj,k+dk]
+    (!isfinite(left) || !isfinite(right)) && return CT_TROUBLED_STRONG
+    adjacent_level=_ct_mask_level(max(left,right))
+    adjacent_level >= CT_TROUBLED_STRONG && return CT_TROUBLED_STRONG
+    support_is_troubled=adjacent_level >= CT_TROUBLED_RECOVERABLE
+    # Union of the left and right WENO7 supports at this face. Keeping this
+    # dilation normal to the face prevents a shock from affecting unrelated
+    # tangential rows. Either troubled category selects characteristic AO;
+    # only an actually inadmissible candidate may trigger further recovery.
+    for offset in Int32(-3):Int32(4)
+        @inbounds sample=sensor[
+            i+offset*di,j+offset*dj,k+offset*dk,
+        ]
+        if !isfinite(sample) ||
+           _ct_mask_level(sample) >= CT_TROUBLED_RECOVERABLE
+            support_is_troubled=true
+        end
+    end
+    return support_is_troubled ?
+        CT_TROUBLED_RECOVERABLE : CT_TROUBLED_SMOOTH
+end
+
 @inline function _ct_mhd_characteristic_reconstruct_kernel!(
     Q, states, area_array, nx_array, ny_array, nz_array, face_b,
     background_face, background_cell,
-    nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
+    nxp, nyp, nzp, mode::Int32, pos_meta, pos_values, sensor,
     ::Val{DIRECTION}, ::Val{SIDE},
 ) where {DIRECTION,SIDE}
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -339,6 +425,13 @@ end
         )
     end
 
+    troubled_level=ct_face_troubled_level(
+        ct_troubled_consumer_sensor(
+            sensor,Val(ct_troubled_face_reconstruction_enabled),
+        ),
+        i,j,k,Val(DIRECTION),
+    )
+
     if ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7
         first_offset = SIDE == 1 ? Int32(-3) : Int32(-2)
         stencil = ntuple(Val(7)) do s
@@ -348,8 +441,9 @@ end
             )
         end
         primitive_state, recovery_mode =
-            _ct_characteristic_weno7_admissible(
-                stencil, nx, ny, nz, face_bn, FT(γ), Val(SIDE),
+            _ct_characteristic_candidate_admissible(
+                stencil,nx,ny,nz,face_bn,FT(γ),Val(SIDE),
+                troubled_level >= CT_TROUBLED_RECOVERABLE,
             )
         _ct_record_characteristic_recovery!(pos_meta, recovery_mode)
     elseif SIDE == 1
@@ -394,7 +488,7 @@ end
         magnetic_left,magnetic_right,_ =
             ct_background_split_interface_magnetic(
                 Q,background_cell,i,j,k,split_ss,
-                nx,ny,nz,background_bn,Val(DIRECTION),
+                nx,ny,nz,background_bn,Val(DIRECTION),troubled_level,
             )
         magnetic = SIDE == 1 ? magnetic_left : magnetic_right
         _ct_finalize_characteristic_state!(
@@ -409,66 +503,66 @@ end
 function ct_mhd_characteristic_reconstruct_left_i_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(1), Val(1),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(1),Val(1),
     )
 end
 
 function ct_mhd_characteristic_reconstruct_right_i_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(1), Val(2),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(1),Val(2),
     )
 end
 
 function ct_mhd_characteristic_reconstruct_left_j_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(2), Val(1),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(2),Val(1),
     )
 end
 
 function ct_mhd_characteristic_reconstruct_right_j_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(2), Val(2),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(2),Val(2),
     )
 end
 
 function ct_mhd_characteristic_reconstruct_left_k_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(3), Val(1),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(3),Val(1),
     )
 end
 
 function ct_mhd_characteristic_reconstruct_right_k_kernel!(
     Q, states, area, nx, ny, nz, face_b,
     nxp, nyp, nzp, mode::Int32, pos_meta, pos_values,
-    background_face=nothing, background_cell=nothing,
+    background_face=nothing, background_cell=nothing, sensor=nothing,
 )
     _ct_mhd_characteristic_reconstruct_kernel!(
         Q, states, area, nx, ny, nz, face_b, background_face, background_cell,
-        nxp, nyp, nzp, mode, pos_meta, pos_values, Val(3), Val(2),
+        nxp,nyp,nzp,mode,pos_meta,pos_values,sensor,Val(3),Val(2),
     )
 end
 
@@ -476,7 +570,7 @@ end
     left_states, right_states, flux, rho_sum,
     area_array, nx_array, ny_array, nz_array,
     nxp, nyp, nzp, ch_glm::FT, mode::Int32, pos_meta,
-    background_face, background_cell,
+    background_face, background_cell, sensor,
     ::Val{DIRECTION},
 ) where {DIRECTION}
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -548,36 +642,36 @@ end
 function ct_mhd_hlld_flux_i_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta, background_face=nothing, background_cell=nothing,
+    pos_meta,background_face=nothing,background_cell=nothing,sensor=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
         area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
-        background_face, background_cell, Val(1),
+        background_face,background_cell,sensor,Val(1),
     )
 end
 
 function ct_mhd_hlld_flux_j_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta, background_face=nothing, background_cell=nothing,
+    pos_meta,background_face=nothing,background_cell=nothing,sensor=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
         area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
-        background_face, background_cell, Val(2),
+        background_face,background_cell,sensor,Val(2),
     )
 end
 
 function ct_mhd_hlld_flux_k_kernel!(
     left_states, right_states, flux, rho_sum,
     area, nx, ny, nz, nxp, nyp, nzp, ch_glm::FT, mode::Int32,
-    pos_meta, background_face=nothing, background_cell=nothing,
+    pos_meta,background_face=nothing,background_cell=nothing,sensor=nothing,
 )
     _ct_mhd_hlld_flux_kernel!(
         left_states, right_states, flux, rho_sum,
         area, nx, ny, nz, nxp, nyp, nzp, ch_glm, mode, pos_meta,
-        background_face, background_cell, Val(3),
+        background_face,background_cell,sensor,Val(3),
     )
 end
 
@@ -819,7 +913,7 @@ end
 @inline function _ct_mhd_characteristic_weno7_cache_kernel!(
     Q, cache, area_array, nx_array, ny_array, nz_array,
     face_b, background_face, background_cell, Vol,
-    nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32, pos_meta,
+    nxp,nyp,nzp,ch_glm::FT,dt_stage::FT,mode::Int32,pos_meta,sensor,
     ::Val{DIRECTION},
 ) where {DIRECTION}
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
@@ -868,6 +962,12 @@ end
         )
     end
 
+    troubled_level=ct_face_troubled_level(
+        ct_troubled_consumer_sensor(
+            sensor,Val(ct_troubled_face_reconstruction_enabled),
+        ),
+        i,j,k,Val(DIRECTION),
+    )
     if ct_characteristic_reconstruction == CT_CHARACTERISTIC_WENO7
         stencil = ntuple(Val(8)) do s
             offset = Int32(s-4)
@@ -876,14 +976,16 @@ end
             )
         end
         left_primitive, left_recovery =
-            _ct_characteristic_weno7_admissible(
+            _ct_characteristic_candidate_admissible(
                 ntuple(index -> stencil[index], Val(7)),
-                nx, ny, nz, face_bn, FT(γ), Val(1),
+                nx,ny,nz,face_bn,FT(γ),Val(1),
+                troubled_level >= CT_TROUBLED_RECOVERABLE,
             )
         right_primitive, right_recovery =
-            _ct_characteristic_weno7_admissible(
+            _ct_characteristic_candidate_admissible(
                 ntuple(index -> stencil[index+1], Val(7)),
-                nx, ny, nz, face_bn, FT(γ), Val(2),
+                nx,ny,nz,face_bn,FT(γ),Val(2),
+                troubled_level >= CT_TROUBLED_RECOVERABLE,
             )
         _ct_record_characteristic_recovery!(pos_meta, left_recovery)
         _ct_record_characteristic_recovery!(pos_meta, right_recovery)
@@ -932,6 +1034,7 @@ end
             ct_background_split_interface_states(
                 left_state,right_state,Q,background_cell,
                 i,j,k,split_ss,nx,ny,nz,background_bn,Val(DIRECTION),
+                troubled_level,
             )
     end
     left_state = ct_impose_face_bn_preserve_p(
@@ -940,8 +1043,8 @@ end
     right_state = ct_impose_face_bn_preserve_p(
         right_state, nx, ny, nz, face_bn,
     )
-    flux_temp = HLLD_Flux(
-        left_state, right_state, nx, ny, nz, ch_glm, pos_meta,
+    flux_temp=HLLD_Flux(
+        left_state,right_state,nx,ny,nz,ch_glm,pos_meta,
     )
     if background !== nothing
         flux_temp = ct_remove_background_maxwell_stress(
@@ -976,12 +1079,13 @@ end
 function ct_mhd_characteristic_weno7_cache_i_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing, background_cell=nothing, pos_meta=nothing,
+    background_face=nothing,background_cell=nothing,pos_meta=nothing,
+    sensor=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
         Q, cache, area, nx, ny, nz,
         face_b, background_face, background_cell, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(1),
+        nxp,nyp,nzp,ch_glm,dt_stage,mode,pos_meta,sensor,Val(1),
     )
 end
 
@@ -989,12 +1093,13 @@ end
 function ct_mhd_characteristic_weno7_cache_j_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing, background_cell=nothing, pos_meta=nothing,
+    background_face=nothing,background_cell=nothing,pos_meta=nothing,
+    sensor=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
         Q, cache, area, nx, ny, nz,
         face_b, background_face, background_cell, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(2),
+        nxp,nyp,nzp,ch_glm,dt_stage,mode,pos_meta,sensor,Val(2),
     )
 end
 
@@ -1002,12 +1107,13 @@ end
 function ct_mhd_characteristic_weno7_cache_k_kernel!(
     Q, cache, area, nx, ny, nz, face_b, Vol,
     nxp, nyp, nzp, ch_glm::FT, dt_stage::FT, mode::Int32,
-    background_face=nothing, background_cell=nothing, pos_meta=nothing,
+    background_face=nothing,background_cell=nothing,pos_meta=nothing,
+    sensor=nothing,
 )
     _ct_mhd_characteristic_weno7_cache_kernel!(
         Q, cache, area, nx, ny, nz,
         face_b, background_face, background_cell, Vol,
-        nxp, nyp, nzp, ch_glm, dt_stage, mode, pos_meta, Val(3),
+        nxp,nyp,nzp,ch_glm,dt_stage,mode,pos_meta,sensor,Val(3),
     )
 end
 

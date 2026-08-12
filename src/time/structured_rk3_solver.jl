@@ -1608,40 +1608,40 @@ function compute_structured_point_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, Fz,
     if eigen_reconstruction && equation_type == :MHD && ct_mode
         # F* temporarily stores left states and Fv_* stores right states. HLLD
         # consumes them immediately; viscous/resistive kernels overwrite Fv_* below.
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_left_i_kernel!(Q, Fx, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_right_i_kernel!(Q, Fv_x, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_hlld_flux_i_kernel!(Fx, Fv_x, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0x_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_left_i_kernel!(Q, Fx, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_characteristic_reconstruct_right_i_kernel!(Q, Fv_x, Areai, nxi, nyi, nzi, block.Bx_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0x_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_i blocks=nb_recon_i ct_mhd_hlld_flux_i_kernel!(Fx, Fv_x, Fx, rho_sum_x, Areai, nxi, nyi, nzi, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0x_face, block.B0_cell, ϕ)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fx, "Fx after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_i blocks=nb_weno_i ct_mhd_characteristic_weno7_cache_i_kernel!(Q, cache_i, Areai, nxi, nyi, nzi, block.Bx_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0x_face, block.B0_cell, pos_meta)
+            @gpu_launch threads=threads_recon_i blocks=nb_weno_i ct_mhd_characteristic_weno7_cache_i_kernel!(Q, cache_i, Areai, nxi, nyi, nzi, block.Bx_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0x_face, block.B0_cell, pos_meta, ϕ)
         end
 
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_left_j_kernel!(Q, Fy, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_right_j_kernel!(Q, Fv_y, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_hlld_flux_j_kernel!(Fy, Fv_y, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0y_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_left_j_kernel!(Q, Fy, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_characteristic_reconstruct_right_j_kernel!(Q, Fv_y, Areaj, nxj, nyj, nzj, block.By_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0y_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_j blocks=nb_recon_j ct_mhd_hlld_flux_j_kernel!(Fy, Fv_y, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0y_face, block.B0_cell, ϕ)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fy, "Fy after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_j blocks=nb_weno_j ct_mhd_characteristic_weno7_cache_j_kernel!(Q, cache_j, Areaj, nxj, nyj, nzj, block.By_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0y_face, block.B0_cell, pos_meta)
+            @gpu_launch threads=threads_recon_j blocks=nb_weno_j ct_mhd_characteristic_weno7_cache_j_kernel!(Q, cache_j, Areaj, nxj, nyj, nzj, block.By_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0y_face, block.B0_cell, pos_meta, ϕ)
         end
 
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_left_k_kernel!(Q, Fz, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_right_k_kernel!(Q, Fv_z, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell)
-        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_hlld_flux_k_kernel!(Fz, Fv_z, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0z_face, block.B0_cell)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_left_k_kernel!(Q, Fz, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_characteristic_reconstruct_right_k_kernel!(Q, Fv_z, Areak, nxk, nyk, nzk, block.Bz_face, nxp, nyp, nzp, Int32(0), pos_meta, pos_values, block.B0z_face, block.B0_cell, ϕ)
+        @gpu_launch threads=threads_recon_k blocks=nb_recon_k ct_mhd_hlld_flux_k_kernel!(Fz, Fv_z, Fz, rho_sum_z, Areak, nxk, nyk, nzk, nxp, nyp, nzp, ch_glm_current, Int32(0), pos_meta, block.B0z_face, block.B0_cell, ϕ)
         @static if strict_ct_positivity
             gpu_sync()
             ct_check_positivity_or_abort!(pos_meta, pos_values; rank=world_rank, block=block.id, step=tt, rk_stage=rk_stage)
         end
         @check_nan(Fz, "Fz after split characteristic HLLD", block.id, world_rank, tt)
         @static if ct_emf_scheme == CT_EMF_WENO7_SG07
-            @gpu_launch threads=threads_recon_k blocks=nb_weno_k ct_mhd_characteristic_weno7_cache_k_kernel!(Q, cache_k, Areak, nxk, nyk, nzk, block.Bz_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0z_face, block.B0_cell, pos_meta)
+            @gpu_launch threads=threads_recon_k blocks=nb_weno_k ct_mhd_characteristic_weno7_cache_k_kernel!(Q, cache_k, Areak, nxk, nyk, nzk, block.Bz_face, Vol, nxp, nyp, nzp, ch_glm_current, dt, Int32(0), block.B0z_face, block.B0_cell, pos_meta, ϕ)
         end
     elseif eigen_reconstruction
         @gpu_launch threads=threads_recon_i blocks=nb_recon_i Eigen_reconstruct_i(Q, U, ϕ, Areai, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nzp, si, Δsi, lpi, sRi, ΔsRi, ch_glm_current, Int32(0))
@@ -1701,20 +1701,25 @@ function average_structured_point_face_fluxes!(
     second_i=(cld(nxp+Int32(1),nthreads[1]),cld(nyp,nthreads[2]),cld(nzp,nthreads[3]))
     second_j=(cld(nxp,nthreads[1]),cld(nyp+Int32(1),nthreads[2]),cld(nzp,nthreads[3]))
     second_k=(cld(nxp,nthreads[1]),cld(nyp,nthreads[2]),cld(nzp+Int32(1),nthreads[3]))
+    p2a_sensor = sensor
+    @static if ct_troubled_mask_enabled &&
+               !ct_troubled_face_p2a_enabled
+        p2a_sensor = nothing
+    end
     @gpu_launch threads=nthreads blocks=first_i structured_face_p2a_first_kernel!(
-        scratch_x,Fx,nxp,nyp,nzp,Val(1),pos_meta,sensor,FT(hybrid_ϕ1))
+        scratch_x,Fx,nxp,nyp,nzp,Val(1),pos_meta,p2a_sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_i structured_face_p2a_second_kernel!(
-        Fx,scratch_x,Fx,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(1),
+        Fx,scratch_x,Fx,p2a_sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(1),
         pos_meta)
     @gpu_launch threads=nthreads blocks=first_j structured_face_p2a_first_kernel!(
-        scratch_y,Fy,nxp,nyp,nzp,Val(2),pos_meta,sensor,FT(hybrid_ϕ1))
+        scratch_y,Fy,nxp,nyp,nzp,Val(2),pos_meta,p2a_sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_j structured_face_p2a_second_kernel!(
-        Fy,scratch_y,Fy,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(2),
+        Fy,scratch_y,Fy,p2a_sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(2),
         pos_meta)
     @gpu_launch threads=nthreads blocks=first_k structured_face_p2a_first_kernel!(
-        scratch_z,Fz,nxp,nyp,nzp,Val(3),pos_meta,sensor,FT(hybrid_ϕ1))
+        scratch_z,Fz,nxp,nyp,nzp,Val(3),pos_meta,p2a_sensor,FT(hybrid_ϕ1))
     @gpu_launch threads=nthreads blocks=second_k structured_face_p2a_second_kernel!(
-        Fz,scratch_z,Fz,sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(3),
+        Fz,scratch_z,Fz,p2a_sensor,nxp,nyp,nzp,FT(hybrid_ϕ1),Val(3),
         pos_meta)
     return nothing
 end
@@ -2037,6 +2042,77 @@ function compute_structured_boundary_face_fluxes!(block::Block, dt, ϕ, Fx, Fy, 
     # viscous was already computed on compute_stream and is now complete
     # (copyto! in sync_blocks forced device sync). Boundary viscous overwrites
     # boundary faces; interior faces remain from the compute_stream pass.
+end
+
+@inline function _ct_troubled_periodic_face_mask(face_bc, bid)
+    return ntuple(Val(6)) do face_id
+        direction = (face_id + 1) ÷ 2
+        base_periodic = Bool(Iperiodic[direction])
+        bc_id = get(face_bc, (bid, face_id), BC_INTERBLOCK)
+        base_periodic && Int32(bc_id) == Int32(BC_PERIODIC)
+    end
+end
+
+Base.@noinline function _sync_ct_troubled_mask!(
+    blocks, connectivity, Block_Nprocs, rank_offsets,
+    Nx_b, Ny_b, Nz_b, ghost_pool, block_comms, face_bc,
+)
+    gpu_sync()
+    mask_arrays = Dict(
+        bid => reshape(b.ϕ, size(b.ϕ, 1), size(b.ϕ, 2), size(b.ϕ, 3), 1)
+        for (bid, b) in blocks
+    )
+    copy_ghost_face!(
+        blocks, connectivity, Block_Nprocs, rank_offsets,
+        Nx_b, Ny_b, Nz_b, :ϕ, 1, ghost_pool;
+        full_range=false, target_arrays=mask_arrays,
+    )
+    for (bid, b) in blocks
+        exchange_ghost(
+            mask_arrays[bid], 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
+            b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
+            b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
+            b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
+            sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
+            rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2,
+            periodic_faces=_ct_troubled_periodic_face_mask(face_bc, bid),
+            rank_coords=(b.rx, b.ry, b.rz),
+            rank_dims=Tuple(Block_Nprocs[bid + 1]),
+        )
+    end
+    copy_ghost_face!(
+        blocks, connectivity, Block_Nprocs, rank_offsets,
+        Nx_b, Ny_b, Nz_b, :ϕ, 1, ghost_pool;
+        full_range=true, delta_mode=true, target_arrays=mask_arrays,
+    )
+    gpu_sync()
+    return nothing
+end
+
+struct CTTroubledMaskTaskContext
+    blocks::Any
+    connectivity::Any
+    block_nprocs::Any
+    rank_offsets::Any
+    nx_b::Any
+    ny_b::Any
+    nz_b::Any
+    ghost_pool::Any
+    block_comms::Any
+    face_bc::Any
+end
+
+Base.@noinline function _ct_troubled_mask_halo_task!(
+    task_context::CTTroubledMaskTaskContext,
+)
+    _sync_ct_troubled_mask!(
+        task_context.blocks, task_context.connectivity,
+        task_context.block_nprocs, task_context.rank_offsets,
+        task_context.nx_b, task_context.ny_b, task_context.nz_b,
+        task_context.ghost_pool, task_context.block_comms,
+        task_context.face_bc,
+    )
+    return StructuredTaskDone
 end
 
 
@@ -3514,50 +3590,50 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         cfg_state_left_i = auto_tune_kernel("CTMHD_charL_i", ct_mhd_characteristic_reconstruct_left_i_kernel!,
             first_b.Q, shared_Fx,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi, first_b.Bx_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_i = auto_tune_kernel("CTMHD_charR_i", ct_mhd_characteristic_reconstruct_right_i_kernel!,
             first_b.Q, shared_Fvx,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi, first_b.Bx_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0x_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_i = auto_tune_kernel("CTMHD_hlld_i", ct_mhd_hlld_flux_i_kernel!,
             shared_Fx, shared_Fvx, shared_Fx, shared_rho_sum_x,
             first_b.Areai, first_b.nxi, first_b.nyi, first_b.nzi,
             nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
-            first_b.B0x_face, first_b.B0_cell;
+            first_b.B0x_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_left_j = auto_tune_kernel("CTMHD_charL_j", ct_mhd_characteristic_reconstruct_left_j_kernel!,
             first_b.Q, shared_Fy,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj, first_b.By_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_j = auto_tune_kernel("CTMHD_charR_j", ct_mhd_characteristic_reconstruct_right_j_kernel!,
             first_b.Q, shared_Fvy,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj, first_b.By_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0y_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_j = auto_tune_kernel("CTMHD_hlld_j", ct_mhd_hlld_flux_j_kernel!,
             shared_Fy, shared_Fvy, shared_Fy, shared_rho_sum_y,
             first_b.Areaj, first_b.nxj, first_b.nyj, first_b.nzj,
             nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
-            first_b.B0y_face, first_b.B0_cell;
+            first_b.B0y_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_left_k = auto_tune_kernel("CTMHD_charL_k", ct_mhd_characteristic_reconstruct_left_k_kernel!,
             first_b.Q, shared_Fz,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk, first_b.Bz_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_state_right_k = auto_tune_kernel("CTMHD_charR_k", ct_mhd_characteristic_reconstruct_right_k_kernel!,
             first_b.Q, shared_Fvz,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk, first_b.Bz_face,
-            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell;
+            nxp_t, nyp_t, nzp_t, Int32(0), shared_ct_pos_meta, shared_ct_pos_values, first_b.B0z_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         cfg_recon_k = auto_tune_kernel("CTMHD_hlld_k", ct_mhd_hlld_flux_k_kernel!,
             shared_Fz, shared_Fvz, shared_Fz, shared_rho_sum_z,
             first_b.Areak, first_b.nxk, first_b.nyk, first_b.nzk,
             nxp_t, nyp_t, nzp_t, ch_glm_current, Int32(0), shared_ct_pos_meta,
-            first_b.B0z_face, first_b.B0_cell;
+            first_b.B0z_face, first_b.B0_cell, first_b.ϕ;
             nxp=nxp_t, nyp=nyp_t, nzp=nzp_t, verbose=_verbose)
         push!(tune_configs,
             cfg_state_left_i, cfg_state_right_i,
@@ -4667,43 +4743,99 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     structured_rk_task_callbacks[:rk_shock] =
         (ctx, rt, node) -> begin
             stage = _structured_rk_stage_from_node(node)
-            stage == 1 || return StructuredTaskDone
             state = structured_rk_task_state[]
+            @static if !ct_troubled_mask_enabled
+                stage == 1 || return StructuredTaskDone
+            end
             for (_, b) in blocks
                 nb_l = (
                     Int32(cld(b.Nx+2*NG, threads_light[1])),
                     Int32(cld(b.Ny+2*NG, threads_light[2])),
                     Int32(cld(b.Nz+2*NG, threads_light[3])),
                 )
-                @gpu_launch threads=threads_light blocks=nb_l shockSensor(
-                    b.ϕ, b.Q, b.Nx, b.Ny, b.Nz,
+                @static if ct_troubled_mask_enabled
+                    @gpu_launch threads=threads_light blocks=nb_l ct_troubled_cell_sensor_kernel!(
+                        b.ϕ,b.Q,b.Vol,
+                        b.Areai,b.nxi,b.nyi,b.nzi,
+                        b.Areaj,b.nxj,b.nyj,b.nzj,
+                        b.Areak,b.nxk,b.nyk,b.nzk,
+                        Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
+                    )
+                else
+                    @gpu_launch threads=threads_light blocks=nb_l shockSensor(
+                        b.ϕ,b.Q,b.Nx,b.Ny,b.Nz,
+                    )
+                end
+                @check_nan(
+                    b.ϕ,"ϕ after task graph shock sensor",
+                    b.id,world_rank,state[:tt],
                 )
-                @check_nan(b.ϕ, "ϕ after task graph shockSensor",
-                           b.id, world_rank, state[:tt])
             end
             StructuredTaskDone
         end
-    structured_rk_task_callbacks[:rk_shock_halo] =
-        (ctx, rt, node) -> begin
-            _structured_rk_stage_from_node(node) == 1 ||
-                return StructuredTaskDone
-            state = structured_rk_task_state[]
-            for (bid, b) in blocks
-                ϕ_4d = reshape(b.ϕ, size(b.ϕ, 1), size(b.ϕ, 2),
-                                size(b.ϕ, 3), 1)
-                exchange_ghost(
-                    ϕ_4d, 1, block_comms[bid], b.Nx, b.Ny, b.Nz,
-                    b.sbuf_hx, b.sbuf_dx, b.rbuf_hx, b.rbuf_dx,
-                    b.sbuf_hy, b.sbuf_dy, b.rbuf_hy, b.rbuf_dy,
-                    b.sbuf_hz, b.sbuf_dz, b.rbuf_hz, b.rbuf_dz;
-                    sbuf_hx2=b.sbuf_hx2, sbuf_dx2=b.sbuf_dx2,
-                    rbuf_hx2=b.rbuf_hx2, rbuf_dx2=b.rbuf_dx2,
-                    periodic_faces=_structured_periodic_face_mask(bid),
-                    rank_coords=(b.rx, b.ry, b.rz),
-                    rank_dims=Tuple(Block_Nprocs[bid + 1]),
-                )
+    @static if ct_troubled_mask_enabled
+        troubled_mask_task_context = CTTroubledMaskTaskContext(
+            blocks, connectivity, Block_Nprocs, rank_offsets,
+            Nx_b, Ny_b, Nz_b, ghost_pool, block_comms, face_bc,
+        )
+        structured_rk_task_callbacks[:rk_shock_halo] =
+            let task_context = troubled_mask_task_context
+                (ctx, rt, node) -> _ct_troubled_mask_halo_task!(task_context)
             end
-            gpu_sync()
+    else
+        structured_rk_task_callbacks[:rk_shock_halo] =
+            (ctx, rt, node) -> begin
+                stage = _structured_rk_stage_from_node(node)
+                stage == 1 || return StructuredTaskDone
+                for (bid,b) in blocks
+                    ϕ_4d=reshape(
+                        b.ϕ,size(b.ϕ,1),size(b.ϕ,2),size(b.ϕ,3),1,
+                    )
+                    exchange_ghost(
+                        ϕ_4d,1,block_comms[bid],b.Nx,b.Ny,b.Nz,
+                        b.sbuf_hx,b.sbuf_dx,b.rbuf_hx,b.rbuf_dx,
+                        b.sbuf_hy,b.sbuf_dy,b.rbuf_hy,b.rbuf_dy,
+                        b.sbuf_hz,b.sbuf_dz,b.rbuf_hz,b.rbuf_dz;
+                        sbuf_hx2=b.sbuf_hx2,sbuf_dx2=b.sbuf_dx2,
+                        rbuf_hx2=b.rbuf_hx2,rbuf_dx2=b.rbuf_dx2,
+                        periodic_faces=_structured_periodic_face_mask(bid),
+                        rank_coords=(b.rx,b.ry,b.rz),
+                        rank_dims=Tuple(Block_Nprocs[bid+1]),
+                    )
+                end
+                gpu_sync()
+                StructuredTaskDone
+            end
+    end
+
+    structured_rk_task_callbacks[:rk_troubled_state]=
+        (ctx,rt,node)->begin
+            @static if ct_troubled_state_enabled
+                ct_derivation_halo_plan === nothing && error(
+                    "CT troubled-state derivation halo was not initialized",
+                )
+                for (bid,b) in blocks
+                    rank_coordinates=(Int(b.rx),Int(b.ry),Int(b.rz))
+                    rank_dimensions=Tuple(Int.(Block_Nprocs[bid+1]))
+                    physical_faces=ntuple(Val(6)) do face_id
+                        direction=fld(face_id+1,2)
+                        owns_face=isodd(face_id) ?
+                            rank_coordinates[direction]==0 :
+                            rank_coordinates[direction]==rank_dimensions[direction]-1
+                        boundary_type=Int32(get(
+                            face_bc,(bid,face_id),BC_INTERBLOCK,
+                        ))
+                        owns_face && _ct_is_physical_boundary_type(boundary_type)
+                    end
+                    ct_apply_troubled_q!(
+                        b,ct_derivation_halo_plan.halos[bid],
+                        b.Nx,b.Ny,b.Nz;
+                        physical_faces=physical_faces,
+                        positivity_meta=shared_ct_pos_meta,
+                    )
+                end
+                gpu_sync()
+            end
             StructuredTaskDone
         end
 
@@ -4923,12 +5055,16 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 )
                 # Preserve WENO7 in smooth regions, but restore SG07's
                 # multidimensional upwinding on shock- or FOFC-adjacent edges.
+                shock_edge_sensor = ct_troubled_consumer_sensor(
+                    b.ϕ,Val(ct_troubled_edge_emf_enabled),
+                )
                 @gpu_launch threads=nthreads blocks=nb_ct ct_compute_edge_line_emf_from_weno7_cache_kernel!(
                     b.Ex_edge,b.Ey_edge,b.Ez_edge,
                     cache_i,cache_j,cache_k,b.U,b.Q,b.x,b.y,b.z,
                     Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),
                     ct_junction_edge_mask(ct_junction_plan,bid),
-                    ct_weno7_sg07_selective_only,b.ϕ,FT(hybrid_ϕ1),
+                    ct_weno7_sg07_selective_only,shock_edge_sensor,
+                    FT(CT_TROUBLED_RECOVERABLE),
                 )
                 @static if ct_first_order_flux_correction
                     # FOFC replaces selected face fluxes after POINT6 averaging.
@@ -4946,7 +5082,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         b.Vol,b.x,b.y,b.z,state[:current_dt],
                         Int32(b.Nx),Int32(b.Ny),Int32(b.Nz),b.Q,
                         ct_junction_edge_mask(ct_junction_plan,bid),
-                        b.fofc_flag,true,nothing,FT(hybrid_ϕ1),
+                        b.fofc_flag,true,nothing,
+                        FT(CT_TROUBLED_RECOVERABLE),
                         Int32(STRUCTURED_FLUX_TANGENTIAL_HALO),
                     )
                 end
@@ -5360,6 +5497,10 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 global_hlld_to_hlle = MPI.Allreduce(
                     fallback_counts.hlld_to_hlle, MPI.SUM, MPI.COMM_WORLD,
                 )
+                global_characteristic_limited = MPI.Allreduce(
+                    fallback_counts.characteristic_limited,
+                    MPI.SUM,MPI.COMM_WORLD,
+                )
                 global_point6_to_ao = MPI.Allreduce(
                     fallback_counts.point6_to_ao,MPI.SUM,MPI.COMM_WORLD,
                 )
@@ -5388,15 +5529,17 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 )
                 if world_rank == 0 &&
                    global_weno_to_plm + global_plm_to_first +
-                   global_hlld_to_hlle + global_point6_to_ao +
+                   global_hlld_to_hlle + global_characteristic_limited +
+                   global_point6_to_ao +
                    global_point6_limited + global_point6_unrecoverable +
                    global_face_p2a_to_ao +
                    global_face_p2a_to_midpoint + global_fofc_cells +
                    global_fofc_faces + global_fofc_limited > 0
                     @printf(
-                        "CT_FALLBACK taskgraph step=%d rk=%d weno_to_plm=%d plm_to_first=%d hlld_to_hlle=%d point6_to_ao=%d point6_limited=%d point6_unrecoverable=%d face_p2a_to_ao=%d face_p2a_to_midpoint=%d fofc_cells=%d fofc_faces=%d fofc_limited=%d\n",
+                        "CT_FALLBACK taskgraph step=%d rk=%d weno_to_plm=%d plm_to_first=%d hlld_to_hlle=%d characteristic_limited=%d point6_to_ao=%d point6_limited=%d point6_unrecoverable=%d face_p2a_to_ao=%d face_p2a_to_midpoint=%d fofc_cells=%d fofc_faces=%d fofc_limited=%d\n",
                         state[:tt], stage, global_weno_to_plm,
                         global_plm_to_first,global_hlld_to_hlle,
+                        global_characteristic_limited,
                         global_point6_to_ao,global_point6_limited,
                         global_point6_unrecoverable,
                         global_face_p2a_to_ao,global_face_p2a_to_midpoint,
@@ -6157,6 +6300,8 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         task_graph = build_structured_explicit_rk3_task_graph(
             0:(Int(Nblocks) - 1);
             ct_mode=structured_task_ct_active,
+            troubled_mask=structured_task_ct_active &&
+                           ct_troubled_mask_enabled,
             fofc=structured_task_ct_active &&
                  ct_first_order_flux_correction,
             fofc_iterations=Int(ct_fofc_max_iterations),

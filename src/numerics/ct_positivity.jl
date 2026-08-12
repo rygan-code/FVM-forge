@@ -1,6 +1,6 @@
 # Observation-only positivity diagnostics for the strict CT+HLLD path.
 
-const CT_POS_META_LEN = 22
+const CT_POS_META_LEN = 23
 const CT_POS_VALUE_LEN = 17
 const CT_POS_SITE_RECONSTRUCTED = Int32(1)
 const CT_POS_SITE_FACE_B_INVARIANT = Int32(2)
@@ -30,6 +30,7 @@ const CT_POS_POINT6_UNRECOVERABLE_COUNT = 19
 const CT_POS_FOFC_LIMIT_COUNT = 20
 const CT_POS_FOFC_REDUCED_CELL_COUNT = 21
 const CT_POS_FOFC_UNRECOVERABLE_COUNT = 22
+const CT_POS_CHARACTERISTIC_LIMIT_COUNT = 23
 const CT_POS_FAILURE_META_LEN = 7
 const CT_FOFC_DIFFUSIVE_ACTIVE =
     (@isdefined(viscous) ? Bool(viscous) : false) ||
@@ -946,6 +947,9 @@ function ct_fallback_counts(meta)
         weno_to_plm=Int(meta_h[CT_POS_WENO_TO_PLM_COUNT]),
         plm_to_first=Int(meta_h[CT_POS_PLM_TO_FIRST_COUNT]),
         hlld_to_hlle=Int(meta_h[CT_POS_HLLD_TO_HLLE_COUNT]),
+        characteristic_limited=Int(
+            meta_h[CT_POS_CHARACTERISTIC_LIMIT_COUNT],
+        ),
         point6_to_ao=Int(meta_h[CT_POS_POINT6_TO_AO_COUNT]),
         point6_limited=Int(meta_h[CT_POS_POINT6_LIMIT_COUNT]),
         face_p2a_to_ao=Int(meta_h[CT_POS_FACE_P2A_TO_AO_COUNT]),

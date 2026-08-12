@@ -1971,6 +1971,297 @@ end
     Wm, Wc, Wp, nx, ny, nz, bn, gamma, -one(T),
 )
 
+# Point-value WENO-AO(5,3) at x_{i+1/2}. These coefficients interpolate
+# cell-center point values; they are intentionally distinct from the P2A/A2P
+# coefficients used by face quadrature and primitive recovery.
+@inline function _ct_weno_ao53_point_beta_high(v::SVector{5,T}) where {T}
+    a1 = (v[1]-T(8)*v[2]+T(8)*v[4]-v[5])/T(12)
+    a2 = (-v[1]+T(16)*v[2]-T(30)*v[3]+T(16)*v[4]-v[5])/T(24)
+    a3 = (-v[1]+T(2)*v[2]-T(2)*v[4]+v[5])/T(12)
+    a4 = (v[1]-T(4)*v[2]+T(6)*v[3]-T(4)*v[4]+v[5])/T(24)
+    return max(
+        zero(T),
+        a1*a1+T(0.5)*a1*a3+T(13)/T(3)*a2*a2+
+        T(21)/T(5)*a2*a4+T(3129)/T(80)*a3*a3+
+        T(87617)/T(140)*a4*a4,
+    )
+end
+
+@inline function _ct_weno_ao53_point_beta_low(v::SVector{5,T}) where {T}
+    left = T(13)/T(12)*(v[1]-T(2)*v[2]+v[3])^2+
+           T(0.25)*(v[1]-T(4)*v[2]+T(3)*v[3])^2
+    center = T(13)/T(12)*(v[2]-T(2)*v[3]+v[4])^2+
+             T(0.25)*(v[2]-v[4])^2
+    right = T(13)/T(12)*(v[3]-T(2)*v[4]+v[5])^2+
+            T(0.25)*(T(3)*v[3]-T(4)*v[4]+v[5])^2
+    return SVector{3,T}(left,center,right)
+end
+
+@inline function _ct_characteristic_ao_high_weight(::Type{T}) where {T}
+    @static if @isdefined(ct_characteristic_ao_high_weight)
+        return T(ct_characteristic_ao_high_weight)
+    else
+        return T(0.85)
+    end
+end
+
+@inline function ct_weno_ao53_point_left(v::SVector{5,T}) where {T}
+    finite_stencil = true
+    scale = zero(T)
+    for sample in 1:5
+        finite_stencil &= isfinite(v[sample])
+        scale = max(scale,abs(v[sample]))
+    end
+    finite_stencil || return T(NaN)
+    iszero(scale) && return v[3]
+    if v[1] == v[2] && v[2] == v[3] && v[3] == v[4] && v[4] == v[5]
+        return v[3]
+    end
+
+    normalized = v/scale
+    high = T(3)/T(128)*normalized[1]-T(5)/T(32)*normalized[2]+
+           T(45)/T(64)*normalized[3]+T(15)/T(32)*normalized[4]-
+           T(5)/T(128)*normalized[5]
+    low = SVector{3,T}(
+        T(3)/T(8)*normalized[1]-T(5)/T(4)*normalized[2]+
+            T(15)/T(8)*normalized[3],
+        -T(1)/T(8)*normalized[2]+T(3)/T(4)*normalized[3]+
+            T(3)/T(8)*normalized[4],
+        T(3)/T(8)*normalized[3]+T(3)/T(4)*normalized[4]-
+            T(1)/T(8)*normalized[5],
+    )
+    beta_high = _ct_weno_ao53_point_beta_high(normalized)
+    beta_low = _ct_weno_ao53_point_beta_low(normalized)
+    tau = (
+        abs(beta_high-beta_low[1])+abs(beta_high-beta_low[2])+
+        abs(beta_high-beta_low[3])
+    )/T(3)
+    epsilon_beta = T(64)*eps(T)
+    gamma_high = _ct_characteristic_ao_high_weight(T)
+    gamma_low = (one(T)-gamma_high)/T(3)
+    alpha_high = gamma_high*(
+        one(T)+(tau/(beta_high+epsilon_beta))^2
+    )
+    alpha_left = gamma_low*(
+        one(T)+(tau/(beta_low[1]+epsilon_beta))^2
+    )
+    alpha_center = gamma_low*(
+        one(T)+(tau/(beta_low[2]+epsilon_beta))^2
+    )
+    alpha_right = gamma_low*(
+        one(T)+(tau/(beta_low[3]+epsilon_beta))^2
+    )
+    alpha_sum = alpha_high+alpha_left+alpha_center+alpha_right
+    if !(isfinite(alpha_sum) && alpha_sum > zero(T))
+        return scale*high
+    end
+    corrected_high = (
+        high-gamma_low*(low[1]+low[2]+low[3])
+    )/gamma_high
+    candidate = (
+        alpha_high*corrected_high+alpha_left*low[1]+
+        alpha_center*low[2]+alpha_right*low[3]
+    )/alpha_sum
+    return scale*(isfinite(candidate) ? candidate : high)
+end
+
+@inline ct_weno_ao53_point_right(v::SVector{5,T}) where {T} =
+    ct_weno_ao53_point_left(reverse(v))
+
+@inline function _ct_mhd_characteristic_weno_ao53(
+    stencil::NTuple{7,SVector{9,T}},
+    reference_left::SVector{9,T}, reference_right::SVector{9,T},
+    nx::T, ny::T, nz::T, bn::T, gamma::T, ::Val{SIDE},
+) where {T,SIDE}
+    frame = ct_mhd_local_frame(nx,ny,nz)
+    local_reference = T(0.5)*(
+        ct_mhd_global_to_local(reference_left,frame)+
+        ct_mhd_global_to_local(reference_right,frame)
+    )
+    basis = ct_mhd_characteristic_basis(local_reference,bn,gamma)
+    characteristic_stencil = ntuple(Val(5)) do sample
+        local_state = ct_mhd_global_to_local(stencil[sample+1],frame)
+        ct_mhd_primitive_to_characteristic(
+            basis,local_state-local_reference,
+        )
+    end
+    characteristic_face = SVector{7,T}(ntuple(Val(7)) do wave
+        values = SVector{5,T}(ntuple(
+            sample -> characteristic_stencil[sample][wave],Val(5),
+        ))
+        SIDE == 1 ? ct_weno_ao53_point_left(values) :
+                    ct_weno_ao53_point_right(values)
+    end)
+    psi_values = SVector{5,T}(ntuple(
+        sample -> stencil[sample+1][9],Val(5),
+    ))
+    psi_face = SIDE == 1 ? ct_weno_ao53_point_left(psi_values) :
+                           ct_weno_ao53_point_right(psi_values)
+    local_face = local_reference+
+        ct_mhd_characteristic_to_primitive(basis,characteristic_face)
+    return ct_mhd_local_to_global(local_face,psi_face,bn,frame)
+end
+
+@inline function ct_mhd_characteristic_weno_ao53_left(
+    W1::SVector{9,T}, W2::SVector{9,T}, W3::SVector{9,T},
+    W4::SVector{9,T}, W5::SVector{9,T}, W6::SVector{9,T},
+    W7::SVector{9,T}, nx::T, ny::T, nz::T, bn::T, gamma::T,
+) where {T}
+    return _ct_mhd_characteristic_weno_ao53(
+        (W1,W2,W3,W4,W5,W6,W7),W4,W5,
+        nx,ny,nz,bn,gamma,Val(1),
+    )
+end
+
+@inline function ct_mhd_characteristic_weno_ao53_right(
+    W1::SVector{9,T}, W2::SVector{9,T}, W3::SVector{9,T},
+    W4::SVector{9,T}, W5::SVector{9,T}, W6::SVector{9,T},
+    W7::SVector{9,T}, nx::T, ny::T, nz::T, bn::T, gamma::T,
+) where {T}
+    return _ct_mhd_characteristic_weno_ao53(
+        (W1,W2,W3,W4,W5,W6,W7),W3,W4,
+        nx,ny,nz,bn,gamma,Val(2),
+    )
+end
+
+@inline function _ct_primitive_is_physical(state)
+    T=eltype(state)
+    return isfinite(state[1]) && state[1] > zero(T) &&
+           isfinite(state[5]) && state[5] > zero(T) &&
+           all(isfinite,state)
+end
+
+@inline function _ct_characteristic_density_floor(::Type{T}) where {T}
+    @static if @isdefined(density_floor)
+        return T(density_floor)
+    else
+        return T(1.0e-12)
+    end
+end
+
+@inline function _ct_characteristic_pressure_floor(::Type{T}) where {T}
+    @static if @isdefined(pressure_floor)
+        return T(pressure_floor)
+    else
+        return T(1.0e-12)
+    end
+end
+
+@inline function _ct_characteristic_limit_iterations()
+    @static if @isdefined(ct_characteristic_limiter_iterations)
+        return Int(ct_characteristic_limiter_iterations)
+    else
+        return 16
+    end
+end
+
+@inline function _ct_characteristic_state_is_admissible(state)
+    T=eltype(state)
+    return _ct_primitive_is_physical(state) &&
+           state[1] >= _ct_characteristic_density_floor(T) &&
+           state[5] >= _ct_characteristic_pressure_floor(T)
+end
+
+@inline function _ct_characteristic_convex_limit(
+    high::SVector{9,T}, anchor::SVector{9,T},
+) where {T}
+    _ct_characteristic_state_is_admissible(anchor) ||
+        return anchor,zero(T),false
+    _ct_characteristic_state_is_admissible(high) &&
+        return high,one(T),false
+    all(isfinite,high) || return anchor,zero(T),false
+
+    theta_max=one(T)
+    density_floor_value=_ct_characteristic_density_floor(T)
+    pressure_floor_value=_ct_characteristic_pressure_floor(T)
+    if high[1] < density_floor_value
+        denominator=anchor[1]-high[1]
+        if !(isfinite(denominator) && denominator > zero(T))
+            return anchor,zero(T),true
+        end
+        theta_max=min(
+            theta_max,
+            clamp((anchor[1]-density_floor_value)/denominator,zero(T),one(T)),
+        )
+    end
+    if high[5] < pressure_floor_value
+        denominator=anchor[5]-high[5]
+        if !(isfinite(denominator) && denominator > zero(T))
+            return anchor,zero(T),true
+        end
+        theta_max=min(
+            theta_max,
+            clamp((anchor[5]-pressure_floor_value)/denominator,zero(T),one(T)),
+        )
+    end
+    limited=anchor+theta_max*(high-anchor)
+    if _ct_characteristic_state_is_admissible(limited)
+        return limited,theta_max,true
+    end
+
+    lower=zero(T)
+    upper=theta_max
+    for _ in 1:_ct_characteristic_limit_iterations()
+        middle=T(0.5)*(lower+upper)
+        trial=anchor+middle*(high-anchor)
+        if _ct_characteristic_state_is_admissible(trial)
+            lower=middle
+        else
+            upper=middle
+        end
+    end
+    return anchor+lower*(high-anchor),lower,true
+end
+
+@inline function _ct_characteristic_candidate_admissible(
+    stencil::NTuple{7,SVector{9,T}},
+    nx::T, ny::T, nz::T, face_bn::T, gamma::T,
+    ::Val{SIDE}, use_ao::Bool=false,
+) where {T,SIDE}
+    anchor=stencil[4]
+    primitive_state = if use_ao && SIDE == 1
+        ct_mhd_characteristic_weno_ao53_left(
+            stencil...,nx,ny,nz,face_bn,gamma,
+        )
+    elseif use_ao
+        ct_mhd_characteristic_weno_ao53_right(
+            stencil...,nx,ny,nz,face_bn,gamma,
+        )
+    elseif SIDE == 1
+        ct_mhd_characteristic_weno7_left(
+            stencil...,nx,ny,nz,face_bn,gamma,
+        )
+    else
+        ct_mhd_characteristic_weno7_right(
+            stencil...,nx,ny,nz,face_bn,gamma,
+        )
+    end
+    if _ct_characteristic_state_is_admissible(primitive_state)
+        return primitive_state,(use_ao ? Int32(1) : Int32(0))
+    end
+    limited,_,recoverable=_ct_characteristic_convex_limit(
+        primitive_state,anchor,
+    )
+    recoverable && return limited,Int32(2)
+
+    plm_state = SIDE == 1 ?
+        ct_mhd_characteristic_plm_plus(
+            stencil[3],stencil[4],stencil[5],nx,ny,nz,face_bn,gamma,
+        ) :
+        ct_mhd_characteristic_plm_minus(
+            stencil[3],stencil[4],stencil[5],nx,ny,nz,face_bn,gamma,
+        )
+    _ct_characteristic_state_is_admissible(plm_state) &&
+        return plm_state,Int32(3)
+    return anchor,Int32(4)
+end
+
+@inline _ct_characteristic_weno7_admissible(
+    stencil,nx,ny,nz,face_bn,gamma,side,
+) = _ct_characteristic_candidate_admissible(
+    stencil,nx,ny,nz,face_bn,gamma,side,false,
+)
+
 @inline function _ct_mhd_characteristic_weno7(
     stencil::NTuple{7,SVector{9,T}},
     reference_left::SVector{9,T}, reference_right::SVector{9,T},
