@@ -16,6 +16,7 @@ const STRUCTURED_TASK_Q_PROVISIONAL = :Q_PROVISIONAL
 const STRUCTURED_TASK_Q_POINT = :Q_POINT
 const STRUCTURED_TASK_Q_HALO = :Q_HALO
 const STRUCTURED_TASK_CT_DERIVATION_HALO = :CT_DERIVATION_HALO
+const STRUCTURED_TASK_CT_BACKGROUND_READY = :CT_BACKGROUND_READY
 const STRUCTURED_TASK_POSITIVITY = :POSITIVITY
 
 # End-of-step resources.  These are intentionally separate from the RK stage
@@ -140,11 +141,9 @@ function build_structured_ghost_ct_task_graph(;
         add_structured_task!(builder, final_state;
             depends=[final_u_dependency],
             reads=[final_u_resource, STRUCTURED_TASK_FACE_B_HALO],
-            writes=point6 ?
-                [STRUCTURED_TASK_Q_POINT,
-                 STRUCTURED_TASK_CT_DERIVATION_HALO] :
-                [STRUCTURED_TASK_Q_POINT],
-            exclusive=point6 ? [:MPI_REQUESTS, :CT_DERIVATION_SCRATCH] : [],
+            writes=[STRUCTURED_TASK_Q_POINT,
+                    STRUCTURED_TASK_CT_DERIVATION_HALO],
+            exclusive=[:MPI_REQUESTS, :CT_DERIVATION_SCRATCH],
             start! = callback(final_state))
         add_structured_task!(builder, :ct_positivity;
             depends=[final_state],
@@ -398,6 +397,7 @@ end
 function build_structured_explicit_rk3_task_graph(
     block_ids;
     ct_mode::Bool=false,
+    background_split::Bool=false,
     resistive_pre::Bool=false,
     defer_trailing_split::Bool=false,
     callbacks=Dict{Symbol,Function}(),
@@ -405,6 +405,9 @@ function build_structured_explicit_rk3_task_graph(
     ids = sort!(collect(Int.(block_ids)))
     isempty(ids) && throw(ArgumentError(
         "explicit RK3 task graph requires at least one block",
+    ))
+    background_split && !ct_mode && throw(ArgumentError(
+        "CT background splitting requires ct_mode=true",
     ))
 
     callback(id) = get(callbacks, id, _structured_task_noop_callback)
@@ -418,6 +421,9 @@ function build_structured_explicit_rk3_task_graph(
     declare_structured_resource!(builder, initial_q)
     declare_structured_resource!(builder, initial_u)
     ct_mode && declare_structured_resource!(builder, initial_face)
+    background_split && declare_structured_resource!(
+        builder, STRUCTURED_TASK_CT_BACKGROUND_READY; persistent=true,
+    )
 
     previous_barrier = nothing
     for stage in 1:3
@@ -522,9 +528,13 @@ function build_structured_explicit_rk3_task_graph(
             # keep block b's flux alive until its divergence callback consumes
             # it.  Serialize complete per-block pipelines explicitly.
             previous_block_div === nothing || push!(flux_dep, previous_block_div)
+            flux_reads = [q_in, Symbol("RK_SHOCK_HALO_", stage)]
+            background_split && push!(
+                flux_reads, STRUCTURED_TASK_CT_BACKGROUND_READY,
+            )
             add_structured_task!(builder, flux_id;
                 depends=flux_dep,
-                reads=[q_in, Symbol("RK_SHOCK_HALO_", stage)],
+                reads=flux_reads,
                 writes=[point_flux_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_flux))
 

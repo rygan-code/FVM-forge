@@ -182,9 +182,9 @@ for bid in 1:nblocks, face in (1, 2, 3, 4, 5, 6)
     bcp[BCP_MN_RHO0] = rho0
     bcp[BCP_MN_T0] = T0
     bcp[BCP_MN_B0] = Bstar
-    bcp[BCP_MN_XC] = 0.50
+    bcp[BCP_MN_XC] = sheth_case ? 0.0 : 0.50
     bcp[BCP_MN_RB] = 0.20
-    bcp[BCP_MN_LB] = 0.32
+    bcp[BCP_MN_LB] = sheth_case ? L : 0.32
     bcp[BCP_MN_TURNS] = 32.0
     bcp[BCP_MN_MODEL] = sheth_case ? 1.0 : 0.0
     bcp[BCP_MN_ALPHA] = alpha

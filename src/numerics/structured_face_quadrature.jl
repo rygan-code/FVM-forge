@@ -176,6 +176,31 @@ end
     end
 end
 
+@inline function structured_ct_split_face_geometry(
+    face_field, background_field,
+    area, normal_x, normal_y, normal_z,
+    i, j, k, direction,
+)
+    if background_field === nothing
+        local_area, nx, ny, nz, face_bn = structured_ct_face_geometry_bn(
+            face_field, nothing, area, normal_x, normal_y, normal_z,
+            i, j, k, direction,
+        )
+        return local_area, nx, ny, nz, face_bn, face_bn, zero(face_bn)
+    end
+    local_area, nx, ny, nz, perturbation_bn =
+        structured_ct_face_geometry_bn(
+            face_field, nothing, area, normal_x, normal_y, normal_z,
+            i, j, k, direction,
+        )
+    _, _, _, _, background_bn = structured_ct_face_geometry_bn(
+        background_field, nothing, area, normal_x, normal_y, normal_z,
+        i, j, k, direction,
+    )
+    return local_area, nx, ny, nz,
+           perturbation_bn + background_bn, perturbation_bn, background_bn
+end
+
 @inline function _structured_p2a_axis_value(
     source, i, j, k, component, axis::Int32, extent::Int32,
 )

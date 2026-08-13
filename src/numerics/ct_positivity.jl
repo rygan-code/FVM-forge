@@ -347,6 +347,7 @@ function ct_check_sync_transition_kernel!(
     gamma::FT, recovery_mode::Int32,
     nxp::Int32, nyp::Int32, nzp::Int32,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -367,6 +368,10 @@ function ct_check_sync_transition_kernel!(
         old_bx = Q[ii, jj, kk, QBX]
         old_by = Q[ii, jj, kk, QBY]
         old_bz = Q[ii, jj, kk, QBZ]
+        split_background = B0x_cell !== nothing
+        recovery_B0x_face = split_background ? nothing : B0x_face
+        recovery_B0y_face = split_background ? nothing : B0y_face
+        recovery_B0z_face = split_background ? nothing : B0z_face
         area_i_lo = SVector(
             Areai[ii,jj,kk]*nxi[ii,jj,kk],
             Areai[ii,jj,kk]*nyi[ii,jj,kk],
@@ -400,7 +405,8 @@ function ct_check_sync_transition_kernel!(
         recovered_b = if recovery_mode == CT_CELL_B_POINT6
             ct_recover_cell_b_point6(
                 Bx_face, By_face, Bz_face,
-                B0x_face, B0y_face, B0z_face,
+                recovery_B0x_face, recovery_B0y_face,
+                recovery_B0z_face,
                 Areai, nxi, nyi, nzi,
                 Areaj, nxj, nyj, nzj,
                 Areak, nxk, nyk, nzk,
@@ -410,12 +416,34 @@ function ct_check_sync_transition_kernel!(
             ct_recover_cell_b(
                 area_i_lo, area_i_hi, area_j_lo, area_j_hi,
                 area_k_lo, area_k_hi,
-                _ct_total_face_flux(Bx_face, B0x_face, ii, jj, kk),
-                _ct_total_face_flux(Bx_face, B0x_face, ii+Int32(1), jj, kk),
-                _ct_total_face_flux(By_face, B0y_face, ii, jj, kk),
-                _ct_total_face_flux(By_face, B0y_face, ii, jj+Int32(1), kk),
-                _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk),
-                _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk+Int32(1)),
+                _ct_total_face_flux(
+                    Bx_face, recovery_B0x_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    Bx_face, recovery_B0x_face,
+                    ii+Int32(1), jj, kk,
+                ),
+                _ct_total_face_flux(
+                    By_face, recovery_B0y_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    By_face, recovery_B0y_face,
+                    ii, jj+Int32(1), kk,
+                ),
+                _ct_total_face_flux(
+                    Bz_face, recovery_B0z_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    Bz_face, recovery_B0z_face,
+                    ii, jj, kk+Int32(1),
+                ),
+            )
+        end
+        if split_background
+            recovered_b += SVector(
+                B0x_cell[ii,jj,kk],
+                B0y_cell[ii,jj,kk],
+                B0z_cell[ii,jj,kk],
             )
         end
         new_bx = recovered_b[1]

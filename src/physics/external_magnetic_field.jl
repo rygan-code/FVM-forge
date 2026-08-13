@@ -244,6 +244,42 @@ end
     )
 end
 
+@inline function magnetic_nozzle_profiled_inflow_state(
+    bcp, radius, gas_constant, gamma, isothermal,
+)
+    rho0 = bcp[BCP_MN_RHO0]
+    temperature = bcp[BCP_MN_T0]
+    profile_radius = max(bcp[BCP_MN_RB], typeof(radius)(1.0e-30))
+    profile_argument = bcp[BCP_MN_KAPPA] * (radius/profile_radius)^2
+    profile = inv(cosh(profile_argument)^2)
+    density = rho0 * (one(radius) + typeof(radius)(20)*profile)
+    pressure = density * gas_constant * temperature
+    sound_speed = sqrt(
+        (isothermal ? one(gamma) : gamma) * gas_constant * temperature,
+    )
+    axial_velocity = bcp[BCP_MN_V0] * sound_speed * profile
+    return density, axial_velocity, pressure, temperature
+end
+
+@inline function magnetic_nozzle_profiled_inflow_line_emf(
+    bcp, x0, y0, z0, x1, y1, z1, gas_constant, gamma, isothermal,
+)
+    half = one(x0) / 2
+    xm = half*(x0 + x1)
+    ym = half*(y0 + y1)
+    zm = half*(z0 + z1)
+    radius = sqrt(ym*ym + zm*zm)
+    _, axial_velocity, _, _ = magnetic_nozzle_profiled_inflow_state(
+        bcp, radius, gas_constant, gamma, isothermal,
+    )
+    _, magnetic_y, magnetic_z = external_magnetic_field_components_from_bc(
+        bcp, xm, ym, zm,
+    )
+    electric_y = axial_velocity * magnetic_z
+    electric_z = -axial_velocity * magnetic_y
+    return electric_y*(y1 - y0) + electric_z*(z1 - z0)
+end
+
 @inline function external_magnetic_vector_potential_from_bc(bcp, x, y, z)
     model = bcp[BCP_MN_MODEL]
     if model >= typeof(model)(0.5)
@@ -456,21 +492,6 @@ end
     return lower ? index <= ng : index > ncell + ng
 end
 
-# In background-field splitting, the analytic field is B0 and the evolved
-# perturbation is B1 = B - B0.  A physical sheet receives B0 plus a zero
-# gradient copy of B1 from the nearest interior face.  The mapping is made in
-# face-array coordinates because normal faces have a duplicated endpoint while
-# tangential face arrays do not.
-@inline function _external_field_background_source_index(
-    index, ncell, ng, boundary_axis, side, face_kind,
-)
-    lower = side == Int32(0)
-    if boundary_axis == face_kind
-        return lower ? ng + Int32(2) : ng + ncell
-    end
-    return lower ? ng + Int32(1) : ng + ncell
-end
-
 # Fill one Cartesian component of the staggered CT face state from the
 # analytic external field.  `Bface` stores oriented face flux, so the kernel
 # evaluates the field at the face center and projects it with the local CT
@@ -479,7 +500,6 @@ function ct_fill_external_field_face_b_kernel!(
     Bface, Area, normal_x, normal_y, normal_z, x, y, z,
     boundary_axis, side, face_kind,
     nxp, nyp, nzp, bcp, include_normal_face, background_splitting,
-    background_face=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -502,6 +522,16 @@ function ct_fill_external_field_face_b_kernel!(
         boundary_axis, side, face_kind, include_normal_face,
     ) || return
 
+    if background_splitting
+        # The evolved face state is b = B - B0.  These boundary kinds prescribe
+        # the total external field to be the cached B0, so their Dirichlet
+        # value is exactly b_n = 0.  Copying an interior perturbation here would
+        # turn the fixed-field boundary into a zero-gradient boundary and break
+        # the discrete Bessel equilibrium after the first CT stage.
+        @inbounds Bface[i,j,k] = zero(eltype(Bface))
+        return
+    end
+
     # Use the same discrete Stokes construction as CT initialization. The
     # temporary point-value projection above is intentionally not used: it
     # differs from vector-potential face flux by O(h^2), which is fatal in
@@ -509,27 +539,7 @@ function ct_fill_external_field_face_b_kernel!(
     analytic_flux = external_magnetic_face_flux_from_vector_potential(
         bcp, x, y, z, i, j, k, face_kind,
     )
-    if background_splitting
-        source_i = boundary_axis == Int32(1) ?
-            _external_field_background_source_index(
-                i, nxp, ng, boundary_axis, side, face_kind) : i
-        source_j = boundary_axis == Int32(2) ?
-            _external_field_background_source_index(
-                j, nyp, ng, boundary_axis, side, face_kind) : j
-        source_k = boundary_axis == Int32(3) ?
-            _external_field_background_source_index(
-                k, nzp, ng, boundary_axis, side, face_kind) : k
-        @inbounds begin
-            # The evolved array stores b.  Impose the prescribed total field
-            # by subtracting the fixed B0 flux at the destination and adding
-            # the nearest interior perturbation.
-            Bface[i,j,k] = analytic_flux -
-                _ct_background_face_flux(background_face, i, j, k) +
-                Bface[source_i,source_j,source_k]
-        end
-    else
-        @inbounds Bface[i,j,k] = analytic_flux
-    end
+    @inbounds Bface[i,j,k] = analytic_flux
     return
 end
 
@@ -710,6 +720,48 @@ end
     x, y, z, time=zero(field.B0),
 )
     return magnetic_nozzle_vector_potential(field, x, y, z, time)
+end
+
+function ct_initialize_background_cell_b_from_model!(
+    block, model; time=zero(FT),
+)
+    block.B0x_cell === nothing && return false
+    applicable(
+        magnetic_nozzle_field, model, zero(FT), zero(FT), zero(FT), FT(time),
+    ) || return false
+
+    x = Array(block.x)
+    y = Array(block.y)
+    z = Array(block.z)
+    cell_dims = size(block.B0x_cell)
+    size(block.B0y_cell) == cell_dims == size(block.B0z_cell) ||
+        throw(DimensionMismatch(
+            "CT background cell arrays must have identical sizes",
+        ))
+    size(x) == size(y) == size(z) == cell_dims .+ 1 ||
+        throw(DimensionMismatch(
+            "CT background cell sampling requires one more node than cell " *
+            "in each coordinate direction",
+        ))
+
+    background_x = Array{FT}(undef, cell_dims)
+    background_y = similar(background_x)
+    background_z = similar(background_x)
+    @inbounds for k in axes(background_x, 3),
+                  j in axes(background_x, 2),
+                  i in axes(background_x, 1)
+        center = structured_cell_center_coordinates(x, y, z, i, j, k)
+        magnetic = magnetic_nozzle_field(
+            model, center[1], center[2], center[3], FT(time),
+        )
+        background_x[i,j,k] = FT(magnetic[1])
+        background_y[i,j,k] = FT(magnetic[2])
+        background_z[i,j,k] = FT(magnetic[3])
+    end
+    copyto!(block.B0x_cell, background_x)
+    copyto!(block.B0y_cell, background_y)
+    copyto!(block.B0z_cell, background_z)
+    return true
 end
 
 function _run_configured_external_magnetic_field_process!(

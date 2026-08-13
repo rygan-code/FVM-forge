@@ -423,12 +423,19 @@ function build_ct_derivation_halo_plan(
     ng::Integer,
     communicator=nothing,
     conservative_components::Integer=5,
+    include_cell_data::Bool=true,
     cell_reach::NTuple{3,<:Integer}=(2,2,2),
     face_reach::NTuple{3,<:Integer}=(2,2,2),
 )
-    conservative_components >= 5 || throw(ArgumentError(
-        "CT POINT6 requires at least five conservative components",
-    ))
+    if include_cell_data
+        conservative_components >= 5 || throw(ArgumentError(
+            "CT POINT6 requires at least five conservative components",
+        ))
+    else
+        conservative_components >= 0 || throw(ArgumentError(
+            "conservative component count cannot be negative",
+        ))
+    end
     halos = Dict{Int,CTDerivationHalo}()
     cell_groups = Dict{Tuple{Int,Int},Tuple{
         Vector{Int32},Vector{NTuple{3,Int32}},
@@ -472,10 +479,11 @@ function build_ct_derivation_halo_plan(
         )
         cell_count = Int(ct_shell_count(cell_layout))
         face_count = Int(ct_shell_count(face_layout))
-        conservative_shell = gpu_zeros(
+        conservative_shell = include_cell_data ? gpu_zeros(
             FT, cell_count, conservative_components,
-        )
-        inverse_volume_shell = gpu_zeros(FT, cell_count)
+        ) : gpu_zeros(FT, 0, 0)
+        inverse_volume_shell = include_cell_data ?
+            gpu_zeros(FT, cell_count) : gpu_zeros(FT, 0)
         face_b_shells = ntuple(_ -> gpu_zeros(FT, face_count), Val(3))
         background_fields = _ct_derivation_background_face_fields(block)
         background_shells = ntuple(Val(3)) do axis
@@ -498,44 +506,46 @@ function build_ct_derivation_halo_plan(
              sum(length, area_vector_shells)) * sizeof(FT),
         )
 
-        for offset in Int32(1):ct_shell_count(cell_layout)
-            i, j, k = ct_shell_indices(cell_layout, offset)
-            global_index = (
-                Int(block.ox) + Int(i),
-                Int(block.oy) + Int(j),
-                Int(block.oz) + Int(k),
-            )
-            source = ct_resolve_cell_source(
-                bid, global_index, block_dims, face_bc, connectivity,
-            )
-            owned = if source === nothing
-                CTDerivationOwnedCellSource(
-                    Int32(world_rank), Int32(bid),
-                    (
-                        Int32(clamp(i,1,active_dims[1]) + Int(ng)),
-                        Int32(clamp(j,1,active_dims[2]) + Int(ng)),
-                        Int32(clamp(k,1,active_dims[3]) + Int(ng)),
-                    ),
+        if include_cell_data
+            for offset in Int32(1):ct_shell_count(cell_layout)
+                i, j, k = ct_shell_indices(cell_layout, offset)
+                global_index = (
+                    Int(block.ox) + Int(i),
+                    Int(block.oy) + Int(j),
+                    Int(block.oz) + Int(k),
                 )
-            else
-                ct_owned_cell_source(
-                    source, block_dims, block_nprocs, rank_offsets; ng=ng,
+                source = ct_resolve_cell_source(
+                    bid, global_index, block_dims, face_bc, connectivity,
                 )
-            end
-            if Int(owned.rank) == Int(world_rank)
-                offsets, indices = _ct_derivation_add_cell_job!(
-                    cell_groups, bid, owned,
-                )
-                push!(offsets, offset)
-                push!(indices, owned.local_index)
-            else
-                requests = get!(
-                    remote_cell_requests, Int(owned.rank),
-                    CTCellDestinationRequest[],
-                )
-                push!(requests, CTCellDestinationRequest(
-                    owned, Int32(bid), offset,
-                ))
+                owned = if source === nothing
+                    CTDerivationOwnedCellSource(
+                        Int32(world_rank), Int32(bid),
+                        (
+                            Int32(clamp(i,1,active_dims[1]) + Int(ng)),
+                            Int32(clamp(j,1,active_dims[2]) + Int(ng)),
+                            Int32(clamp(k,1,active_dims[3]) + Int(ng)),
+                        ),
+                    )
+                else
+                    ct_owned_cell_source(
+                        source, block_dims, block_nprocs, rank_offsets; ng=ng,
+                    )
+                end
+                if Int(owned.rank) == Int(world_rank)
+                    offsets, indices = _ct_derivation_add_cell_job!(
+                        cell_groups, bid, owned,
+                    )
+                    push!(offsets, offset)
+                    push!(indices, owned.local_index)
+                else
+                    requests = get!(
+                        remote_cell_requests, Int(owned.rank),
+                        CTCellDestinationRequest[],
+                    )
+                    push!(requests, CTCellDestinationRequest(
+                        owned, Int32(bid), offset,
+                    ))
+                end
             end
         end
 
@@ -1150,6 +1160,39 @@ function ct_materialize_inverse_volume_ghost_kernel!(
     return
 end
 
+function ct_materialize_face_flux_ghost_kernel!(
+    face_flux, face_shell, layout,
+    face_axis, nxp, nyp, nzp, physical_faces,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > size(face_flux,1) || j > size(face_flux,2) ||
+       k > size(face_flux,3)
+        return
+    end
+
+    logical_i, logical_j, logical_k = i - NG, j - NG, k - NG
+    extents = (
+        nxp + (face_axis == Int32(1) ? Int32(1) : Int32(0)),
+        nyp + (face_axis == Int32(2) ? Int32(1) : Int32(0)),
+        nzp + (face_axis == Int32(3) ? Int32(1) : Int32(0)),
+    )
+    if 1 <= logical_i <= extents[1] &&
+       1 <= logical_j <= extents[2] &&
+       1 <= logical_k <= extents[3]
+        return
+    end
+    _ct_derivation_crosses_physical_face(
+        logical_i, logical_j, logical_k, extents, physical_faces,
+    ) && return
+
+    offset = ct_shell_offset(layout, logical_i, logical_j, logical_k)
+    offset > 0 || return
+    @inbounds face_flux[i,j,k] = face_shell[offset]
+    return
+end
+
 function ct_materialize_face_metric_ghost_kernel!(
     area, normal_x, normal_y, normal_z, area_vector_shell, layout,
     face_axis, nxp, nyp, nzp, physical_faces,
@@ -1207,15 +1250,17 @@ function materialize_ct_derivation_static_ghosts!(
         physical_faces = get(
             physical_faces_by_block, bid, ntuple(_ -> false, Val(6)),
         )
-        cell_blocks = (
-            cld(Int(block.Nx) + 2NG, Int(threads[1])),
-            cld(Int(block.Ny) + 2NG, Int(threads[2])),
-            cld(Int(block.Nz) + 2NG, Int(threads[3])),
-        )
-        @gpu_launch threads=threads blocks=cell_blocks ct_materialize_inverse_volume_ghost_kernel!(
-            block.Vol, halo.inverse_volume_shell, halo.cell_layout,
-            Int32(block.Nx), Int32(block.Ny), Int32(block.Nz), physical_faces,
-        )
+        if !isempty(halo.inverse_volume_shell)
+            cell_blocks = (
+                cld(Int(block.Nx) + 2NG, Int(threads[1])),
+                cld(Int(block.Ny) + 2NG, Int(threads[2])),
+                cld(Int(block.Nz) + 2NG, Int(threads[3])),
+            )
+            @gpu_launch threads=threads blocks=cell_blocks ct_materialize_inverse_volume_ghost_kernel!(
+                block.Vol, halo.inverse_volume_shell, halo.cell_layout,
+                Int32(block.Nx), Int32(block.Ny), Int32(block.Nz), physical_faces,
+            )
+        end
 
         metric_fields = (
             (block.Areai, block.nxi, block.nyi, block.nzi),
@@ -1238,4 +1283,112 @@ function materialize_ct_derivation_static_ghosts!(
     end
     gpu_sync()
     return nothing
+end
+
+"""
+Materialize authoritative topological face-flux shells into the existing CT
+staggered ghost allocation. This completes edge/corner halos that ordinary
+interface-sheet exchange cannot represent. Physical-boundary entries remain
+owned by their boundary kernels.
+"""
+function materialize_ct_derivation_dynamic_ghosts!(
+    plan, blocks, physical_faces_by_block,
+)
+    threads = (Int32(8), Int32(8), Int32(4))
+    for (bid, block) in blocks
+        halo = plan.halos[bid]
+        physical_faces = get(
+            physical_faces_by_block, bid, ntuple(_ -> false, Val(6)),
+        )
+        face_fields = _ct_derivation_face_fields(block)
+        background_fields = _ct_derivation_background_face_fields(block)
+        for axis in 1:3
+            face_flux = face_fields[axis]
+            face_blocks = (
+                cld(size(face_flux,1), Int(threads[1])),
+                cld(size(face_flux,2), Int(threads[2])),
+                cld(size(face_flux,3), Int(threads[3])),
+            )
+            @gpu_launch threads=threads blocks=face_blocks ct_materialize_face_flux_ghost_kernel!(
+                face_flux, halo.face_b_shells[axis], halo.face_layout,
+                Int32(axis), Int32(block.Nx), Int32(block.Ny),
+                Int32(block.Nz), physical_faces,
+            )
+            background = background_fields[axis]
+            background_shell = halo.background_face_shells[axis]
+            if background !== nothing && background_shell !== nothing
+                @gpu_launch threads=threads blocks=face_blocks ct_materialize_face_flux_ghost_kernel!(
+                    background, background_shell, halo.face_layout,
+                    Int32(axis), Int32(block.Nx), Int32(block.Ny),
+                    Int32(block.Nz), physical_faces,
+                )
+            end
+        end
+    end
+    gpu_sync()
+    return nothing
+end
+
+"""
+Release static shell payloads after direct CT has materialized its face-metric
+ghosts. POINT6 retains these arrays because every point recovery reads them.
+"""
+function release_direct_ct_derivation_static_storage!(plan)
+    any(!isempty(halo.conservative_shell) for halo in values(plan.halos)) &&
+        throw(ArgumentError(
+            "cannot release CT derivation static storage with cell shells active",
+        ))
+    released = Int64(0)
+    for halo in values(plan.halos)
+        for values in halo.face_area_vector_shells
+            released += Int64(length(values) * sizeof(FT))
+        end
+        halo.face_area_vector_shells = ntuple(
+            _ -> gpu_zeros(FT, 0, 3), Val(3),
+        )
+    end
+    for jobs in (
+        plan.remote_cell_send_jobs, plan.remote_cell_receive_jobs,
+        plan.remote_face_send_jobs, plan.remote_face_receive_jobs,
+    )
+        for job in jobs
+            released += Int64(
+                (length(job.static_device) + length(job.static_host)) *
+                sizeof(FT),
+            )
+            job.static_device = gpu_zeros(FT, 0, 3)
+            job.static_host = zeros(FT, 0, 3)
+        end
+    end
+    plan.persistent_bytes = max(Int64(0), plan.persistent_bytes - released)
+    return released
+end
+
+"""
+Release the packed fixed-background payload after B0 has been materialized in
+the ordinary face arrays. Subsequent stages exchange only the evolved b flux.
+"""
+function release_ct_derivation_background_storage!(plan)
+    plan.background_enabled || return Int64(0)
+    released = Int64(0)
+    for halo in values(plan.halos)
+        for values in halo.background_face_shells
+            values === nothing && continue
+            released += Int64(length(values) * sizeof(FT))
+        end
+        halo.background_face_shells = (nothing, nothing, nothing)
+    end
+    for jobs in (plan.remote_face_send_jobs, plan.remote_face_receive_jobs)
+        for job in jobs
+            rows = size(job.dynamic_host, 1)
+            old_length = length(job.dynamic_device) + length(job.dynamic_host)
+            job.dynamic_host = zeros(FT, rows, 1)
+            job.dynamic_device = GPUArray(job.dynamic_host)
+            new_length = length(job.dynamic_device) + length(job.dynamic_host)
+            released += Int64((old_length - new_length) * sizeof(FT))
+        end
+    end
+    plan.background_enabled = false
+    plan.persistent_bytes = max(Int64(0), plan.persistent_bytes - released)
+    return released
 end

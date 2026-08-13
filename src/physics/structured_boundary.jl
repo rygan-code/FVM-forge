@@ -7,6 +7,9 @@ using Adapt
 if !@isdefined(MHD_SI_UNITS_LOADED)
     include(joinpath(@__DIR__, "..", "core", "mhd_units.jl"))
 end
+if !isdefined(@__MODULE__, :structured_cell_center_coordinates)
+    include(joinpath(@__DIR__, "..", "mesh", "structured_coordinates.jl"))
+end
 if !@isdefined(ct_mode)
     const ct_mode = false
 end
@@ -547,7 +550,8 @@ function _apply_bc!(Q, U, i, j, k, bc_type, dir, side,
             T = bcp[BCP_MN_T0]
             a = max(bcp[BCP_MN_RB], FT(1.0e-30))
             kappa = bcp[BCP_MN_KAPPA]
-            radius = sqrt(y[i,j,k]^2 + z[i,j,k]^2)
+            center = structured_cell_center_coordinates(x, y, z, i, j, k)
+            radius = sqrt(center[2]^2 + center[3]^2)
             # Sheth et al. define sech^2[kappa (r/a)^2], not sech^2 of
             # kappa^2.  The distinction changes the injected radial profile
             # and therefore the mass-loading and inlet Mach number.

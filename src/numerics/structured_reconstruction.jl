@@ -8,8 +8,105 @@ end
 @inline _structured_state_component(U, Q, i, j, k, n) =
     ct_cell_state_component(U, Q, i, j, k, n)
 
-@inline function Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID, ch_glm::FT)
+@inline function _structured_state_component(
+    U, Q, B0x_cell, B0y_cell, B0z_cell, i, j, k, n,
+)
+    B0x_cell === nothing && return ct_cell_state_component(
+        U, Q, i, j, k, n,
+    )
+    if n <= 4
+        @inbounds return U[i, j, k, n]
+    end
+    @inbounds begin
+        b0x = B0x_cell[i, j, k]
+        b0y = B0y_cell[i, j, k]
+        b0z = B0z_cell[i, j, k]
+        total_bx = Q[i, j, k, QBX]
+        total_by = Q[i, j, k, QBY]
+        total_bz = Q[i, j, k, QBZ]
+    end
+    if n == 5
+        if isothermal_mhd
+            @inbounds return U[i, j, k, 5]
+        end
+        bx = total_bx - b0x
+        by = total_by - b0y
+        bz = total_bz - b0z
+        removed_energy = FT(0.5) * (b0x*b0x + b0y*b0y + b0z*b0z) +
+                         b0x*bx + b0y*by + b0z*bz
+        @inbounds return U[i, j, k, 5] - removed_energy*INV_MU0_SI
+    elseif n == UBX
+        return total_bx - b0x
+    elseif n == UBY
+        return total_by - b0y
+    elseif n == UBZ
+        return total_bz - b0z
+    end
+    return zero(FT)
+end
+
+@inline function _ct_background_face_component(
+    field, i, j, k, ::Val{DIRECTION}, ::Val{RECONSTRUCTION},
+) where {DIRECTION,RECONSTRUCTION}
+    T = eltype(field)
+    if RECONSTRUCTION == CT_CHARACTERISTIC_PLM
+        ii = DIRECTION == 1 ? i + Int32(1) : i
+        jj = DIRECTION == 2 ? j + Int32(1) : j
+        kk = DIRECTION == 3 ? k + Int32(1) : k
+        @inbounds return T(0.5) * (
+            field[i, j, k] + field[ii, jj, kk]
+        )
+    end
+    weights = SVector{6,T}(T(3), T(-25), T(150), T(150), T(-25), T(3)) /
+              T(256)
+    value = zero(T)
+    for sample in 1:6
+        offset = sample - 3
+        ii = DIRECTION == 1 ? i + offset : i
+        jj = DIRECTION == 2 ? j + offset : j
+        kk = DIRECTION == 3 ? k + offset : k
+        @inbounds value += weights[sample] * field[ii, jj, kk]
+    end
+    return value
+end
+
+@inline function _ct_background_face_component6(
+    field, i, j, k, direction,
+)
+    return _ct_background_face_component(
+        field, i, j, k, direction,
+        Val(ct_characteristic_reconstruction),
+    )
+end
+
+@inline _ct_background_face_vector(
+    ::Nothing, B0y_cell, B0z_cell, i, j, k, direction,
+    nx, ny, nz, background_bn,
+) = nothing
+
+@inline function _ct_background_face_vector(
+    B0x_cell, B0y_cell, B0z_cell, i, j, k, direction,
+    nx, ny, nz, background_bn,
+)
+    b0x = _ct_background_face_component6(B0x_cell, i, j, k, direction)
+    b0y = _ct_background_face_component6(B0y_cell, i, j, k, direction)
+    b0z = _ct_background_face_component6(B0z_cell, i, j, k, direction)
+    b0x, b0y, b0z = ct_replace_normal_component(
+        b0x, b0y, b0z, nx, ny, nz, background_bn,
+    )
+    return SVector{3,FT}(b0x, b0y, b0z)
+end
+
+@inline function Blend_Flux(
+    UL_vec, UR_vec, nx, ny, nz, ϕ, hp1, lin_ϕ, splitMethodID,
+    ch_glm::FT, background_face=nothing,
+)
     @static if equation_type == :MHD
+        if background_face !== nothing
+            return MHD_HLLE_Background_Flux(
+                UL_vec, UR_vec, background_face, nx, ny, nz, ch_glm,
+            )
+        end
         @static if isothermal_mhd
             if splitMethodID == Int32(6)
                 return MHD_HLLE_Flux(UL_vec, UR_vec, nx, ny, nz, ch_glm)
@@ -1363,7 +1460,9 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
                               ch_glm::FT, mode::Int32, Bx_face_CT,
                               cache_i, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0x_face_CT=nothing)
+                              B0x_face_CT=nothing,
+                              B0x_cell=nothing, B0y_cell=nothing,
+                              B0z_cell=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -1394,10 +1493,16 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
     if mode == Int32(1) && (i < NG+Int32(4) || i > nxp+NG-Int32(4)); return; end
     if mode == Int32(2) && (i >= NG+Int32(4) && i <= nxp+NG-Int32(4)); return; end
     # 2. Geometry
+    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
+        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
+            structured_ct_split_face_geometry(
             Bx_face_CT,B0x_face_CT,Areai,nxi,nyi,nzi,
             i+Int32(1),j,k,Val(1),
+        )
+        background_face_vector = _ct_background_face_vector(
+            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(1),
+            nx, ny, nz, _B0n_geometry,
         )
     else
         Area,nx,ny,nz = structured_face_geometry(
@@ -1457,8 +1562,8 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         @inbounds L5 = stencil_arr[i,5] + α_adapt * Δstencil_arr[i,5]; @inbounds L6 = stencil_arr[i,6] + α_adapt * Δstencil_arr[i,6]
         @inbounds L7 = stencil_arr[i,7] + α_adapt * Δstencil_arr[i,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,i-3,j,k,n); v2 = _structured_state_component(U,Q,i-2,j,k,n); v3 = _structured_state_component(U,Q,i-1,j,k,n)
-            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i+1,j,k,n); v6 = _structured_state_component(U,Q,i+2,j,k,n); v7 = _structured_state_component(U,Q,i+3,j,k,n)
+            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-3,j,k,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
+            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         # Right-state weights (temporal register reuse)
@@ -1467,8 +1572,8 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         @inbounds L5 = stencil_R_arr[i,5] + α_adapt * Δstencil_R_arr[i,5]; @inbounds L6 = stencil_R_arr[i,6] + α_adapt * Δstencil_R_arr[i,6]
         @inbounds L7 = stencil_R_arr[i,7] + α_adapt * Δstencil_R_arr[i,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,i+4,j,k,n); r2 = _structured_state_component(U,Q,i+3,j,k,n); r3 = _structured_state_component(U,Q,i+2,j,k,n)
-            @inbounds r4 = _structured_state_component(U,Q,i+1,j,k,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i-1,j,k,n); r7 = _structured_state_component(U,Q,i-2,j,k,n)
+            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+4,j,k,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
+            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -1484,21 +1589,21 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         for n = 1:Ncons
 
             # 2b. 投影 U -> V (Component-wise Reconstruction)
-            @inbounds V1L = _structured_state_component(U,Q,i-3,j,k,n)
-            @inbounds V2L = _structured_state_component(U,Q,i-2,j,k,n)
-            @inbounds V3L = _structured_state_component(U,Q,i-1,j,k,n)
-            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,i+1,j,k,n)
-            @inbounds V6L = _structured_state_component(U,Q,i+2,j,k,n)
-            @inbounds V7L = _structured_state_component(U,Q,i+3,j,k,n)
+            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-3,j,k,n)
+            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
+            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
+            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n)
+            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
+            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,i+4,j,k,n)
-            @inbounds V2R = _structured_state_component(U,Q,i+3,j,k,n)
-            @inbounds V3R = _structured_state_component(U,Q,i+2,j,k,n)
-            @inbounds V4R = _structured_state_component(U,Q,i+1,j,k,n)
-            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,i-1,j,k,n)
-            @inbounds V7R = _structured_state_component(U,Q,i-2,j,k,n)
+            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+4,j,k,n)
+            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+3,j,k,n)
+            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+2,j,k,n)
+            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n)
+            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-1,j,k,n)
+            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i-2,j,k,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -1638,10 +1743,10 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i+1,j,k,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i+1,j,k,n); end
     end
     end
 
@@ -1681,7 +1786,10 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
     end
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
-    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕx, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    flux_temp = Blend_Flux(
+        UL_vec, UR_vec, nx, ny, nz, ϕx, hybrid_ϕ1, local_lin_ϕ,
+        splitMethodID, ch_glm, background_face_vector,
+    )
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&
@@ -1726,7 +1834,9 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
                               ch_glm::FT, mode::Int32, By_face_CT,
                               cache_j, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0y_face_CT=nothing)
+                              B0y_face_CT=nothing,
+                              B0x_cell=nothing, B0y_cell=nothing,
+                              B0z_cell=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -1757,10 +1867,16 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
     if mode == Int32(2) && (j >= NG+Int32(4) && j <= nyp+NG-Int32(4)); return; end
 
     # 2. Geometry
+    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
+        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
+            structured_ct_split_face_geometry(
             By_face_CT,B0y_face_CT,Areaj,nxj,nyj,nzj,
             i,j+Int32(1),k,Val(2),
+        )
+        background_face_vector = _ct_background_face_vector(
+            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(2),
+            nx, ny, nz, _B0n_geometry,
         )
     else
         Area,nx,ny,nz = structured_face_geometry(
@@ -1817,8 +1933,8 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
         @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,i,j-3,k,n); v2 = _structured_state_component(U,Q,i,j-2,k,n); v3 = _structured_state_component(U,Q,i,j-1,k,n)
-            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i,j+1,k,n); v6 = _structured_state_component(U,Q,i,j+2,k,n); v7 = _structured_state_component(U,Q,i,j+3,k,n)
+            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-3,k,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
+            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
@@ -1826,8 +1942,8 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
         @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,i,j+4,k,n); r2 = _structured_state_component(U,Q,i,j+3,k,n); r3 = _structured_state_component(U,Q,i,j+2,k,n)
-            @inbounds r4 = _structured_state_component(U,Q,i,j+1,k,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i,j-1,k,n); r7 = _structured_state_component(U,Q,i,j-2,k,n)
+            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+4,k,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
+            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -1841,21 +1957,21 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         @inbounds ss = FT(2.0)/(S[i, j+1, k] + S[i, j, k])
 
         for n = 1:Ncons
-            @inbounds V1L = _structured_state_component(U,Q,i,j-3,k,n)
-            @inbounds V2L = _structured_state_component(U,Q,i,j-2,k,n)
-            @inbounds V3L = _structured_state_component(U,Q,i,j-1,k,n)
-            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,i,j+1,k,n)
-            @inbounds V6L = _structured_state_component(U,Q,i,j+2,k,n)
-            @inbounds V7L = _structured_state_component(U,Q,i,j+3,k,n)
+            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-3,k,n)
+            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
+            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
+            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n)
+            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
+            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,i,j+4,k,n)
-            @inbounds V2R = _structured_state_component(U,Q,i,j+3,k,n)
-            @inbounds V3R = _structured_state_component(U,Q,i,j+2,k,n)
-            @inbounds V4R = _structured_state_component(U,Q,i,j+1,k,n)
-            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,i,j-1,k,n)
-            @inbounds V7R = _structured_state_component(U,Q,i,j-2,k,n)
+            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+4,k,n)
+            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+3,k,n)
+            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+2,k,n)
+            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n)
+            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-1,k,n)
+            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j-2,k,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -1977,10 +2093,10 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i,j+1,k,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j+1,k,n); end
     end
     end
 
@@ -2018,7 +2134,10 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
     end
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
-    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕy, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    flux_temp = Blend_Flux(
+        UL_vec, UR_vec, nx, ny, nz, ϕy, hybrid_ϕ1, local_lin_ϕ,
+        splitMethodID, ch_glm, background_face_vector,
+    )
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&
@@ -2063,7 +2182,9 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
                               ch_glm::FT, mode::Int32, Bz_face_CT,
                               cache_k, Vol, dt_stage::FT,
                               rk_stage::Int32, pos_meta, pos_values,
-                              B0z_face_CT=nothing)
+                              B0z_face_CT=nothing,
+                              B0x_cell=nothing, B0y_cell=nothing,
+                              B0z_cell=nothing)
     @static if strict_ct_positivity && ct_mode
         _use_primitive_reconstruction = splitMethodID == Int32(4)
     else
@@ -2096,10 +2217,16 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
     if mode == Int32(2) && (k >= NG+Int32(4) && k <= nzp+NG-Int32(4)); return; end
 
     # 2. Geometry
+    background_face_vector = nothing
     @static if ct_mode
-        Area,nx,ny,nz,_Bn_geometry = structured_ct_face_geometry_bn(
+        Area,nx,ny,nz,_total_Bn_geometry,_Bn_geometry,_B0n_geometry =
+            structured_ct_split_face_geometry(
             Bz_face_CT,B0z_face_CT,Areak,nxk,nyk,nzk,
             i,j,k+Int32(1),Val(3),
+        )
+        background_face_vector = _ct_background_face_vector(
+            B0x_cell, B0y_cell, B0z_cell, i, j, k, Val(3),
+            nx, ny, nz, _B0n_geometry,
         )
     else
         Area,nx,ny,nz = structured_face_geometry(
@@ -2155,8 +2282,8 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds L5 = stencil_arr[j,k,5] + α_adapt * Δstencil_arr[j,k,5]; @inbounds L6 = stencil_arr[j,k,6] + α_adapt * Δstencil_arr[j,k,6]
         @inbounds L7 = stencil_arr[j,k,7] + α_adapt * Δstencil_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds v1 = _structured_state_component(U,Q,i,j,k-3,n); v2 = _structured_state_component(U,Q,i,j,k-2,n); v3 = _structured_state_component(U,Q,i,j,k-1,n)
-            @inbounds v4 = _structured_state_component(U,Q,i,j,k,n); v5 = _structured_state_component(U,Q,i,j,k+1,n); v6 = _structured_state_component(U,Q,i,j,k+2,n); v7 = _structured_state_component(U,Q,i,j,k+3,n)
+            @inbounds v1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-3,n); v2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n); v3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
+            @inbounds v4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); v5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); v6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n); v7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
             UL_final[n] = L1*v1 + L2*v2 + L3*v3 + L4*v4 + L5*v5 + L6*v6 + L7*v7
         end
         @inbounds L1 = stencil_R_arr[j,k,1] + α_adapt * Δstencil_R_arr[j,k,1]; @inbounds L2 = stencil_R_arr[j,k,2] + α_adapt * Δstencil_R_arr[j,k,2]
@@ -2164,8 +2291,8 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds L5 = stencil_R_arr[j,k,5] + α_adapt * Δstencil_R_arr[j,k,5]; @inbounds L6 = stencil_R_arr[j,k,6] + α_adapt * Δstencil_R_arr[j,k,6]
         @inbounds L7 = stencil_R_arr[j,k,7] + α_adapt * Δstencil_R_arr[j,k,7]
         for n = 1:Ncons
-            @inbounds r1 = _structured_state_component(U,Q,i,j,k+4,n); r2 = _structured_state_component(U,Q,i,j,k+3,n); r3 = _structured_state_component(U,Q,i,j,k+2,n)
-            @inbounds r4 = _structured_state_component(U,Q,i,j,k+1,n); r5 = _structured_state_component(U,Q,i,j,k,n); r6 = _structured_state_component(U,Q,i,j,k-1,n); r7 = _structured_state_component(U,Q,i,j,k-2,n)
+            @inbounds r1 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+4,n); r2 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n); r3 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
+            @inbounds r4 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); r5 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); r6 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n); r7 = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
             UR_final[n] = L1*r1 + L2*r2 + L3*r3 + L4*r4 + L5*r5 + L6*r6 + L7*r7
         end
 
@@ -2179,21 +2306,21 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         @inbounds ss = FT(2.0)/(S[i, j, k+1] + S[i, j, k])
 
         for n = 1:Ncons
-            @inbounds V1L = _structured_state_component(U,Q,i,j,k-3,n)
-            @inbounds V2L = _structured_state_component(U,Q,i,j,k-2,n)
-            @inbounds V3L = _structured_state_component(U,Q,i,j,k-1,n)
-            @inbounds V4L = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V5L = _structured_state_component(U,Q,i,j,k+1,n)
-            @inbounds V6L = _structured_state_component(U,Q,i,j,k+2,n)
-            @inbounds V7L = _structured_state_component(U,Q,i,j,k+3,n)
+            @inbounds V1L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-3,n)
+            @inbounds V2L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
+            @inbounds V3L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
+            @inbounds V4L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V5L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n)
+            @inbounds V6L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
+            @inbounds V7L = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
 
-            @inbounds V1R = _structured_state_component(U,Q,i,j,k+4,n)
-            @inbounds V2R = _structured_state_component(U,Q,i,j,k+3,n)
-            @inbounds V3R = _structured_state_component(U,Q,i,j,k+2,n)
-            @inbounds V4R = _structured_state_component(U,Q,i,j,k+1,n)
-            @inbounds V5R = _structured_state_component(U,Q,i,j,k,n)
-            @inbounds V6R = _structured_state_component(U,Q,i,j,k-1,n)
-            @inbounds V7R = _structured_state_component(U,Q,i,j,k-2,n)
+            @inbounds V1R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+4,n)
+            @inbounds V2R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+3,n)
+            @inbounds V3R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+2,n)
+            @inbounds V4R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n)
+            @inbounds V5R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n)
+            @inbounds V6R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-1,n)
+            @inbounds V7R = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k-2,n)
 
             valL = zero(FT); valR = zero(FT)
 
@@ -2315,10 +2442,10 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
         _eiR = UR_final[5] - FT(0.5) * _ρuR2 / max(_ρR, eps(FT))
     end
     if !(_ρL >= eps(FT)) || !(_eiL >= eps(FT)) || !isfinite(_ρL) || !isfinite(_eiL)
-        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,i,j,k,n); end
+        for n = 1:Ncons; @inbounds UL_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k,n); end
     end
     if !(_ρR >= eps(FT)) || !(_eiR >= eps(FT)) || !isfinite(_ρR) || !isfinite(_eiR)
-        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,i,j,k+1,n); end
+        for n = 1:Ncons; @inbounds UR_final[n] = _structured_state_component(U,Q,B0x_cell,B0y_cell,B0z_cell,i,j,k+1,n); end
     end
     end
 
@@ -2357,7 +2484,10 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
 
     # Hybrid flux: Continuous blending of KEP with an upwind Riemann flux
     @inbounds local_lin_ϕ = lin_phi_arr[j,k]
-    flux_temp = Blend_Flux(UL_vec, UR_vec, nx, ny, nz, ϕz, hybrid_ϕ1, local_lin_ϕ, splitMethodID, ch_glm)
+    flux_temp = Blend_Flux(
+        UL_vec, UR_vec, nx, ny, nz, ϕz, hybrid_ϕ1, local_lin_ϕ,
+        splitMethodID, ch_glm, background_face_vector,
+    )
 
     @static if ct_mode
         @static if @isdefined(ct_emf_scheme) &&

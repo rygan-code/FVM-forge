@@ -38,7 +38,8 @@ function expand_coords_with_ghost(x_real, y_real, z_real,
                                    face_bc, bid, connectivity;
                                    xi_offset::Int=0,
                                    cell_offsets::NTuple{3,Int}=(xi_offset, 0, 0),
-                                   block_dims::NTuple{3,Int}=(Nx, Ny, Nz))
+                                   block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
+                                   topology_covariant::Bool=false)
     Nx_tot = Nx + 2*NG + 1
     Ny_tot = Ny + 2*NG + 1
     Nz_tot = Nz + 2*NG + 1
@@ -83,6 +84,7 @@ function expand_coords_with_ghost(x_real, y_real, z_real,
         cell_offsets=cell_offsets,
         block_dims=block_dims,
         mesh_cache=mesh_cache,
+        topology_covariant=topology_covariant,
     )
     
     return FT.(x), FT.(y), FT.(z)
@@ -686,6 +688,7 @@ function _resolve_topological_node(
     bid::Int, index::NTuple{3,Int}, dims::NTuple{3,Int},
     face_bc, connectivity, mesh_cache;
     max_steps::Int=12,
+    reference_coordinate=nothing,
 )
     # A junction node has several equivalent representations.  Following
     # only the first out-of-range coordinate makes the result depend on which
@@ -823,10 +826,47 @@ function _resolve_topological_node(
     end
 
     isempty(candidates) && return nothing
-    sort!(candidates, by = candidate -> (
-        candidate[1], candidate[2][1], candidate[2][2], candidate[2][3],
-        candidate[3][1], candidate[3][2], candidate[3][3],
-    ))
+
+    if reference_coordinate === nothing
+        sort!(candidates, by = candidate -> (
+            candidate[1], candidate[2][1], candidate[2][2], candidate[2][3],
+            candidate[3][1], candidate[3][2], candidate[3][3],
+        ))
+        owner_bid, source, owner_shift = first(candidates)
+        coords = _ghost_mesh_coords(mesh_cache, owner_bid)
+        coords === nothing && return nothing
+        return (
+            coords[1][source...] + owner_shift[1],
+            coords[2][source...] + owner_shift[2],
+            coords[3][source...] + owner_shift[3],
+        )
+    end
+
+    # At a multi-block junction, more than one real-node continuation may be
+    # reachable.  A block-ID owner is deterministic but not geometric: rotating
+    # or renumbering an otherwise identical mesh then changes the high-order
+    # metric stencil.  The product extrapolation already stored at this ghost
+    # node is a local smooth-continuation estimate, so use it to select the
+    # physically nearest topological image.  The remaining tuple fields only
+    # break ties between coincident images and cannot bias the geometry.
+    function candidate_key(candidate)
+        candidate_bid, candidate_index, candidate_shift = candidate
+        candidate_coords = _ghost_mesh_coords(mesh_cache, candidate_bid)
+        candidate_coords === nothing && return (Inf, Inf, Inf, Inf,
+                                                  candidate_bid,
+                                                  candidate_index...,
+                                                  candidate_shift...)
+        px = candidate_coords[1][candidate_index...] + candidate_shift[1]
+        py = candidate_coords[2][candidate_index...] + candidate_shift[2]
+        pz = candidate_coords[3][candidate_index...] + candidate_shift[3]
+        distance2 = reference_coordinate === nothing ? zero(px) :
+            (px - reference_coordinate[1])^2 +
+            (py - reference_coordinate[2])^2 +
+            (pz - reference_coordinate[3])^2
+        return (distance2, px, py, pz, candidate_bid,
+                candidate_index..., candidate_shift...)
+    end
+    sort!(candidates, by=candidate_key)
     owner_bid, source, owner_shift = first(candidates)
     coords = _ghost_mesh_coords(mesh_cache, owner_bid)
     coords === nothing && return nothing
@@ -842,6 +882,7 @@ function _fill_topological_edge_corner_ghosts!(
     cell_offsets::NTuple{3,Int}=(0, 0, 0),
     block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
     mesh_cache=nothing,
+    topology_covariant::Bool=false,
 )
     local_dims = (Nx, Ny, Nz)
     for k in axes(x, 3), j in axes(x, 2), i in axes(x, 1)
@@ -915,7 +956,9 @@ function _fill_topological_edge_corner_ghosts!(
         any(_topology_interblock_bc(bc) for bc in bcs) || continue
 
         resolved = _resolve_topological_node(
-            bid, global_index, block_dims, face_bc, connectivity, mesh_cache,
+            bid, global_index, block_dims, face_bc, connectivity, mesh_cache;
+            reference_coordinate=topology_covariant ?
+                (x[i,j,k], y[i,j,k], z[i,j,k]) : nothing,
         )
         resolved === nothing && throw(ArgumentError(
             "unable to resolve topological ghost node " *
@@ -1184,11 +1227,100 @@ end
     end
 end
 
-function structured_scmm_edge_line_integrals(vector_potential, x, y, z; time=zero(eltype(x)))
+if !isdefined(@__MODULE__, :STRUCTURED_METRIC_JUNCTION_LAYERS)
+    const STRUCTURED_METRIC_JUNCTION_LAYERS = 4
+end
+
+if !isdefined(@__MODULE__, :_STRUCTURED_METRIC_EDGE_PINS)
+    # (axis_a, high_a, axis_b, high_b), matching the solver's 12-edge
+    # topology convention.  The edge itself runs along the remaining axis.
+    const _STRUCTURED_METRIC_EDGE_PINS = (
+        (2, false, 3, false), (2, false, 3, true),
+        (2, true,  3, false), (2, true,  3, true),
+        (1, false, 3, false), (1, false, 3, true),
+        (1, true,  3, false), (1, true,  3, true),
+        (1, false, 2, false), (1, false, 2, true),
+        (1, true,  2, false), (1, true,  2, true),
+    )
+end
+
+@inline function _structured_metric_boundary_distance(
+    index, axis, edge_direction, high, dims, ng,
+)
+    boundary = ng + 1 + (high ? dims[axis] : 0)
+    coordinate = axis == edge_direction ? index + 0.5 : index
+    return abs(coordinate - boundary)
+end
+
+@inline function structured_metric_near_junction_edge(
+    edge_direction, i, j, k, dims, ng, singularity_edges, junction_layers,
+)
+    singularity_edges === nothing && return false
+    junction_layers > 0 || return false
+    length(singularity_edges) == 12 || throw(DimensionMismatch(
+        "structured metric singularity flags must contain 12 block edges",
+    ))
+    indices = (i, j, k)
+    @inbounds for edge_index in 1:12
+        singularity_edges[edge_index] || continue
+        axis_a, high_a, axis_b, high_b =
+            _STRUCTURED_METRIC_EDGE_PINS[edge_index]
+        distance_a = _structured_metric_boundary_distance(
+            indices[axis_a], axis_a, edge_direction, high_a, dims, ng,
+        )
+        distance_b = _structured_metric_boundary_distance(
+            indices[axis_b], axis_b, edge_direction, high_b, dims, ng,
+        )
+        max(distance_a, distance_b) <= junction_layers && return true
+    end
+    return false
+end
+
+@inline function structured_metric_endpoint_products(
+    x, y, z, edge_direction, i, j, k,
+)
+    ip = i + (edge_direction == 1)
+    jp = j + (edge_direction == 2)
+    kp = k + (edge_direction == 3)
+    half = eltype(x)(0.5)
+    return (
+        half * (y[i,j,k] * z[ip,jp,kp] - z[i,j,k] * y[ip,jp,kp]),
+        half * (z[i,j,k] * x[ip,jp,kp] - x[i,j,k] * z[ip,jp,kp]),
+        half * (x[i,j,k] * y[ip,jp,kp] - y[i,j,k] * x[ip,jp,kp]),
+    )
+end
+
+@inline function structured_endpoint_line_integral(
+    ax, ay, az, x, y, z, edge_direction, i, j, k,
+)
+    ip = i + (edge_direction == 1)
+    jp = j + (edge_direction == 2)
+    kp = k + (edge_direction == 3)
+    half = eltype(x)(0.5)
+    return (
+        half * (ax[i,j,k] + ax[ip,jp,kp]) * (x[ip,jp,kp] - x[i,j,k]) +
+        half * (ay[i,j,k] + ay[ip,jp,kp]) * (y[ip,jp,kp] - y[i,j,k]) +
+        half * (az[i,j,k] + az[ip,jp,kp]) * (z[ip,jp,kp] - z[i,j,k])
+    )
+end
+
+function structured_scmm_edge_line_integrals(
+    vector_potential, x, y, z;
+    time=zero(eltype(x)), active_dims=nothing, ng::Int=0,
+    singularity_edges=nothing,
+    junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS,
+)
     size(x) == size(y) == size(z) || throw(DimensionMismatch(
         "SCMM edge geometry arrays must have identical sizes",
     ))
     ni, nj, nk = size(x)
+    if singularity_edges !== nothing && active_dims === nothing
+        throw(ArgumentError(
+            "active_dims is required for junction-regularized SCMM edges",
+        ))
+    end
+    metric_dims = active_dims === nothing ? (ni - 1, nj - 1, nk - 1) :
+        active_dims
     T = promote_type(eltype(x), typeof(time))
     ax = Array{T}(undef, ni, nj, nk)
     ay = similar(ax)
@@ -1204,31 +1336,52 @@ function structured_scmm_edge_line_integrals(vector_potential, x, y, z; time=zer
     edge_y = Array{T,3}(undef, ni, nj - 1, nk)
     edge_z = Array{T,3}(undef, ni, nj, nk - 1)
     @inbounds for k in 1:nk, j in 1:nj, i in 1:ni-1
-        edge_x[i,j,k] =
+        edge_x[i,j,k] = if structured_metric_near_junction_edge(
+            1, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
+        )
+            structured_endpoint_line_integral(
+                ax, ay, az, x, y, z, 1, i, j, k,
+            )
+        else
             structured_scmm_interp_i(ax, i, j, k, ni) *
                 structured_scmm_deriv_i(x, i, j, k, ni) +
             structured_scmm_interp_i(ay, i, j, k, ni) *
                 structured_scmm_deriv_i(y, i, j, k, ni) +
             structured_scmm_interp_i(az, i, j, k, ni) *
                 structured_scmm_deriv_i(z, i, j, k, ni)
+        end
     end
     @inbounds for k in 1:nk, j in 1:nj-1, i in 1:ni
-        edge_y[i,j,k] =
+        edge_y[i,j,k] = if structured_metric_near_junction_edge(
+            2, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
+        )
+            structured_endpoint_line_integral(
+                ax, ay, az, x, y, z, 2, i, j, k,
+            )
+        else
             structured_scmm_interp_j(ax, i, j, k, nj) *
                 structured_scmm_deriv_j(x, i, j, k, nj) +
             structured_scmm_interp_j(ay, i, j, k, nj) *
                 structured_scmm_deriv_j(y, i, j, k, nj) +
             structured_scmm_interp_j(az, i, j, k, nj) *
                 structured_scmm_deriv_j(z, i, j, k, nj)
+        end
     end
     @inbounds for k in 1:nk-1, j in 1:nj, i in 1:ni
-        edge_z[i,j,k] =
+        edge_z[i,j,k] = if structured_metric_near_junction_edge(
+            3, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
+        )
+            structured_endpoint_line_integral(
+                ax, ay, az, x, y, z, 3, i, j, k,
+            )
+        else
             structured_scmm_interp_k(ax, i, j, k, nk) *
                 structured_scmm_deriv_k(x, i, j, k, nk) +
             structured_scmm_interp_k(ay, i, j, k, nk) *
                 structured_scmm_deriv_k(y, i, j, k, nk) +
             structured_scmm_interp_k(az, i, j, k, nk) *
                 structured_scmm_deriv_k(z, i, j, k, nk)
+        end
     end
     return edge_x, edge_y, edge_z
 end
@@ -1236,6 +1389,8 @@ end
 function compute_fvm_metrics_runtime(
     x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
     periodic=(false, false, false),
+    singularity_edges=nothing,
+    junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS,
 )
     Nx_nodes_tot = Nx + 2NG + 1
     Ny_nodes_tot = Ny + 2NG + 1
@@ -1342,50 +1497,74 @@ function compute_fvm_metrics_runtime(
     # --- Pre-compute SCMM intermediate edge products ---
     # a) k-face/edge intermediates (midpoint in k, nodes in i and j)
     for k in 1:Nz_cells_tot, j in 1:Ny_nodes_tot, i in 1:Nx_nodes_tot
-        y_dz_k[i, j, k] = FT(0.5) * (
-            interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot) -
-            interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot)
+        if structured_metric_near_junction_edge(
+            3, i, j, k, (Nx, Ny, Nz), NG,
+            singularity_edges, junction_layers,
         )
-        z_dx_k[i, j, k] = FT(0.5) * (
-            interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot) -
-            interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot)
-        )
-        x_dy_k[i, j, k] = FT(0.5) * (
-            interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot) -
-            interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot)
-        )
+            y_dz_k[i,j,k], z_dx_k[i,j,k], x_dy_k[i,j,k] =
+                structured_metric_endpoint_products(x, y, z, 3, i, j, k)
+        else
+            y_dz_k[i, j, k] = FT(0.5) * (
+                interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot) -
+                interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot)
+            )
+            z_dx_k[i, j, k] = FT(0.5) * (
+                interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot) -
+                interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot)
+            )
+            x_dy_k[i, j, k] = FT(0.5) * (
+                interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot) -
+                interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot)
+            )
+        end
     end
     
     # b) j-face/edge intermediates (midpoint in j, nodes in i and k)
     for k in 1:Nz_nodes_tot, j in 1:Ny_cells_tot, i in 1:Nx_nodes_tot
-        y_dz_j[i, j, k] = FT(0.5) * (
-            interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot) -
-            interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot)
+        if structured_metric_near_junction_edge(
+            2, i, j, k, (Nx, Ny, Nz), NG,
+            singularity_edges, junction_layers,
         )
-        z_dx_j[i, j, k] = FT(0.5) * (
-            interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot) -
-            interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot)
-        )
-        x_dy_j[i, j, k] = FT(0.5) * (
-            interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot) -
-            interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot)
-        )
+            y_dz_j[i,j,k], z_dx_j[i,j,k], x_dy_j[i,j,k] =
+                structured_metric_endpoint_products(x, y, z, 2, i, j, k)
+        else
+            y_dz_j[i, j, k] = FT(0.5) * (
+                interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot) -
+                interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot)
+            )
+            z_dx_j[i, j, k] = FT(0.5) * (
+                interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot) -
+                interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot)
+            )
+            x_dy_j[i, j, k] = FT(0.5) * (
+                interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot) -
+                interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot)
+            )
+        end
     end
     
     # c) i-face/edge intermediates (midpoint in i, nodes in j and k)
     for k in 1:Nz_nodes_tot, j in 1:Ny_nodes_tot, i in 1:Nx_cells_tot
-        y_dz_i[i, j, k] = FT(0.5) * (
-            interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot) -
-            interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot)
+        if structured_metric_near_junction_edge(
+            1, i, j, k, (Nx, Ny, Nz), NG,
+            singularity_edges, junction_layers,
         )
-        z_dx_i[i, j, k] = FT(0.5) * (
-            interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot) -
-            interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot)
-        )
-        x_dy_i[i, j, k] = FT(0.5) * (
-            interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot) -
-            interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot)
-        )
+            y_dz_i[i,j,k], z_dx_i[i,j,k], x_dy_i[i,j,k] =
+                structured_metric_endpoint_products(x, y, z, 1, i, j, k)
+        else
+            y_dz_i[i, j, k] = FT(0.5) * (
+                interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot) -
+                interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot)
+            )
+            z_dx_i[i, j, k] = FT(0.5) * (
+                interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot) -
+                interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot)
+            )
+            x_dy_i[i, j, k] = FT(0.5) * (
+                interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot) -
+                interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot)
+            )
+        end
     end
 
     # 1. Compute i-face metrics (face center: i, j+1/2, k+1/2)
@@ -1486,7 +1665,7 @@ end
 # Cache filename includes block ID AND rank indices to avoid race conditions
 # =============================================================================
 if !isdefined(@__MODULE__, :STRUCTURED_METRIC_ALGORITHM_VERSION)
-    const STRUCTURED_METRIC_ALGORITHM_VERSION = 4
+    const STRUCTURED_METRIC_ALGORITHM_VERSION = 5
 end
 
 function _structured_metric_fingerprint(arrays...)
@@ -1567,9 +1746,15 @@ function load_or_compute_metrics(bid::Int, rx::Int, ry::Int, rz::Int,
                                   x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
                                   cache_metrics::Bool=true,
                                   periodic=(false, false, false),
-                                  topology_fingerprint::AbstractString="none")
+                                  topology_fingerprint::AbstractString="none",
+                                  singularity_edges=nothing,
+                                  junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS)
     _mesh_base_mc = isdefined(Main, :mesh_dir) ? getfield(Main, :mesh_dir) : "MESH"
-    mesh_fingerprint = _structured_metric_fingerprint(x, y, z)
+    mesh_fingerprint = singularity_edges === nothing ?
+        _structured_metric_fingerprint(x, y, z) :
+        _structured_metric_fingerprint(
+            x, y, z, Int8.(collect(singularity_edges)), Int32[junction_layers],
+        )
     cache_path = joinpath(
         _mesh_base_mc,
         _metrics_cache_filename(
@@ -1603,7 +1788,10 @@ function load_or_compute_metrics(bid::Int, rx::Int, ry::Int, rz::Int,
     println("    Computing metrics at runtime for block $bid rank ($rx,$ry,$rz)...")
     Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V = 
         compute_fvm_metrics_runtime(
-            x, y, z, Nx, Ny, Nz, NG; periodic=periodic,
+            x, y, z, Nx, Ny, Nz, NG;
+            periodic=periodic,
+            singularity_edges=singularity_edges,
+            junction_layers=junction_layers,
         )
     
     return cache_path, true, Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V

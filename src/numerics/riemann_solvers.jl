@@ -621,6 +621,149 @@ end
 # 5-wave approximate Riemann solver for ideal MHD.
 # Captures fast magnetosonic, Alfvén, and contact discontinuities.
 # Extended with GLM for the ψ-equation.
+# Background-field HLLE for CT B=B0+b. The input magnetic components and
+# magnetic part of U[5] describe b; wave speeds and induction use B0+b.
+@inline function _mhd_background_state_is_physical(U)
+    rho = U[1]
+    if !(isfinite(rho) && rho > zero(FT))
+        return false
+    end
+    inv_rho = one(FT) / rho
+    kinetic = FT(0.5) * (
+        U[2]*U[2] + U[3]*U[3] + U[4]*U[4]
+    ) * inv_rho
+    perturbation_magnetic = FT(0.5) * INV_MU0_SI * (
+        U[6]*U[6] + U[7]*U[7] + U[8]*U[8]
+    )
+    pressure = mhd_thermodynamic_pressure(
+        rho, U[5] - kinetic - perturbation_magnetic, γ,
+    )
+    return isfinite(pressure) && pressure > zero(FT) && all(isfinite, U)
+end
+
+@inline function _mhd_background_flux_normal(
+    U, background::SVector{3,FT}, nx, ny, nz, ch::FT,
+)
+    rho = U[1]
+    inv_rho = one(FT) / rho
+    u = U[2] * inv_rho
+    v = U[3] * inv_rho
+    w = U[4] * inv_rho
+    bx = U[6]
+    by = U[7]
+    bz = U[8]
+    psi = U[9]
+    b0x, b0y, b0z = background
+
+    qn = u*nx + v*ny + w*nz
+    bn = bx*nx + by*ny + bz*nz
+    b0n = b0x*nx + b0y*ny + b0z*nz
+    total_bn = bn + b0n
+    b2 = bx*bx + by*by + bz*bz
+    b0_dot_b = b0x*bx + b0y*by + b0z*bz
+    velocity_dot_b = u*bx + v*by + w*bz
+    kinetic = FT(0.5) * rho * (u*u + v*v + w*w)
+    pressure = mhd_thermodynamic_pressure(
+        rho, U[5] - kinetic - FT(0.5)*b2*INV_MU0_SI, γ,
+    )
+    split_magnetic_pressure = (
+        b0_dot_b + FT(0.5)*b2
+    ) * INV_MU0_SI
+
+    f1 = rho * qn
+    f2 = rho*u*qn + (pressure + split_magnetic_pressure)*nx -
+         (b0x*bn + bx*b0n + bx*bn)*INV_MU0_SI
+    f3 = rho*v*qn + (pressure + split_magnetic_pressure)*ny -
+         (b0y*bn + by*b0n + by*bn)*INV_MU0_SI
+    f4 = rho*w*qn + (pressure + split_magnetic_pressure)*nz -
+         (b0z*bn + bz*b0n + bz*bn)*INV_MU0_SI
+    f5 = isothermal_mhd ? zero(FT) :
+         (U[5] + pressure + split_magnetic_pressure)*qn -
+         total_bn*velocity_dot_b*INV_MU0_SI
+    f6 = (b0x + bx)*qn - u*total_bn + psi*nx
+    f7 = (b0y + by)*qn - v*total_bn + psi*ny
+    f8 = (b0z + bz)*qn - w*total_bn + psi*nz
+    f9 = ch*ch*total_bn
+    return SVector{9,FT}(f1, f2, f3, f4, f5, f6, f7, f8, f9)
+end
+
+@inline function _mhd_background_total_energy_carrier_flux(
+    reduced_flux, background::SVector{3,FT},
+)
+    isothermal_mhd && return setindex(reduced_flux, zero(FT), 5)
+    induction_work = (
+        background[1]*reduced_flux[6] +
+        background[2]*reduced_flux[7] +
+        background[3]*reduced_flux[8]
+    ) * INV_MU0_SI
+    return setindex(reduced_flux, reduced_flux[5] + induction_work, 5)
+end
+
+@inline function MHD_HLLE_Background_Flux(
+    UL, UR, background::SVector{3,FT}, nx, ny, nz, ch_glm::FT,
+)
+    if !(_mhd_background_state_is_physical(UL) &&
+         _mhd_background_state_is_physical(UR))
+        return _mhd_nan_flux()
+    end
+
+    rhoL = UL[1]
+    rhoR = UR[1]
+    inv_rhoL = one(FT) / rhoL
+    inv_rhoR = one(FT) / rhoR
+    uL = UL[2]*inv_rhoL; vL = UL[3]*inv_rhoL; wL = UL[4]*inv_rhoL
+    uR = UR[2]*inv_rhoR; vR = UR[3]*inv_rhoR; wR = UR[4]*inv_rhoR
+    bxL = background[1] + UL[6]
+    byL = background[2] + UL[7]
+    bzL = background[3] + UL[8]
+    bxR = background[1] + UR[6]
+    byR = background[2] + UR[7]
+    bzR = background[3] + UR[8]
+    b2L = UL[6]*UL[6] + UL[7]*UL[7] + UL[8]*UL[8]
+    b2R = UR[6]*UR[6] + UR[7]*UR[7] + UR[8]*UR[8]
+    kineticL = FT(0.5) * rhoL * (uL*uL + vL*vL + wL*wL)
+    kineticR = FT(0.5) * rhoR * (uR*uR + vR*vR + wR*wR)
+    pL = mhd_thermodynamic_pressure(
+        rhoL, UL[5] - kineticL - FT(0.5)*b2L*INV_MU0_SI, γ,
+    )
+    pR = mhd_thermodynamic_pressure(
+        rhoR, UR[5] - kineticR - FT(0.5)*b2R*INV_MU0_SI, γ,
+    )
+    qnL = uL*nx + vL*ny + wL*nz
+    qnR = uR*nx + vR*ny + wR*nz
+    total_b2L = bxL*bxL + byL*byL + bzL*bzL
+    total_b2R = bxR*bxR + byR*byR + bzR*bzR
+    cfL = sqrt(mhd_sound_speed_squared(rhoL, pL, γ) +
+               total_b2L*INV_MU0_SI*inv_rhoL)
+    cfR = sqrt(mhd_sound_speed_squared(rhoR, pR, γ) +
+               total_b2R*INV_MU0_SI*inv_rhoR)
+    ch = ch_glm
+    SL = min(qnL-cfL, qnR-cfR, -ch)
+    SR = max(qnL+cfL, qnR+cfR, ch)
+    FL = _mhd_background_flux_normal(UL, background, nx, ny, nz, ch)
+    FR = _mhd_background_flux_normal(UR, background, nx, ny, nz, ch)
+
+    reduced_flux = if SL >= zero(FT)
+        FL
+    elseif SR <= zero(FT)
+        FR
+    else
+        inv_span = one(FT) / (SR - SL)
+        state_jump = isothermal_mhd ?
+            SVector{9,FT}(
+                UR[1]-UL[1], UR[2]-UL[2], UR[3]-UL[3], UR[4]-UL[4],
+                zero(FT), UR[6]-UL[6], UR[7]-UL[7], UR[8]-UL[8],
+                UR[9]-UL[9],
+            ) : UR - UL
+        SVector{9,FT}(ntuple(Val(9)) do n
+            (SR*FL[n] - SL*FR[n] + SL*SR*state_jump[n]) * inv_span
+        end)
+    end
+    return _mhd_background_total_energy_carrier_flux(
+        reduced_flux, background,
+    )
+end
+
 @inline _mhd_nan_flux() =
     SVector{9,FT}(ntuple(_ -> FT(NaN), Val(9)))
 

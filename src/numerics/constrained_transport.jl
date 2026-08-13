@@ -15,6 +15,34 @@ if !@isdefined(STRUCTURED_FACE_QUADRATURE_LOADED)
     include(joinpath(@__DIR__, "structured_face_quadrature.jl"))
 end
 
+function validate_ct_background_split_configuration(;
+    enabled::Bool,
+    equation::Symbol,
+    ct_enabled::Bool,
+    split_method::Integer,
+    eigen_reconstruction_enabled::Bool,
+    resistive_enabled::Bool,
+)
+    enabled || return nothing
+    equation == :MHD || throw(ArgumentError(
+        "magnetic background splitting requires equation_type=:MHD",
+    ))
+    ct_enabled || throw(ArgumentError(
+        "magnetic background splitting currently requires CT",
+    ))
+    split_method == 6 || throw(ArgumentError(
+        "magnetic background splitting currently supports only " *
+        "splitMethodID=6 (HLLE), got $split_method",
+    ))
+    !eigen_reconstruction_enabled || throw(ArgumentError(
+        "magnetic background splitting does not yet support eigen reconstruction",
+    ))
+    !resistive_enabled || throw(ArgumentError(
+        "magnetic background splitting currently supports only ideal MHD",
+    ))
+    return nothing
+end
+
 function ct_init_face_b_kernel!(
     Bx_face, By_face, Bz_face, Q,
     Areai, nxi, nyi, nzi,
@@ -82,8 +110,27 @@ function ct_initial_face_flux_from_vector_potential!(
     size(x) == size(y) == size(z) || throw(DimensionMismatch(
         "CT node-coordinate arrays must have identical sizes",
     ))
+    singularity_edges = nothing
+    if hasproperty(b, :id) && isdefined(@__MODULE__, :_SING_INFO)
+        singularity_info = getfield(@__MODULE__, :_SING_INFO)
+        if singularity_info !== nothing &&
+           b.id + 1 <= size(singularity_info.is_singularity_edge, 1)
+            candidate = ntuple(
+                edge_index -> singularity_info.is_singularity_edge[
+                    b.id + 1, edge_index,
+                ],
+                12,
+            )
+            any(candidate) && (singularity_edges = candidate)
+        end
+    end
     edge_x, edge_y, edge_z = structured_scmm_edge_line_integrals(
-        vector_potential, x, y, z; time=FT(time),
+        vector_potential, x, y, z;
+        time=FT(time),
+        active_dims=(b.Nx, b.Ny, b.Nz),
+        ng=NG,
+        singularity_edges=singularity_edges,
+        junction_layers=STRUCTURED_METRIC_JUNCTION_LAYERS,
     )
     phi_x, phi_y, phi_z = ct_face_fluxes_from_edge_integrals(
         edge_x, edge_y, edge_z,
@@ -1032,13 +1079,45 @@ function ct_conducting_wall_edge_emf_kernel!(
     return
 end
 
+function ct_profiled_inflow_edge_emf_kernel!(
+    Ey_edge, Ez_edge, x, y, z, bcp, nxp, nyp, nzp,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    i == Int32(1) || return
+    ni = Int32(NG) + Int32(1)
+    nj = j + Int32(NG)
+    nk = k + Int32(NG)
+
+    if j <= nyp && k <= nzp + Int32(1)
+        @inbounds Ey_edge[1,j,k] = magnetic_nozzle_profiled_inflow_line_emf(
+            bcp,
+            x[ni,nj,nk], y[ni,nj,nk], z[ni,nj,nk],
+            x[ni,nj+Int32(1),nk], y[ni,nj+Int32(1),nk],
+            z[ni,nj+Int32(1),nk],
+            Rg, (isothermal_mhd ? one(FT) : Cp/(Cp-Rg)), isothermal_mhd,
+        )
+    end
+    if j <= nyp + Int32(1) && k <= nzp
+        @inbounds Ez_edge[1,j,k] = magnetic_nozzle_profiled_inflow_line_emf(
+            bcp,
+            x[ni,nj,nk], y[ni,nj,nk], z[ni,nj,nk],
+            x[ni,nj,nk+Int32(1)], y[ni,nj,nk+Int32(1)],
+            z[ni,nj,nk+Int32(1)],
+            Rg, (isothermal_mhd ? one(FT) : Cp/(Cp-Rg)), isothermal_mhd,
+        )
+    end
+    return
+end
+
 @inline function ct_is_conducting_wall_bc(bc)
     return bc == Int(BC_MHD_WALL) ||
            bc == Int(BC_ISOTHERMAL_WALL) ||
            bc == Int(BC_ADIABATIC_WALL)
 end
 
-function ct_enforce_physical_edge_emf!(b, bid, face_bc)
+function ct_enforce_physical_edge_emf!(b, bid, face_bc, bc_params=nothing)
     nb = (
         cld(b.Nx + 1, nthreads[1]),
         cld(b.Ny + 1, nthreads[2]),
@@ -1046,6 +1125,24 @@ function ct_enforce_physical_edge_emf!(b, bid, face_bc)
     )
     for fid in 1:6
         bc = get(face_bc, (bid, fid), Int(BC_INTERBLOCK))
+        if bc == Int(BC_MHD_PROFILED_INFLOW)
+            fid == 1 || throw(ArgumentError(
+                "profiled CT inflow edge EMF currently supports only x-lo",
+            ))
+            b.rx == 0 || continue
+            bc_params === nothing && throw(ArgumentError(
+                "profiled CT inflow edge EMF requires boundary parameters",
+            ))
+            bcp = get(bc_params, (bid, fid), nothing)
+            bcp === nothing && throw(ArgumentError(
+                "missing profiled CT inflow parameters for block=$bid face=$fid",
+            ))
+            @gpu_launch threads=nthreads blocks=nb ct_profiled_inflow_edge_emf_kernel!(
+                b.Ey_edge, b.Ez_edge, b.x, b.y, b.z, bcp,
+                Int32(b.Nx), Int32(b.Ny), Int32(b.Nz),
+            )
+            continue
+        end
         ct_is_conducting_wall_bc(bc) || continue
         direction = Int32((fid + 1) ÷ 2)
         side = Int32(isodd(fid) ? 0 : 1)
@@ -1325,6 +1422,8 @@ function ct_recover_cell_b_kernel!(
     Areak, nxk, nyk, nzk,
     recovery_mode, nxp, nyp, nzp, cell_offset,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    output_bx=nothing, output_by=nothing, output_bz=nothing,
+    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -1335,10 +1434,14 @@ function ct_recover_cell_b_kernel!(
     kk = k + cell_offset
 
     @inbounds begin
+        split_background = B0x_cell !== nothing
+        recovery_B0x_face = split_background ? nothing : B0x_face
+        recovery_B0y_face = split_background ? nothing : B0y_face
+        recovery_B0z_face = split_background ? nothing : B0z_face
         if recovery_mode == CT_CELL_B_POINT6
             magnetic = ct_recover_cell_b_point6(
                 Bx_face, By_face, Bz_face,
-                B0x_face, B0y_face, B0z_face,
+                recovery_B0x_face, recovery_B0y_face, recovery_B0z_face,
                 Areai, nxi, nyi, nzi,
                 Areaj, nxj, nyj, nzj,
                 Areak, nxk, nyk, nzk,
@@ -1378,21 +1481,47 @@ function ct_recover_cell_b_kernel!(
             magnetic = ct_recover_cell_b(
                 area_i_lo, area_i_hi, area_j_lo, area_j_hi,
                 area_k_lo, area_k_hi,
-                _ct_total_face_flux(Bx_face, B0x_face, ii, jj, kk),
-                _ct_total_face_flux(Bx_face, B0x_face, ii+Int32(1), jj, kk),
-                _ct_total_face_flux(By_face, B0y_face, ii, jj, kk),
-                _ct_total_face_flux(By_face, B0y_face, ii, jj+Int32(1), kk),
-                _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk),
-                _ct_total_face_flux(Bz_face, B0z_face, ii, jj, kk+Int32(1)),
+                _ct_total_face_flux(
+                    Bx_face, recovery_B0x_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    Bx_face, recovery_B0x_face, ii+Int32(1), jj, kk,
+                ),
+                _ct_total_face_flux(
+                    By_face, recovery_B0y_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    By_face, recovery_B0y_face, ii, jj+Int32(1), kk,
+                ),
+                _ct_total_face_flux(
+                    Bz_face, recovery_B0z_face, ii, jj, kk,
+                ),
+                _ct_total_face_flux(
+                    Bz_face, recovery_B0z_face, ii, jj, kk+Int32(1),
+                ),
+            )
+        end
+
+        if split_background
+            magnetic += SVector(
+                B0x_cell[ii,jj,kk],
+                B0y_cell[ii,jj,kk],
+                B0z_cell[ii,jj,kk],
             )
         end
 
         if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
            isfinite(magnetic[3])
-            Q[ii,jj,kk,QBX] = magnetic[1]
-            Q[ii,jj,kk,QBY] = magnetic[2]
-            Q[ii,jj,kk,QBZ] = magnetic[3]
-            Q[ii,jj,kk,QPSI] = zero(FT)
+            if output_bx === nothing
+                Q[ii,jj,kk,QBX] = magnetic[1]
+                Q[ii,jj,kk,QBY] = magnetic[2]
+                Q[ii,jj,kk,QBZ] = magnetic[3]
+                Q[ii,jj,kk,QPSI] = zero(FT)
+            else
+                output_bx[ii,jj,kk] = magnetic[1]
+                output_by[ii,jj,kk] = magnetic[2]
+                output_bz[ii,jj,kk] = magnetic[3]
+            end
         end
     end
     return
@@ -1751,6 +1880,7 @@ function _ct_launch_recover_cell_b!(
     range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
     cell_offset::Int32,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    B0x_cell=nothing, B0y_cell=nothing, B0z_cell=nothing,
 )
     nb = (
         cld(range_nxp, nthreads[1]),
@@ -1763,7 +1893,57 @@ function _ct_launch_recover_cell_b!(
         b.Areaj, b.nxj, b.nyj, b.nzj,
         b.Areak, b.nxk, b.nyk, b.nzk,
         recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
-        B0x_face, B0y_face, B0z_face)
+        B0x_face, B0y_face, B0z_face,
+        nothing, nothing, nothing,
+        B0x_cell, B0y_cell, B0z_cell)
+    return nothing
+end
+
+function _ct_launch_recover_background_cell_b!(
+    b, recovery_mode::Int32,
+    range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
+    cell_offset::Int32,
+)
+    nb = (
+        cld(range_nxp, nthreads[1]),
+        cld(range_nyp, nthreads[2]),
+        cld(range_nzp, nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_recover_cell_b_kernel!(
+        b.Q, b.B0x_face, b.B0y_face, b.B0z_face,
+        b.Areai, b.nxi, b.nyi, b.nzi,
+        b.Areaj, b.nxj, b.nyj, b.nzj,
+        b.Areak, b.nxk, b.nyk, b.nzk,
+        recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
+        nothing, nothing, nothing,
+        b.B0x_cell, b.B0y_cell, b.B0z_cell)
+    return nothing
+end
+
+function ct_recover_background_cell_b!(
+    b, nxp, nyp, nzp;
+    recovery_mode::Int32=ct_cell_b_recovery,
+)
+    b.B0x_cell === nothing && return nothing
+    recovery_mode in (CT_CELL_B_LSQ2, CT_CELL_B_POINT6) ||
+        throw(ArgumentError("unknown CT background cell-B recovery mode $recovery_mode"))
+    if recovery_mode == CT_CELL_B_POINT6
+        _ct_launch_recover_background_cell_b!(
+            b, CT_CELL_B_LSQ2,
+            Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
+            Int32(0),
+        )
+        _ct_launch_recover_background_cell_b!(
+            b, CT_CELL_B_POINT6,
+            Int32(nxp), Int32(nyp), Int32(nzp), Int32(NG),
+        )
+    else
+        _ct_launch_recover_background_cell_b!(
+            b, recovery_mode,
+            Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
+            Int32(0),
+        )
+    end
     return nothing
 end
 
@@ -1778,6 +1958,10 @@ function ct_recover_cell_b!(
         (b.B0x_face, b.B0y_face, b.B0z_face) :
         (nothing, nothing, nothing)
     B0x_face, B0y_face, B0z_face = background_faces
+    background_cells = B0x_face !== nothing && hasproperty(b, :B0x_cell) ?
+        (b.B0x_cell, b.B0y_cell, b.B0z_cell) :
+        (nothing, nothing, nothing)
+    B0x_cell, B0y_cell, B0z_cell = background_cells
     if include_ghosts && recovery_mode == CT_CELL_B_POINT6
         # POINT6 needs two face layers on the low side and three on the high
         # side. Those layers do not exist outside the padded allocation, so
@@ -1788,11 +1972,13 @@ function ct_recover_cell_b!(
             b, CT_CELL_B_LSQ2,
             Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
             Int32(0), B0x_face, B0y_face, B0z_face,
+            B0x_cell, B0y_cell, B0z_cell,
         )
         _ct_launch_recover_cell_b!(
             b, CT_CELL_B_POINT6,
             Int32(nxp), Int32(nyp), Int32(nzp), Int32(NG),
             B0x_face, B0y_face, B0z_face,
+            B0x_cell, B0y_cell, B0z_cell,
         )
     else
         _ct_launch_recover_cell_b!(
@@ -1802,8 +1988,59 @@ function ct_recover_cell_b!(
             Int32(include_ghosts ? nzp + 2*NG : nzp),
             Int32(include_ghosts ? 0 : NG),
             B0x_face, B0y_face, B0z_face,
+            B0x_cell, B0y_cell, B0z_cell,
         )
     end
+    return nothing
+end
+
+# Prescribed external-field boundaries impose zero perturbation in the
+# background-split system. Deep physical ghost cells can have degenerate
+# extrapolated metrics, so they do not admit an LSQ face-flux recovery. Their
+# total magnetic primitive is nevertheless well-defined by the boundary:
+# B = B0 + b = B0. This operation touches only magnetic primitive components.
+function ct_restore_prescribed_background_ghost_b_kernel!(
+    Q, B0x_cell, B0y_cell, B0z_cell, prescribed_faces,
+    nxp, nyp, nzp,
+)
+    i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
+    if i > nxp + 2NG || j > nyp + 2NG || k > nzp + 2NG
+        return
+    end
+    prescribed =
+        (prescribed_faces[1] && i <= NG) ||
+        (prescribed_faces[2] && i > nxp + NG) ||
+        (prescribed_faces[3] && j <= NG) ||
+        (prescribed_faces[4] && j > nyp + NG) ||
+        (prescribed_faces[5] && k <= NG) ||
+        (prescribed_faces[6] && k > nzp + NG)
+    prescribed || return
+
+    @inbounds begin
+        Q[i,j,k,QBX] = B0x_cell[i,j,k]
+        Q[i,j,k,QBY] = B0y_cell[i,j,k]
+        Q[i,j,k,QBZ] = B0z_cell[i,j,k]
+        Q[i,j,k,QPSI] = zero(FT)
+    end
+    return
+end
+
+function ct_restore_prescribed_background_ghost_b!(
+    b, nxp, nyp, nzp;
+    prescribed_faces::NTuple{6,Bool},
+)
+    b.B0x_cell === nothing && return nothing
+    any(prescribed_faces) || return nothing
+    nb = (
+        cld(nxp + 2NG, nthreads[1]), cld(nyp + 2NG, nthreads[2]),
+        cld(nzp + 2NG, nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=nb ct_restore_prescribed_background_ghost_b_kernel!(
+        b.Q, b.B0x_cell, b.B0y_cell, b.B0z_cell, prescribed_faces,
+        Int32(nxp), Int32(nyp), Int32(nzp),
+    )
     return nothing
 end
 
@@ -2553,10 +2790,6 @@ function ct_fill_external_field_face_b!(
     axis = Int32(boundary_axis)
     side_value = Int32(side)
     nx = Int32(nxp); ny = Int32(nyp); nz = Int32(nzp)
-    background_faces = hasproperty(b, :B0x_face) ?
-        (b.B0x_face, b.B0y_face, b.B0z_face) :
-        (nothing, nothing, nothing)
-    B0x_face, B0y_face, B0z_face = background_faces
 
     n1x = nx + Int32(2)*NG + Int32(1)
     n2x = ny + Int32(2)*NG
@@ -2566,7 +2799,7 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.Bx_face, b.Areai, b.nxi, b.nyi, b.nzi, b.x, b.y, b.z,
         axis, side_value, Int32(1), nx, ny, nz, bcp,
-        include_normal_face, background_splitting, B0x_face,
+        include_normal_face, background_splitting,
     )
 
     n1y = nx + Int32(2)*NG
@@ -2577,7 +2810,7 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.By_face, b.Areaj, b.nxj, b.nyj, b.nzj, b.x, b.y, b.z,
         axis, side_value, Int32(2), nx, ny, nz, bcp,
-        include_normal_face, background_splitting, B0y_face,
+        include_normal_face, background_splitting,
     )
 
     n1z = nx + Int32(2)*NG
@@ -2588,7 +2821,7 @@ function ct_fill_external_field_face_b!(
     ) ct_fill_external_field_face_b_kernel!(
         b.Bz_face, b.Areak, b.nxk, b.nyk, b.nzk, b.x, b.y, b.z,
         axis, side_value, Int32(3), nx, ny, nz, bcp,
-        include_normal_face, background_splitting, B0z_face,
+        include_normal_face, background_splitting,
     )
     return nothing
 end
