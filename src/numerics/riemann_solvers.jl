@@ -1087,12 +1087,17 @@ end
     ψ_up = FT(0.5)*(ψL + ψR) - FT(0.5)*ch*(BnR - BnL)
     Bn_up = FT(0.5)*(BnL + BnR) - FT(0.5)*(ψR - ψL)/(ch + FT(1.0e-20))
     F_psi = ch*ch*Bn_up
-    # Replace ψ·n̂ in f6,f7,f8 with ψ_up·n̂, and f9 with F_psi
-    # The star-state flux F already contains some ψ contribution (from _mhd_flux_normal
-    # which used ψL or ψR). We correct by replacing the ψ part.
-    # f6 = (Bx*qn - u*Bn) + ψ_used·nx → correct to ψ_up·nx
-    # But we don't know ψ_used exactly (varies by region). Simplest: just override f9.
-    F = SVector{9, FT}(F[1], F[2], F[3], F[4], F[5], F[6], F[7], F[8], F_psi)
+    # Preserve the HLLD tangential induction flux and replace only its normal
+    # component, which belongs to the decoupled (Bn, psi) GLM subsystem.
+    F_Bn = F[6]*nx + F[7]*ny + F[8]*nz
+    delta_F_Bn = ψ_up - F_Bn
+    F = SVector{9, FT}(
+        F[1], F[2], F[3], F[4], F[5],
+        F[6] + delta_F_Bn*nx,
+        F[7] + delta_F_Bn*ny,
+        F[8] + delta_F_Bn*nz,
+        F_psi,
+    )
 
     # ── Final flux sanity check: non-finite or extreme values → revert to HLLE ──
     F_max = max(abs(F[1]),abs(F[2]),abs(F[3]),abs(F[4]),abs(F[5]),

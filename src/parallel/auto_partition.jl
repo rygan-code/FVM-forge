@@ -228,21 +228,29 @@ function auto_partition(
     # ══════════════════════════════════════════════════════════════
     total_cells = sum(cells)
     
-    # Ideal (fractional) allocation
-    ideal = [cells[i] / total_cells * N_gpus for i in 1:Nblocks]
-    
-    # Floor allocation (minimum 1 rank per block)
-    ranks = [max(1, floor(Int, f)) for f in ideal]
-    
-    # Distribute remaining ranks using largest-remainder (Hamilton) method
-    remaining = N_gpus - sum(ranks)
-    if remaining > 0
-        remainders = [(ideal[i] - ranks[i], i) for i in 1:Nblocks]
-        sort!(remainders, by=x -> -x[1])
-        for k in 1:min(remaining, Nblocks)
+    # Reserve one rank per block, then distribute only the remaining ranks
+    # proportionally. This is Hamilton apportionment with a lower bound of one
+    # and guarantees sum(ranks) == N_gpus even for highly unequal blocks.
+    ranks = ones(Int, Nblocks)
+    ranks_to_distribute = N_gpus - Nblocks
+    if ranks_to_distribute > 0
+        ideal_extra = [
+            cells[i] / total_cells * ranks_to_distribute for i in 1:Nblocks
+        ]
+        extra = floor.(Int, ideal_extra)
+        ranks .+= extra
+        remaining = N_gpus - sum(ranks)
+        remainders = [
+            (ideal_extra[i] - extra[i], i) for i in 1:Nblocks
+        ]
+        sort!(remainders, by=x -> (-x[1], x[2]))
+        for k in 1:remaining
             ranks[remainders[k][2]] += 1
         end
     end
+    sum(ranks) == N_gpus || error(
+        "auto_partition allocated $(sum(ranks)) ranks for $N_gpus GPUs",
+    )
     
     # Optimal 3D factorization per block
     partitions = Vector{SVector{3,Int}}(undef, Nblocks)
@@ -299,4 +307,3 @@ function auto_partition(
     
     return partitions, block_to_rank
 end
-

@@ -13,6 +13,9 @@ end
 # Deschamps / CEBL pipe forcing
 # =============================================================================
 
+@inline _forcing_timestep(dt::Number, i, j, k) = dt
+@inline _forcing_timestep(dt, i, j, k) = @inbounds dt[i, j, k]
+
 # Fused Deschamps + add_source kernel: computes deschamps force and applies
 # directly to U in one pass, avoiding the intermediate dU_forced array.
 # Eliminates 2 kernel launches (zero_dU + deschamps_gpu_kernel).
@@ -118,7 +121,8 @@ function adjust_gpu_kernel!(dU_forced, Q, forcex, flowx, dt, nxp, nyp, nzp)
     @inbounds p = Q[ii, jj, kk, 5]
     
     local_e_internal = p / (ρ * (γ - one(FT)))
-    max_removal_rate = -FT(0.2e0) * ρ / dt 
+    dt_cell = _forcing_timestep(dt, ii, jj, kk)
+    max_removal_rate = -FT(0.2e0) * ρ / dt_cell
     flowx_safe = max(flowx, max_removal_rate)
 
     @inbounds dU_forced[i, j, k, 1] += flowx_safe
@@ -389,7 +393,8 @@ function deschamps_gpu_kernel!(dU_forced, Q, f1_val, flowx_val, dt, nxp, nyp, nz
     
     # Mass correction: limit removal rate to avoid negative density
     local_e_internal = p / (ρ * (γ - one(FT)))
-    max_removal_rate = -FT(0.2e0) * ρ / dt
+    dt_cell = _forcing_timestep(dt, ii, jj, kk)
+    max_removal_rate = -FT(0.2e0) * ρ / dt_cell
     flowx_safe = max(flowx_val, max_removal_rate)
     
     # Streamwise momentum force (Deschamps)

@@ -345,6 +345,10 @@ function write_XDMF_multiblock(tt, time, Nblocks)
                     coord_prec = 8
                 end
             end
+            field_prec = sizeof(FT)
+            if is_cebl && bid >= 5
+                coord_prec = field_prec
+            end
 
             # Geometry: X_Y_Z with separate x, y, z datasets
             nz_tot = nz + 1; ny_tot = ny + 1; nx_tot = nx + 1
@@ -369,7 +373,7 @@ function write_XDMF_multiblock(tt, time, Nblocks)
             end
             for varname in varnames
                 write(f, "    <Attribute Name=\"$varname\" AttributeType=\"Scalar\" Center=\"Cell\">\n")
-                write(f, "     <DataItem Dimensions=\"$nz $ny $nx\" NumberType=\"Float\" Precision=\"$coord_prec\" Format=\"HDF\">\n")
+                write(f, "     <DataItem Dimensions=\"$nz $ny $nx\" NumberType=\"Float\" Precision=\"$field_prec\" Format=\"HDF\">\n")
                 write(f, "      $h5name:/$varname\n")
                 write(f, "     </DataItem>\n")
                 write(f, "    </Attribute>\n")

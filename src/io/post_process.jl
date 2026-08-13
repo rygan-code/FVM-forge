@@ -103,8 +103,10 @@ function compute_integral_energies(blocks, comm_world)
         # Kinetic energy density integrated: 0.5 * rho * (u^2+v^2+w^2) / Vol
         ekin_local += mapreduce((r, u, v_vel, w, v) -> 0.5 * Float64(r) * (Float64(u)^2 + Float64(v_vel)^2 + Float64(w)^2) / Float64(v), +, ρ_v, u_v, v_v, w_v, vol_v)
         
-        # Thermal energy density integrated: p / (gamma - 1) / Vol
-        gamma_factor = 1.0 / (Float64(γ) - 1.0)
+        # Isothermal MHD has no evolved adiabatic internal energy. Its U[5]
+        # compatibility carrier uses p as the thermodynamic component.
+        gamma_factor = isothermal_mhd ? 1.0 :
+            1.0 / (Float64(γ) - 1.0)
         eth_local += mapreduce((p, v) -> Float64(p) * gamma_factor / Float64(v), +, p_v, vol_v)
         
         @static if equation_type == :MHD
@@ -467,6 +469,8 @@ function checkerboard_diagnostic!(blocks, connectivity, tt_val, world_rank)
         
         # Compute 2Δx energy near this face for density (variable 1)
         n = 1  # density
+        e_2dx = 0.0
+        count = 0
         if fid == 1 || fid == 2
             for layer in 1:4
                 ic = fid == 1 ? ng + layer : Nx + ng - layer + 1
@@ -489,9 +493,7 @@ function checkerboard_diagnostic!(blocks, connectivity, tt_val, world_rank)
             end
             continue
         end
-        e_2dx = 0.0
-        count = 0
-        
+
         if fid == 3  # η- face: j = NG+1 to NG+4
             for layer in 1:4
                 jc = ng + layer

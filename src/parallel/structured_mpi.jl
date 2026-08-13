@@ -503,6 +503,24 @@ struct GhostBufferPool
     cpu_recv_combined::Vector{FT}          # single CPU buffer for batch H2D
 end
 
+@inline function _ghost_face_pack_ranges(
+    full_range::Bool,
+    local_u_start::Int, local_u_end::Int,
+    local_v_start::Int, local_v_end::Int,
+    global_v_start::Int, global_v_end::Int, global_v_total::Int,
+    transform_code::Int, ng::Int,
+)
+    u_start = full_range ? local_u_start : local_u_start + ng
+    u_end = full_range ? local_u_end + 2ng : local_u_end + ng
+    swap_orientation = (transform_code & 1) != 0
+    extend_v_ghosts = full_range && (
+        swap_orientation || global_v_start == 1 || global_v_end == global_v_total
+    )
+    v_start = extend_v_ghosts ? local_v_start : local_v_start + ng
+    v_end = extend_v_ghosts ? local_v_end + 2ng : local_v_end + ng
+    return u_start, u_end, v_start, v_end
+end
+
 function init_ghost_buffer_pool(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, NV_max)
     comm = MPI.COMM_WORLD
     world_rank = MPI.Comm_rank(comm)
@@ -567,9 +585,15 @@ function init_ghost_buffer_pool(blocks, connectivity, Block_Nprocs, rank_offsets
                 n_exchanges += 1
                 lu = u_int_s - u_d_s + 1; hu = u_int_e - u_d_s + 1
                 lv = v_int_s - v_d_s + 1; hv = v_int_e - v_d_s + 1
-                u_len = (hu - lu + 1) + 2NG
-                v_s = (v_int_s == 1) ? lv : lv + NG
-                v_e = (v_int_e == V_tot_d) ? hv + 2NG : hv + NG
+                transform_code = hasproperty(conn, :transform) && conn.transform !== nothing ?
+                    Int(structured_face_transform_code(
+                        structured_inverse_face_transform(conn.transform),
+                    )) : (conn.reverse_tan ? 4 : 0)
+                u_s, u_e, v_s, v_e = _ghost_face_pack_ranges(
+                    true, lu, hu, lv, hv,
+                    v_int_s, v_int_e, V_tot_d, transform_code, NG,
+                )
+                u_len = u_e - u_s + 1
                 v_len = v_e - v_s + 1
                 buf_elems = u_len * v_len * NG * NV_max
                 max_buf_elems = max(max_buf_elems, buf_elems)
@@ -759,18 +783,15 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
                 local_u_dst_e = u_int_e - u_d_s + 1
                 local_v_dst_s = v_int_s - v_d_s + 1
                 local_v_dst_e = v_int_e - v_d_s + 1
-                if full_range
-                    # The full-range pass runs after ξ MPI exchange and must carry
-                    # the local ξ ghost columns across inter-block faces. This is
-                    # required at block-interface/rank-cut edges when a block is
-                    # split along ξ (e.g. 24-GPU production runs).
-                    u_pack_start = local_u_dst_s
-                    u_pack_end   = local_u_dst_e + 2NG
-                else
-                    u_pack_start = local_u_dst_s + NG
-                    u_pack_end   = local_u_dst_e + NG
-                end
-                u_pack_len   = u_pack_end - u_pack_start + 1
+                u_pack_start, u_pack_end, v_pack_start, v_pack_end =
+                    _ghost_face_pack_ranges(
+                        full_range,
+                        local_u_dst_s, local_u_dst_e,
+                        local_v_dst_s, local_v_dst_e,
+                        v_int_s, v_int_e, V_tot_d,
+                        transform_code, NG,
+                    )
+                u_pack_len = u_pack_end - u_pack_start + 1
 
                 # Check if src block is local (on the same rank).  In standard
                 # rank-split mode `Block_to_rank[src]` is only the first rank of
@@ -845,11 +866,6 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
                     end
                 else
                     # ── Standard mode: pack full slab ──
-                    swap_orientation = (transform_code & 1) != 0
-                    extend_v_ghosts = full_range &&
-                        (swap_orientation || v_int_s == 1 || v_int_e == V_tot_d)
-                    v_pack_start = extend_v_ghosts ? local_v_dst_s : local_v_dst_s + NG
-                    v_pack_end   = extend_v_ghosts ? local_v_dst_e + 2NG : local_v_dst_e + NG
                     v_pack_len   = v_pack_end - v_pack_start + 1
 
                     pack_shape = (u_pack_len, NG, v_pack_len, NV)

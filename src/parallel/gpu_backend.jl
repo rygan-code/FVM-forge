@@ -103,14 +103,16 @@ Launch a GPU kernel on AMD GPU via @roc.
 """
 macro gpu_launch(ex...)
     kwargs = []
+    threads_expr = nothing
+    blocks_expr = nothing
     call = nothing
     for e in ex
         if e isa Expr && e.head == :(=)
             # Translate CUDA keywords to AMDGPU keywords
             if e.args[1] == :threads
-                push!(kwargs, Expr(:(=), :groupsize, e.args[2]))
+                threads_expr = e.args[2]
             elseif e.args[1] == :blocks
-                push!(kwargs, Expr(:(=), :gridsize, e.args[2]))
+                blocks_expr = e.args[2]
             else
                 push!(kwargs, e)
             end
@@ -118,8 +120,22 @@ macro gpu_launch(ex...)
             call = e
         end
     end
-    roc_expr = Expr(:macrocall, Symbol("@roc"), __source__, kwargs..., call)
-    return esc(roc_expr)
+    threads_expr === nothing && error("@gpu_launch requires threads=...")
+    blocks_expr === nothing && error("@gpu_launch requires blocks=...")
+    roc_expr = Expr(
+        :macrocall, Symbol("@roc"), __source__,
+        Expr(:(=), :groupsize, :_groupsize),
+        Expr(:(=), :gridsize, :_gridsize),
+        kwargs..., call,
+    )
+    return esc(quote
+        let _groupsize = $(threads_expr), _blocks = $(blocks_expr)
+            _gridsize = _blocks isa Integer ?
+                _blocks * _groupsize :
+                ntuple(i -> _blocks[i] * _groupsize[i], length(_blocks))
+            $(roc_expr)
+        end
+    end)
 end
 
 """
@@ -128,14 +144,16 @@ end
 Launch a GPU kernel on a specific HIPStream for async execution.
 """
 macro gpu_launch_stream(stream_expr, ex...)
-    kwargs = [Expr(:(=), :stream, stream_expr)]
+    kwargs = []
+    threads_expr = nothing
+    blocks_expr = nothing
     call = nothing
     for e in ex
         if e isa Expr && e.head == :(=)
             if e.args[1] == :threads
-                push!(kwargs, Expr(:(=), :groupsize, e.args[2]))
+                threads_expr = e.args[2]
             elseif e.args[1] == :blocks
-                push!(kwargs, Expr(:(=), :gridsize, e.args[2]))
+                blocks_expr = e.args[2]
             else
                 push!(kwargs, e)
             end
@@ -143,8 +161,24 @@ macro gpu_launch_stream(stream_expr, ex...)
             call = e
         end
     end
-    roc_expr = Expr(:macrocall, Symbol("@roc"), __source__, kwargs..., call)
-    return esc(roc_expr)
+    threads_expr === nothing && error("@gpu_launch_stream requires threads=...")
+    blocks_expr === nothing && error("@gpu_launch_stream requires blocks=...")
+    roc_expr = Expr(
+        :macrocall, Symbol("@roc"), __source__,
+        Expr(:(=), :stream, :_stream),
+        Expr(:(=), :groupsize, :_groupsize),
+        Expr(:(=), :gridsize, :_gridsize),
+        kwargs..., call,
+    )
+    return esc(quote
+        let _groupsize = $(threads_expr), _blocks = $(blocks_expr),
+            _stream = $(stream_expr)
+            _gridsize = _blocks isa Integer ?
+                _blocks * _groupsize :
+                ntuple(i -> _blocks[i] * _groupsize[i], length(_blocks))
+            $(roc_expr)
+        end
+    end)
 end
 
 end  # @eval

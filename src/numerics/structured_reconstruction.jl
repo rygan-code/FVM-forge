@@ -1350,7 +1350,7 @@ function Eigen_reconstruct_i(Q, U, ϕ, S, Fx, Areai, nxi, nyi, nzi, nxp, nyp, nz
                 end
                 invsum=one(FT)/(α1+α2+α3)
                 valR=invsum*(α1*(FT(2.0)*V2-FT(7.0e0)*V3+FT(11.0)*V4)+α2*(-V3+FT(5.0e0)*V4+FT(2.0)*V5)+α3*(FT(2.0)*V4+FT(5.0e0)*V5-V6))*tmp2
-            else; valR=V4-FT(0.5)*minmod(V4-V3,V4-V5); end
+            else; valR=V4-FT(0.5)*minmod(V4-V5,V3-V4); end
 
             rn1=zero(FT); rn2=zero(FT); rn3=zero(FT); rn4=zero(FT); rn5=zero(FT)
             if n == 1; rn1=one(FT); rn2=u-nx*c; rn3=v-ny*c; rn4=w-nz*c; rn5=H-un*c
@@ -1618,7 +1618,7 @@ function Eigen_reconstruct_j(Q, U, ϕ, S, Fy, Areaj, nxj, nyj, nzj, nxp, nyp, nz
                 end
                 invsum=one(FT)/(α1+α2+α3)
                 valR=invsum*(α1*(FT(2.0)*V2-FT(7.0e0)*V3+FT(11.0)*V4)+α2*(-V3+FT(5.0e0)*V4+FT(2.0)*V5)+α3*(FT(2.0)*V4+FT(5.0e0)*V5-V6))*tmp2
-            else; valR=V4-FT(0.5)*minmod(V4-V3,V4-V5); end
+            else; valR=V4-FT(0.5)*minmod(V4-V5,V3-V4); end
 
             rn1=zero(FT); rn2=zero(FT); rn3=zero(FT); rn4=zero(FT); rn5=zero(FT)
             if n == 1; rn1=one(FT); rn2=u-nx*c; rn3=v-ny*c; rn4=w-nz*c; rn5=H-un*c
@@ -1886,7 +1886,7 @@ function Eigen_reconstruct_k(Q, U, ϕ, S, Fz, Areak, nxk, nyk, nzk, nxp, nyp, nz
                 end
                 invsum=one(FT)/(α1+α2+α3)
                 valR=invsum*(α1*(FT(2.0)*V2-FT(7.0e0)*V3+FT(11.0)*V4)+α2*(-V3+FT(5.0e0)*V4+FT(2.0)*V5)+α3*(FT(2.0)*V4+FT(5.0e0)*V5-V6))*tmp2
-            else; valR=V4-FT(0.5)*minmod(V4-V3,V4-V5); end
+            else; valR=V4-FT(0.5)*minmod(V4-V5,V3-V4); end
 
             rn1=zero(FT); rn2=zero(FT); rn3=zero(FT); rn4=zero(FT); rn5=zero(FT)
             if n == 1; rn1=one(FT); rn2=u-nx*c; rn3=v-ny*c; rn4=w-nz*c; rn5=H-un*c
@@ -2168,7 +2168,7 @@ function Conser_reconstruct_i(Q, U, ϕ, S, Fx, rho_sum_x, Areai, nxi, nyi, nzi, 
 
             else # Minmod
                 valL = V4L + FT(0.5)*minmod(V4L - V3L, V5L - V4L)
-                valR = V4R - FT(0.5)*minmod(V4R - V3R, V4R - V5R)
+                valR = V4R - FT(0.5)*minmod(V4R - V5R, V3R - V4R)
             end
             
             UL_final[n] = valL; UR_final[n] = valR
@@ -2533,7 +2533,7 @@ function Conser_reconstruct_j(Q, U, ϕ, S, Fy, rho_sum_y, Areaj, nxj, nyj, nzj, 
 
             else # Minmod
                 valL = V4L + FT(0.5)*minmod(V4L - V3L, V5L - V4L)
-                valR = V4R - FT(0.5)*minmod(V4R - V3R, V4R - V5R)
+                valR = V4R - FT(0.5)*minmod(V4R - V5R, V3R - V4R)
             end
             
             UL_final[n] = valL; UR_final[n] = valR
@@ -2897,7 +2897,7 @@ function Conser_reconstruct_k(Q, U, ϕ, S, Fz, rho_sum_z, Areak, nxk, nyk, nzk, 
 
             else # Minmod
                 valL = V4L + FT(0.5)*minmod(V4L - V3L, V5L - V4L)
-                valR = V4R - FT(0.5)*minmod(V4R - V3R, V4R - V5R)
+                valR = V4R - FT(0.5)*minmod(V4R - V5R, V3R - V4R)
             end
             
             UL_final[n] = valL; UR_final[n] = valR

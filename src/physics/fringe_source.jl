@@ -62,7 +62,7 @@ end
 # ─── Fringe forcing kernel: apply λ(x)(U_target - U) ───
 # Called every RK sub-step, adds to dU_forced.
 # U_target is the precursor mean profile (only depends on y, z).
-function fringe_forcing_kernel!(dU_forced, U, U_target, lambda, nxp, nyp, nzp, dt_sub)
+function fringe_forcing_kernel!(dU_forced, U, U_target, lambda, nxp, nyp, nzp)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -79,9 +79,10 @@ function fringe_forcing_kernel!(dU_forced, U, U_target, lambda, nxp, nyp, nzp, d
         return
     end
 
-    # Add fringe forcing: λ × (U_target - U) × dt
+    # Store a source rate; add_source_kernel! applies the RK sub-step dt once.
     for m in 1:Ncell_cons
-        @inbounds dU_forced[i, j, k, m] += lam * (U_target[ii, jj, kk, m] - U[ii, jj, kk, m]) * dt_sub
+        @inbounds dU_forced[i, j, k, m] +=
+            lam * (U_target[ii, jj, kk, m] - U[ii, jj, kk, m])
     end
 
     return

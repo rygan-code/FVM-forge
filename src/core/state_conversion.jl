@@ -368,7 +368,7 @@ function compute_dt(dt, Q, J, S1, S2, S3,
                     nxi, nyi, nzi,   # ξ-face normals
                     nxj, nyj, nzj,   # η-face normals
                     nxk, nyk, nzk,   # ζ-face normals
-                    nxp, nyp, nzp)
+                    nxp, nyp, nzp, ch_glm)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
     k = (blockIdx().z - Int32(1)) * blockDim().z + threadIdx().z
@@ -420,9 +420,15 @@ function compute_dt(dt, Q, J, S1, S2, S3,
     @inbounds Ak = FT(0.5) * (S3[i, j, k] + S3[i, j, k+1])
 
     # Spectral radii: λ = (|U_contra| + c) * Area
-    λ_ξ = (Ucon_i + c) * Ai
-    λ_η = (Ucon_j + c) * Aj
-    λ_ζ = (Ucon_k + c) * Ak
+    @static if equation_type == :MHD && !ct_mode
+        λ_ξ = max(Ucon_i + c, ch_glm) * Ai
+        λ_η = max(Ucon_j + c, ch_glm) * Aj
+        λ_ζ = max(Ucon_k + c, ch_glm) * Ak
+    else
+        λ_ξ = (Ucon_i + c) * Ai
+        λ_η = (Ucon_j + c) * Aj
+        λ_ζ = (Ucon_k + c) * Ak
+    end
 
     # dt = CFL * Vol / (λ_ξ + λ_η + λ_ζ)   — sum formulation (more conservative, standard)
     dt_conv = Vol / (λ_ξ + λ_η + λ_ζ + FT(1.0e-30))
@@ -443,7 +449,9 @@ function compute_dt(dt, Q, J, S1, S2, S3,
             @inbounds rho = Q[i, j, k, 1]
             T_local = (equation_type == :MHD) ? T_val : T
             mu = get_viscosity(T_local)
-            nu_eff = mu / (rho * Pr + FT(1.0e-30))
+            nu_momentum = mu / (rho + FT(1.0e-30))
+            alpha_thermal = nu_momentum / (Pr + FT(1.0e-30))
+            nu_eff = max(nu_momentum, alpha_thermal)
             dt_diff_hydro = FT(0.5) / (nu_eff * inv_d2_sum + FT(1.0e-30))
             dt_diff = min(dt_diff, dt_diff_hydro)
         end
@@ -697,13 +705,14 @@ function positivity_clipping(Q, U, nxp, nyp, nzp)
 
     
 
+    ρ_min = FT(1.0e-5)
+    p_min = FT(1.0e-5)
+
     # MHD mode: clip ρ and p, leave B and ψ unconstrained
     if equation_type == :MHD
         @inbounds begin
             ρ = Q[i, j, k, 1]
             p = Q[i, j, k, 5]
-            ρ_min = FT(1.0e-5)
-            p_min = FT(1.0e-5)
             if ρ < ρ_min || p < p_min
                 ρ = max(ρ, ρ_min)
                 p = max(p, p_min)
@@ -886,6 +895,9 @@ function c2Prim_ghost(U, Q, nxp, nyp, nzp)
     return
 end
 
+@inline _source_timestep(dt::Number, i, j, k) = dt
+@inline _source_timestep(dt, i, j, k) = @inbounds dt[i, j, k]
+
 function add_source_kernel!(U, dU_forced, dt, Vol, nxp, nyp, nzp)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -899,7 +911,7 @@ function add_source_kernel!(U, dU_forced, dt, Vol, nxp, nyp, nzp)
     ii, jj, kk = i+NG, j+NG, k+NG
     
     # Apply source term: U += S * dt
-    @inbounds fact = dt
+    fact = _source_timestep(dt, ii, jj, kk)
     for n = 1:Ncell_cons
         @inbounds U[ii, jj, kk, n] += dU_forced[i, j, k, n] * fact
     end

@@ -2805,6 +2805,23 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 face_bc, connectivity, _rank_offsets_setup,
                 Nx_b, Ny_b, Nz_b, NG,
             )
+            for (bid, auxiliary) in temp_metric_auxiliary_h
+                coordinates, _, metrics = auxiliary
+                block = blocks[bid]
+                finalize_scmm_volumes!(
+                    metrics,
+                    coordinates.x, coordinates.y, coordinates.z,
+                    block.Nx, block.Ny, block.Nz, NG,
+                )
+                periodic = ntuple(3) do direction
+                    isdefined(Main, :Iperiodic) && Main.Iperiodic[direction] &&
+                        Block_Nprocs[bid + 1][direction] == 1
+                end
+                _enforce_periodic_metric_ghosts!(
+                    structured_metrics_tuple(metrics)...,
+                    block.Nx, block.Ny, block.Nz, NG, periodic,
+                )
+            end
         end
         if ct_mode && debug_metric_closure
             closure_l2, closure_max = ct_metric_closure_stats(temp_metrics_h, blocks)
@@ -2984,6 +3001,28 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 face_bc_pre, connectivity, _rank_offsets_pre,
                 Nx_b_pre, Ny_b_pre, Nz_b_pre, NG,
             )
+            for (bid, auxiliary) in temp_metric_auxiliary_pre_h
+                coordinates, _, metrics = auxiliary
+                block = blocks[bid]
+                finalize_scmm_volumes!(
+                    metrics,
+                    coordinates.x, coordinates.y, coordinates.z,
+                    block.Nx, block.Ny, block.Nz, NG,
+                )
+                periodic = ntuple(3) do direction
+                    low_face = 2direction - 1
+                    high_face = 2direction
+                    Block_Nprocs[bid + 1][direction] == 1 &&
+                        Int32(get(face_bc_pre, (bid, low_face), BC_INTERBLOCK)) ==
+                            Int32(BC_PERIODIC) &&
+                        Int32(get(face_bc_pre, (bid, high_face), BC_INTERBLOCK)) ==
+                            Int32(BC_PERIODIC)
+                end
+                _enforce_periodic_metric_ghosts!(
+                    structured_metrics_tuple(metrics)...,
+                    block.Nx, block.Ny, block.Nz, NG, periodic,
+                )
+            end
         end
         enforce_metric_interface_gate!(
             "CEBL-precursor", temp_metrics_pre_h, face_bc_pre, connectivity,
@@ -4494,6 +4533,32 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     _structured_rk_is_fofc_auxiliary(node) =
         _structured_rk_fofc_iteration(node) !== nothing
 
+    function _update_glm_cleaning_speed!()
+        equation_type == :MHD && !ct_mode || return ch_glm_current
+        cf_max_local = zero(FT)
+        for (_, block) in blocks
+            fill!(block.LTS_dt, zero(FT))
+            nb_cf = (
+                cld(block.Nx+2*NG, nthreads[1]),
+                cld(block.Ny+2*NG, nthreads[2]),
+                cld(block.Nz+2*NG, nthreads[3]),
+            )
+            @gpu_launch threads=nthreads blocks=nb_cf compute_cf_max_kernel!(
+                block.LTS_dt, block.Q, block.Nx, block.Ny, block.Nz,
+            )
+            local_max = FT(mapreduce(
+                value -> value > zero(FT) ? value : zero(FT),
+                max, block.LTS_dt,
+            ))
+            cf_max_local = max(cf_max_local, local_max)
+        end
+        global ch_glm_current = max(
+            MPI.Allreduce(cf_max_local, MPI.MAX, MPI.COMM_WORLD),
+            FT(1.0e-10),
+        )
+        return ch_glm_current
+    end
+
     function _structured_rk_fofc_task_active(node)
         iteration = _structured_rk_fofc_iteration(node)
         iteration === nothing && return true
@@ -4540,6 +4605,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 end
             end
 
+            _update_glm_cleaning_speed!()
             current_dt = if adaptive_dt
                 dt_min = FT(1e10)
                 for (_, b) in blocks
@@ -4552,6 +4618,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                         b.LTS_dt, b.Q, b.Vol, b.Areai, b.Areaj, b.Areak,
                         b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj,
                         b.nxk, b.nyk, b.nzk, b.Nx, b.Ny, b.Nz,
+                        ch_glm_current,
                     )
                     dt_local = FT(mapreduce(
                         value -> value > zero(FT) ? value : FT(Inf),
@@ -4564,29 +4631,6 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 FT(dt)
             end
             state[:current_dt] = current_dt
-
-            if equation_type == :MHD && !ct_mode
-                cf_max_local = zero(FT)
-                for (_, block) in blocks
-                    nb_cf = (
-                        cld(block.Nx+2*NG, nthreads[1]),
-                        cld(block.Ny+2*NG, nthreads[2]),
-                        cld(block.Nz+2*NG, nthreads[3]),
-                    )
-                    @gpu_launch threads=nthreads blocks=nb_cf compute_cf_max_kernel!(
-                        block.LTS_dt, block.Q, block.Nx, block.Ny, block.Nz,
-                    )
-                    local_max = FT(mapreduce(
-                        value -> value > zero(FT) ? value : zero(FT),
-                        max, block.LTS_dt,
-                    ))
-                    cf_max_local = max(cf_max_local, local_max)
-                end
-                global ch_glm_current = max(
-                    MPI.Allreduce(cf_max_local, MPI.MAX, MPI.COMM_WORLD),
-                    FT(1.0e-10),
-                )
-            end
 
             split_source_active = apply_structured_split_sources!(
                 blocks, FT(0.5) * current_dt, nthreads,
@@ -5187,112 +5231,76 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
             b = blocks[bid]
             state = structured_rk_task_state[]
             current_dt_local = state[:current_dt]
+            source_dt = LTS ? b.LTS_dt : current_dt_local
             active_time_local = state[:active_time]
             nb_l = (
                 Int32(cld(b.Nx+2*NG, threads_light[1])),
                 Int32(cld(b.Ny+2*NG, threads_light[2])),
                 Int32(cld(b.Nz+2*NG, threads_light[3])),
             )
-            if flow_forcing
+            if flow_forcing || _fringe_active
+                nb_f = (
+                    cld(b.Nx, nthreads[1]),
+                    cld(b.Ny, nthreads[2]),
+                    cld(b.Nz, nthreads[3]),
+                )
+                @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(
+                    shared_dU_forced, b.Nx, b.Ny, b.Nz,
+                )
                 b_omega_x = (b.id >= 5 || !_diffrot_volume_force_active) ?
                     zero(FT) :
                     (isdefined(Main, :Omega_x) ? FT(Main.Omega_x) : zero(FT))
                 f1_use = (b.id >= 5) ? state[:deschamps_f1_val] : zero(FT)
                 flowx_use = (b.id >= 5) ? state[:deschamps_flowx_val] : zero(FT)
-                if b_omega_x != zero(FT)
+                if flow_forcing && b_omega_x != zero(FT)
                     @gpu_launch threads=threads_light blocks=nb_l Volume_force_kernel!(
                         shared_dU_forced, b.Q, b.y, b.z,
                         b.Nx, b.Ny, b.Nz, b_omega_x,
                     )
-                    if forcing_mode == 1
-                        Apply_bulk_force!(
-                            shared_dU_forced, b.Q, state[:forcex],
-                            state[:flowx], current_dt_local,
-                            b.Nx, b.Ny, b.Nz,
-                        )
-                    elseif forcing_mode == 2
-                        Apply_const_massflux_force!(
-                            shared_dU_forced, b.Q, state[:cmf_f1_val],
-                            b.Nx, b.Ny, b.Nz,
-                        )
-                    elseif forcing_mode == 3 ||
-                           (isdefined(Main, :cebl_forcing) && Main.cebl_forcing)
-                        Apply_deschamps_pipe_force!(
-                            shared_dU_forced, b.Q, f1_use, flowx_use,
-                            current_dt_local, b.Nx, b.Ny, b.Nz,
-                        )
-                    end
-                    if _fringe_active
-                        @gpu_launch threads=threads_light blocks=nb_l fringe_forcing_kernel!(
-                            shared_dU_forced, b.U, b.U_target_fringe,
-                            b.fringe_lambda, b.Nx, b.Ny, b.Nz, current_dt_local,
-                        )
-                    end
-                    Apply_trip_force!(
-                        shared_dU_forced, b.Q, b.x, b.y, b.z,
-                        b.Nx, b.Ny, b.Nz, active_time_local,
+                end
+                if flow_forcing && forcing_mode == 1
+                    Apply_bulk_force!(
+                        shared_dU_forced, b.Q, state[:forcex],
+                        state[:flowx], source_dt,
+                        b.Nx, b.Ny, b.Nz,
                     )
-                    @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
-                        b.U, shared_dU_forced, current_dt_local,
-                        b.Vol, b.Nx, b.Ny, b.Nz,
+                elseif flow_forcing && forcing_mode == 2
+                    Apply_const_massflux_force!(
+                        shared_dU_forced, b.Q, state[:cmf_f1_val],
+                        b.Nx, b.Ny, b.Nz,
                     )
-                else
-                    nb_f = (
-                        cld(b.Nx, nthreads[1]),
-                        cld(b.Ny, nthreads[2]),
-                        cld(b.Nz, nthreads[3]),
-                    )
-                    if forcing_mode == 1
-                        @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(
-                            shared_dU_forced, b.Nx, b.Ny, b.Nz,
-                        )
-                        Apply_bulk_force!(
-                            shared_dU_forced, b.Q, state[:forcex], state[:flowx],
-                            current_dt_local, b.Nx, b.Ny, b.Nz,
-                        )
-                        Apply_trip_force!(
-                            shared_dU_forced, b.Q, b.x, b.y, b.z,
-                            b.Nx, b.Ny, b.Nz, active_time_local,
-                        )
-                        @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
-                            b.U, shared_dU_forced, current_dt_local,
-                            b.Vol, b.Nx, b.Ny, b.Nz,
-                        )
-                    elseif forcing_mode == 2
-                        @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(
-                            shared_dU_forced, b.Nx, b.Ny, b.Nz,
-                        )
-                        Apply_const_massflux_force!(
-                            shared_dU_forced, b.Q, state[:cmf_f1_val],
-                            b.Nx, b.Ny, b.Nz,
-                        )
-                        Apply_trip_force!(
-                            shared_dU_forced, b.Q, b.x, b.y, b.z,
-                            b.Nx, b.Ny, b.Nz, active_time_local,
-                        )
-                        @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
-                            b.U, shared_dU_forced, current_dt_local,
-                            b.Vol, b.Nx, b.Ny, b.Nz,
-                        )
-                    elseif forcing_mode == 3 ||
-                           (isdefined(Main, :cebl_forcing) && Main.cebl_forcing)
+                elseif flow_forcing && (
+                    forcing_mode == 3 ||
+                    (isdefined(Main, :cebl_forcing) && Main.cebl_forcing)
+                )
+                    if b_omega_x == zero(FT) && !_fringe_active && !LTS
                         @gpu_launch threads=nthreads blocks=nb_f fused_deschamps_source_kernel!(
                             b.U, b.Q, f1_use, flowx_use,
                             current_dt_local, b.Nx, b.Ny, b.Nz,
                         )
-                        @gpu_launch threads=nthreads blocks=nb_f zero_dU_forced_kernel!(
-                            shared_dU_forced, b.Nx, b.Ny, b.Nz,
-                        )
-                        Apply_trip_force!(
-                            shared_dU_forced, b.Q, b.x, b.y, b.z,
-                            b.Nx, b.Ny, b.Nz, active_time_local,
-                        )
-                        @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
-                            b.U, shared_dU_forced, current_dt_local,
-                            b.Vol, b.Nx, b.Ny, b.Nz,
+                    else
+                        Apply_deschamps_pipe_force!(
+                            shared_dU_forced, b.Q, f1_use, flowx_use,
+                            source_dt, b.Nx, b.Ny, b.Nz,
                         )
                     end
                 end
+                if flow_forcing
+                    Apply_trip_force!(
+                        shared_dU_forced, b.Q, b.x, b.y, b.z,
+                        b.Nx, b.Ny, b.Nz, active_time_local,
+                    )
+                end
+                if _fringe_active
+                    @gpu_launch threads=threads_light blocks=nb_l fringe_forcing_kernel!(
+                        shared_dU_forced, b.U, b.U_target_fringe,
+                        b.fringe_lambda, b.Nx, b.Ny, b.Nz,
+                    )
+                end
+                @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
+                    b.U, shared_dU_forced, source_dt,
+                    b.Vol, b.Nx, b.Ny, b.Nz,
+                )
             end
             if test_case == "HIT" || test_case == "MHDHIT"
                 Apply_HIT_forcing!(
@@ -5302,7 +5310,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     b.Nx, b.Ny, b.Nz,
                 )
                 @gpu_launch threads=threads_light blocks=nb_l add_source_kernel!(
-                    b.U, shared_dU_forced, current_dt_local,
+                    b.U, shared_dU_forced, source_dt,
                     b.Vol, b.Nx, b.Ny, b.Nz,
                 )
             end
@@ -7568,6 +7576,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
     function _structured_implicit_task_precompute_dt!(
         state::Dict{Symbol,Any},
     )
+        _update_glm_cleaning_speed!()
         if adaptive_dt || !isdefined(@__MODULE__, :dt)
             dt_min = FT(1e10)
             for (_, b) in blocks
@@ -7580,6 +7589,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                     b.LTS_dt, b.Q, b.Vol, b.Areai, b.Areaj, b.Areak,
                     b.nxi, b.nyi, b.nzi, b.nxj, b.nyj, b.nzj,
                     b.nxk, b.nyk, b.nzk, b.Nx, b.Ny, b.Nz,
+                    ch_glm_current,
                 )
                 dt_local = FT(mapreduce(
                     value -> value > zero(FT) ? value : FT(Inf),
