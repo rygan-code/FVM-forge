@@ -610,7 +610,8 @@ end
 #           reducing data volume by ~87% while keeping same MPI message count.
 function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b, Ny_b, Nz_b, 
                           target_field_name::Symbol, NV::Int, pool::GhostBufferPool;
-                          full_range::Bool=false, delta_mode::Bool=false)
+                          full_range::Bool=false, delta_mode::Bool=false,
+                          target_arrays=nothing)
     comm = MPI.COMM_WORLD
     world_rank = MPI.Comm_rank(comm)
     world_size = MPI.Comm_size(comm)
@@ -695,7 +696,8 @@ function copy_ghost_face!(blocks, connectivity, Block_Nprocs, rank_offsets, Nx_b
             Int(structured_face_transform_code(structured_inverse_face_transform(conn.transform))) :
             (reverse_tan ? 4 : 0)
         dst_b = blocks[dst_b_id]
-        dst_array = getfield(dst_b, target_field_name)
+        dst_array = target_arrays === nothing ?
+            getfield(dst_b, target_field_name) : target_arrays[dst_b_id]
         nxp = dst_b.Nx; nyp = dst_b.Ny; nzp = dst_b.Nz
 
         my_local_rank = world_rank - rank_offsets[dst_b_id + 1]

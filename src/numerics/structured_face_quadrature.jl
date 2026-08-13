@@ -52,6 +52,22 @@ const STRUCTURED_P2A_FIXED = Int32(0)
 const STRUCTURED_P2A_AO = Int32(1)
 const STRUCTURED_P2A_MIDPOINT = Int32(2)
 
+# Keep this standalone quadrature module loadable in non-CT fixtures.  The
+# troubled mask uses the same 0/1/2 representation as CT, but P2A should not
+# require equation_config.jl merely to interpret those values.
+@inline _structured_troubled_smooth() = Int32(0)
+@inline _structured_troubled_recoverable() = Int32(1)
+@inline _structured_troubled_strong() = Int32(2)
+
+@inline function _structured_troubled_level(value)
+    if !isfinite(value) || value >= typeof(value)(2)
+        return _structured_troubled_strong()
+    elseif value >= typeof(value)(1)
+        return _structured_troubled_recoverable()
+    end
+    return _structured_troubled_smooth()
+end
+
 @inline function _structured_face_p2a_adaptive_enabled()
     @static if @isdefined(ct_face_p2a_adaptive)
         return ct_face_p2a_adaptive
@@ -815,19 +831,30 @@ function structured_face_p2a_first_kernel!(
         sensor_i,sensor_j,sensor_k=i,j-halo,k
     end
     support_sensor = sensor === nothing ? zero(eltype(point_flux)) :
-        _structured_face_support_max_sensor(
+        _structured_face_p2a_first_sensor(
             sensor,sensor_i,sensor_j,sensor_k,Val(DIRECTION),
         )
     finite_support_sensor=isfinite(support_sensor)
-    force_adaptive=sensor !== nothing && finite_support_sensor &&
-        support_sensor >= shock_threshold
-    allow_adaptive=sensor === nothing || (finite_support_sensor &&
-        support_sensor >= shock_threshold*
-        _structured_face_p2a_gate_fraction(eltype(point_flux)))
+    @static if @isdefined(ct_troubled_mask_enabled) && ct_troubled_mask_enabled
+        mask_level=finite_support_sensor ?
+            _structured_troubled_level(support_sensor) :
+            _structured_troubled_strong()
+        force_adaptive=mask_level == _structured_troubled_recoverable()
+        allow_adaptive=force_adaptive
+    else
+        mask_level=_structured_troubled_smooth()
+        force_adaptive=sensor !== nothing && finite_support_sensor &&
+            support_sensor >= shock_threshold
+        allow_adaptive=sensor === nothing || (finite_support_sensor &&
+            support_sensor >= shock_threshold*
+            _structured_face_p2a_gate_fraction(eltype(point_flux)))
+    end
     used_ao=false
-    used_midpoint=!finite_support_sensor
+    used_midpoint=!finite_support_sensor ||
+        mask_level == _structured_troubled_strong()
     @inbounds for component in 1:Ncons
-        if !finite_support_sensor
+        if !finite_support_sensor ||
+           mask_level == _structured_troubled_strong()
             value=point_flux[fi,fj,fk,component]
             mode=STRUCTURED_P2A_MIDPOINT
         else
@@ -842,6 +869,109 @@ function structured_face_p2a_first_kernel!(
     end
     _structured_record_face_p2a_recovery!(meta,used_ao,used_midpoint)
     return
+end
+
+@inline function _structured_face_adjacent_max_sensor(
+    sensor, i, j, k, ::Val{DIRECTION},
+) where {DIRECTION}
+    ng=Int32(NG)
+    if DIRECTION == 1
+        li,lj,lk=i+ng-Int32(1),j+ng,k+ng
+        ri,rj,rk=li+Int32(1),lj,lk
+    elseif DIRECTION == 2
+        li,lj,lk=i+ng,j+ng-Int32(1),k+ng
+        ri,rj,rk=li,lj+Int32(1),lk
+    else
+        li,lj,lk=i+ng,j+ng,k+ng-Int32(1)
+        ri,rj,rk=li,lj,lk+Int32(1)
+    end
+    @inbounds left=sensor[li,lj,lk]
+    @inbounds right=sensor[ri,rj,rk]
+    (!isfinite(left) || !isfinite(right)) && return oftype(left,Inf)
+    return max(left,right)
+end
+
+@inline function _structured_face_p2a_sensor(
+    sensor, i, j, k, direction,
+)
+    @static if @isdefined(ct_troubled_mask_enabled) && ct_troubled_mask_enabled
+        return _structured_face_categorical_support_level(
+            sensor,i,j,k,direction,false,
+        )
+    else
+        return _structured_face_support_max_sensor(
+            sensor,i,j,k,direction,
+        )
+    end
+end
+
+@inline function _structured_face_categorical_support_level(
+    sensor,i,j,k,direction,first_pass::Bool,
+)
+    adjacent=_structured_face_adjacent_max_sensor(sensor,i,j,k,direction)
+    !isfinite(adjacent) && return adjacent
+    adjacent_level=_structured_troubled_level(adjacent)
+    adjacent_level == _structured_troubled_strong() && return adjacent
+    support=first_pass ?
+        _structured_face_first_support_max_sensor(sensor,i,j,k,direction) :
+        _structured_face_support_max_sensor(sensor,i,j,k,direction)
+    !isfinite(support) && return oftype(adjacent,one(adjacent))
+    return _structured_troubled_level(support) >=
+           _structured_troubled_recoverable() ?
+        oftype(adjacent,one(adjacent)) : adjacent
+end
+
+@inline function _structured_face_first_support_max_sensor(
+    sensor, i, j, k, ::Val{DIRECTION},
+) where {DIRECTION}
+    ng=Int32(NG)
+    maximum_sensor=zero(eltype(sensor))
+    if DIRECTION == 1
+        li,lj,lk=i+ng-Int32(1),j+ng,k+ng
+        ri,rj,rk=li+Int32(1),lj,lk
+        for offset in Int32(-2):Int32(2)
+            @inbounds left=sensor[li,lj+offset,lk]
+            @inbounds right=sensor[ri,rj+offset,rk]
+            (!isfinite(left) || !isfinite(right)) &&
+                return oftype(maximum_sensor,Inf)
+            maximum_sensor=max(maximum_sensor,max(left,right))
+        end
+    elseif DIRECTION == 2
+        li,lj,lk=i+ng,j+ng-Int32(1),k+ng
+        ri,rj,rk=li,lj+Int32(1),lk
+        for offset in Int32(-2):Int32(2)
+            @inbounds left=sensor[li+offset,lj,lk]
+            @inbounds right=sensor[ri+offset,rj,rk]
+            (!isfinite(left) || !isfinite(right)) &&
+                return oftype(maximum_sensor,Inf)
+            maximum_sensor=max(maximum_sensor,max(left,right))
+        end
+    else
+        li,lj,lk=i+ng,j+ng,k+ng-Int32(1)
+        ri,rj,rk=li,lj,lk+Int32(1)
+        for offset in Int32(-2):Int32(2)
+            @inbounds left=sensor[li+offset,lj,lk]
+            @inbounds right=sensor[ri+offset,rj,rk]
+            (!isfinite(left) || !isfinite(right)) &&
+                return oftype(maximum_sensor,Inf)
+            maximum_sensor=max(maximum_sensor,max(left,right))
+        end
+    end
+    return maximum_sensor
+end
+
+@inline function _structured_face_p2a_first_sensor(
+    sensor, i, j, k, direction,
+)
+    @static if @isdefined(ct_troubled_mask_enabled) && ct_troubled_mask_enabled
+        return _structured_face_categorical_support_level(
+            sensor,i,j,k,direction,true,
+        )
+    else
+        return _structured_face_support_max_sensor(
+            sensor,i,j,k,direction,
+        )
+    end
 end
 
 @inline function _structured_face_support_max_sensor(
@@ -922,17 +1052,29 @@ function structured_face_p2a_second_kernel!(
     fk=k+(DIRECTION==3 ? Int32(0) : halo)
     second_axis=DIRECTION==3 ? Int32(2) : Int32(3)
     second_extent=DIRECTION==3 ? Int32(nyp) : Int32(nzp)
-    support_sensor=_structured_face_support_max_sensor(
-        sensor,i,j,k,Val(DIRECTION),
-    )
+    support_sensor=sensor === nothing ? zero(eltype(point_flux)) :
+        _structured_face_p2a_sensor(
+            sensor,i,j,k,Val(DIRECTION),
+        )
     finite_support_sensor=isfinite(support_sensor)
-    force_adaptive=finite_support_sensor && support_sensor >= shock_threshold
-    allow_adaptive=finite_support_sensor && support_sensor >=
-        shock_threshold*_structured_face_p2a_gate_fraction(eltype(point_flux))
+    @static if @isdefined(ct_troubled_mask_enabled) && ct_troubled_mask_enabled
+        mask_level=finite_support_sensor ?
+            _structured_troubled_level(support_sensor) :
+            _structured_troubled_strong()
+        force_adaptive=mask_level == _structured_troubled_recoverable()
+        allow_adaptive=force_adaptive
+    else
+        mask_level=_structured_troubled_smooth()
+        force_adaptive=finite_support_sensor && support_sensor >= shock_threshold
+        allow_adaptive=finite_support_sensor && support_sensor >=
+            shock_threshold*_structured_face_p2a_gate_fraction(eltype(point_flux))
+    end
     used_ao=false
-    used_midpoint=!finite_support_sensor
+    used_midpoint=!finite_support_sensor ||
+        mask_level == _structured_troubled_strong()
     @inbounds for component in 1:Ncons
-        if !finite_support_sensor
+        if !finite_support_sensor ||
+           mask_level == _structured_troubled_strong()
             value=point_flux[fi,fj,fk,component]
             mode=STRUCTURED_P2A_MIDPOINT
         else

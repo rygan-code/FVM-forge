@@ -16,6 +16,7 @@ const MESH_DIR = abspath(get(
 const FINAL_TIME = get(ENV, "OT2D_FINAL_TIME", "0.1")
 const CFL_VALUE = get(ENV, "OT_CFL", "0.2")
 const CT_SCHEME = get(ENV, "OT2D_CT_SCHEME", "weno7")
+const WENO7_EDGE_MODE = get(ENV, "OT2D_WENO7_EDGE_MODE", "hybrid")
 const INITIAL_STATE_MODE = get(
     ENV, "OT2D_INITIAL_STATE_MODE", "quadrature6",
 )
@@ -38,6 +39,12 @@ const DEBUG_INITIAL_FIELD = lowercase(get(
 const DEBUG_INTERFACE_FLUX = lowercase(get(
     ENV, "OT2D_DEBUG_INTERFACE_FLUX", "false",
 )) in ("1", "true", "yes", "on")
+const DEBUG_STAGE_STEPS = Set(parse.(Int, filter(
+    !isempty, split(get(ENV, "OT2D_DEBUG_STAGE_STEPS", "1"), ','),
+)))
+const DEBUG_STAGE_RKS = Set(parse.(Int, filter(
+    !isempty, split(get(ENV, "OT2D_DEBUG_STAGE_RKS", "1"), ','),
+)))
 const PROJECT_ROOT = normpath(joinpath(@__DIR__, "..", ".."))
 const ORIGINAL_RUNNER = joinpath(PROJECT_ROOT, "Benchmark", "ORSZAG_TANG_2D", "run.jl")
 
@@ -45,14 +52,23 @@ const ORIGINAL_RUNNER = joinpath(PROJECT_ROOT, "Benchmark", "ORSZAG_TANG_2D", "r
 # discretely divergence-free on a skew mesh.  Orszag-Tang has the periodic
 # vector potential A_z = sqrt(mu0) * (cos(y) + cos(2x)/2), so initialize face
 # fluxes through the solver's discrete-Stokes hook instead.
-function in_situ_ct_initial_face_flux_process(blocks, world_rank, Block_Nprocs, block_comms)
+function in_situ_ct_initial_edge_integral_process(
+    blocks, world_rank, Block_Nprocs, block_comms, metric_coordinates,
+)
     vector_potential(x, y, z, time) = SVector{3,Float64}(
         0.0,
         0.0,
         SQRT_MU0_SI * (cos(y) + 0.5 * cos(2.0 * x)),
     )
     for block in values(blocks)
-        ct_initial_face_flux_from_vector_potential!(block, vector_potential)
+        ct_initial_edge_line_integrals_from_vector_potential!(
+            block, vector_potential;
+            coordinates=get(metric_coordinates, block.id, nothing),
+            junction_fallback=(
+                structured_metric_mode_setting() !=
+                STRUCTURED_METRIC_LOCAL_CHART
+            ),
+        )
     end
     return nothing
 end
@@ -170,8 +186,8 @@ function _ot2d_debug_stage_snapshot!(
     Fx=nothing, Fy=nothing, Fz=nothing,
 )
     DEBUG_INTERFACE_FLUX || return nothing
-    step == 1 || return nothing
-    stage == 1 || return nothing
+    step in DEBUG_STAGE_STEPS || return nothing
+    stage in DEBUG_STAGE_RKS || return nothing
     gpu_sync()
 
     payload = Dict{Symbol,Any}(
@@ -182,11 +198,15 @@ function _ot2d_debug_stage_snapshot!(
         :block => Int(b.id),
         :dimensions => (Int(b.Nx), Int(b.Ny), Int(b.Nz)),
         :U => Array(b.U),
+        :Un => Array(b.Un),
         :Q => Array(b.Q),
         :Vol => Array(b.Vol),
         :Bx_face => Array(b.Bx_face),
         :By_face => Array(b.By_face),
         :Bz_face => Array(b.Bz_face),
+        :Bx_face_n => Array(b.Bx_face_n),
+        :By_face_n => Array(b.By_face_n),
+        :Bz_face_n => Array(b.Bz_face_n),
         :Areai => Array(b.Areai),
         :nxi => Array(b.nxi),
         :nyi => Array(b.nyi),
@@ -203,6 +223,7 @@ function _ot2d_debug_stage_snapshot!(
         :Ey_edge => Array(b.Ey_edge),
         :Ez_edge => Array(b.Ez_edge),
     )
+    b.fofc_flag === nothing || (payload[:fofc_flag] = Array(b.fofc_flag))
     Fx === nothing || (payload[:Fx] = Array(Fx))
     Fy === nothing || (payload[:Fy] = Array(Fy))
     Fz === nothing || (payload[:Fz] = Array(Fz))
@@ -298,6 +319,7 @@ open(joinpath(CASE_DIR, "manifest.txt"), "w") do io
     println(io, "final_time=$FINAL_TIME")
     println(io, "cfl=$CFL_VALUE")
     println(io, "ct_scheme=$CT_SCHEME")
+    println(io, "weno7_edge_mode=$WENO7_EDGE_MODE")
     println(io, "initial_state_mode=$INITIAL_STATE_MODE")
     println(io, "structured_scheduler=taskgraph")
     println(io, "snapshot_times=$SNAPSHOT_TIMES")
@@ -361,7 +383,10 @@ if DEBUG_INTERFACE_FLUX
         "    _ot2d_solver_lines = split(_ot2d_solver_source, \"\\n\")",
         "    for (_ot2d_callback, _ot2d_statement) in [",
         "        (\":u_interblock_face_copy\", \"            _ot2d_debug_ghost_pair!(blocks, \\\"after_first_U_copy\\\", world_rank)\"),",
-        "        (\":u_interblock_full_copy\", \"            _ot2d_debug_ghost_pair!(blocks, \\\"after_full_U_copy\\\", world_rank)\"),",
+        "        (\":u_interblock_full_copy\", \"            _ot2d_debug_ghost_pair!(blocks, \\\"after_full_U_copy\\\", world_rank); _ot2d_debug_all_blocks!(blocks, \\\"after_full_U_copy\\\", structured_task_sync_state[].step, structured_task_sync_state[].rk_stage, world_rank)\"),",
+        "        (\":interface_filter\", \"            _ot2d_debug_all_blocks!(blocks, \\\"after_interface_filter\\\", structured_task_sync_state[].step, structured_task_sync_state[].rk_stage, world_rank)\"),",
+        "        (\":filtered_u_interblock_full_copy\", \"            _ot2d_debug_all_blocks!(blocks, \\\"after_filtered_full_U_copy\\\", structured_task_sync_state[].step, structured_task_sync_state[].rk_stage, world_rank)\"),",
+        "        (\":ct_point6_state\", \"            _ot2d_debug_all_blocks!(blocks, \\\"after_ct_point6_state\\\", structured_task_sync_state[].step, structured_task_sync_state[].rk_stage, world_rank)\"),",
         "    ]",
         "        _ot2d_header = findfirst(line -> occursin(\"structured_task_callbacks[\$(_ot2d_callback)]\", line), _ot2d_solver_lines)",
         "        _ot2d_header === nothing && error(\"OT2D debug hook: callback \$(_ot2d_callback) was not found\")",
@@ -376,12 +401,14 @@ if DEBUG_INTERFACE_FLUX
         "    insert!(_ot2d_solver_lines, _ot2d_task_flux_gate, \"            _ot2d_debug_interface_flux!(b, shared_Fx, shared_Fy, shared_Fz, state[:tt], stage, world_rank)\")",
         "    insert!(_ot2d_solver_lines, _ot2d_task_flux_gate + 1, \"            _ot2d_debug_stage_snapshot!(b, \\\"post_flux\\\", state[:tt], stage, world_rank; Fx=shared_Fx, Fy=shared_Fy, Fz=shared_Fz)\")",
         "    for (_ot2d_callback, _ot2d_statement) in [",
-        "        (\":rk_edge_emf\", \"            _ot2d_debug_stage_snapshot!(b, \\\"post_edge_emf\\\", state[:tt], stage, world_rank)\"),",
-        "        (\":rk_divergence\", \"            _ot2d_debug_stage_snapshot!(b, \\\"post_divergence\\\", state[:tt], stage, world_rank)\"),",
-        "        (\":rk_edge_sync\", \"            _ot2d_debug_all_blocks!(blocks, \\\"post_edge_sync\\\", structured_rk_task_state[][:tt], _structured_rk_stage_from_node(node), world_rank)\"),",
-        "        (\":rk_face_b_update\", \"            _ot2d_debug_stage_snapshot!(b, \\\"post_face_b_update\\\", structured_rk_task_state[][:tt], stage, world_rank)\"),",
-        "        (\":rk_face_barrier\", \"            _ot2d_debug_all_blocks!(blocks, \\\"post_face_barrier\\\", state[:tt], _structured_rk_stage_from_node(node), world_rank)\"),",
-        "        (\":rk_stage_sync\", \"            _ot2d_debug_all_blocks!(blocks, \\\"post_stage_sync\\\", state[:tt], stage, world_rank)\"),",
+        "        (\":rk_edge_emf\", \"            _ot2d_debug_stage_snapshot!(b, string(node.id, \\\"_post_edge_emf\\\"), state[:tt], stage, world_rank)\"),",
+        "        (\":rk_fofc_detect\", \"            _ot2d_debug_stage_snapshot!(b, string(node.id, \\\"_post_detect\\\"), state[:tt], stage, world_rank; Fx=shared_Fx, Fy=shared_Fy, Fz=shared_Fz)\"),",
+        "        (\":rk_divergence\", \"            _ot2d_debug_stage_snapshot!(b, string(node.id, \\\"_post_divergence\\\"), state[:tt], stage, world_rank)\"),",
+        "        (\":rk_edge_sync\", \"            _ot2d_debug_all_blocks!(blocks, string(node.id, \\\"_post_edge_sync\\\"), structured_rk_task_state[][:tt], _structured_rk_stage_from_node(node), world_rank)\"),",
+        "        (\":rk_junction_solve\", \"            _ot2d_debug_all_blocks!(blocks, string(node.id, \\\"_post_junction\\\"), structured_rk_task_state[][:tt], _structured_rk_stage_from_node(node), world_rank)\"),",
+        "        (\":rk_face_b_update\", \"            _ot2d_debug_stage_snapshot!(b, string(node.id, \\\"_post_face_b_update\\\"), structured_rk_task_state[][:tt], stage, world_rank)\"),",
+        "        (\":rk_face_barrier\", \"            _ot2d_debug_all_blocks!(blocks, string(node.id, \\\"_post_face_barrier\\\"), state[:tt], _structured_rk_stage_from_node(node), world_rank)\"),",
+        "        (\":rk_stage_sync\", \"            _ot2d_debug_all_blocks!(blocks, string(node.id, \\\"_post_stage_sync\\\"), state[:tt], stage, world_rank)\"),",
         "    ]",
         "        _ot2d_header = findfirst(line -> occursin(\"structured_rk_task_callbacks[\$(_ot2d_callback)]\", line), _ot2d_solver_lines)",
         "        _ot2d_header === nothing && error(\"OT2D debug hook: callback \$(_ot2d_callback) was not found\")",

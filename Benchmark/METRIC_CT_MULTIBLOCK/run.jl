@@ -3,15 +3,15 @@ ENV["OT3D_CT"] = "true"
 ENV["OT3D_STRICT_CT"] = "true"
 ENV["OT3D_TEST_CASE"] = "MetricCTUniform"
 ENV["OT3D_MESH_DIR"] = joinpath(_metric_ct_multiblock_dir, "MESH")
-ENV["OT3D_PERIODIC"] = "true,false,true"
-ENV["OT3D_FINAL_TIME"] = "0.1"
-ENV["OT3D_STATS_INTERVAL"] = "1"
-ENV["OT3D_STATS_FILE"] = joinpath(
+get!(ENV, "OT3D_PERIODIC", "true,false,true")
+get!(ENV, "OT3D_FINAL_TIME", "0.1")
+get!(ENV, "OT3D_STATS_INTERVAL", "1")
+get!(ENV, "OT3D_STATS_FILE", joinpath(
     _metric_ct_multiblock_dir, "metric_stats.dat",
-)
-ENV["METRIC_CT_INTERFACE_STATS_FILE"] = joinpath(
+))
+get!(ENV, "METRIC_CT_INTERFACE_STATS_FILE", joinpath(
     _metric_ct_multiblock_dir, "interface_stats.dat",
-)
+))
 
 using MPI
 MPI.Init()

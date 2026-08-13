@@ -404,6 +404,7 @@ end
 function build_structured_explicit_rk3_task_graph(
     block_ids;
     ct_mode::Bool=false,
+    troubled_mask::Bool=false,
     fofc::Bool=false,
     fofc_iterations::Integer=1,
     resistive_pre::Bool=false,
@@ -416,6 +417,9 @@ function build_structured_explicit_rk3_task_graph(
     ))
     fofc && !ct_mode && throw(ArgumentError(
         "first-order flux correction requires the CT task graph",
+    ))
+    troubled_mask && !ct_mode && throw(ArgumentError(
+        "the troubled-state path requires the CT task graph",
     ))
     fofc && fofc_iterations < 1 && throw(ArgumentError(
         "FOFC requires at least one corrected-candidate closure pass",
@@ -485,7 +489,19 @@ function build_structured_explicit_rk3_task_graph(
             ], exclusive=[:RK_SHOCK_MPI], collective_sequence=stage,
             start! = callback(:rk_shock_halo))
 
+        q_reconstruction = q_in
         pre_barrier = shock_halo
+        if troubled_mask
+            troubled_state = Symbol("rk",stage,"_troubled_state")
+            q_reconstruction = Symbol("RK_Q_RECON_",stage)
+            add_structured_task!(builder,troubled_state;
+                depends=[shock_halo],
+                reads=[q_in,u_in,face_in,Symbol("RK_SHOCK_HALO_",stage)],
+                writes=[q_reconstruction],
+                exclusive=[:CT_DERIVATION_SCRATCH],
+                start! = callback(:rk_troubled_state))
+            pre_barrier = troubled_state
+        end
         pre_resources = Symbol[]
         if ct_mode && resistive_pre
             for bid in ids
@@ -493,8 +509,8 @@ function build_structured_explicit_rk3_task_graph(
                 pre_resource = Symbol("RK_RESISTIVE_PRE_", stage, "_B", bid)
                 push!(pre_resources, pre_resource)
                 add_structured_task!(builder, pre_id;
-                    depends=[shock_halo],
-                    reads=[q_in], writes=[pre_resource],
+                    depends=[pre_barrier],
+                    reads=[q_reconstruction], writes=[pre_resource],
                     exclusive=[:RK_SHARED_FLUX],
                     start! = callback(:rk_resistive_pre))
             end
@@ -517,7 +533,7 @@ function build_structured_explicit_rk3_task_graph(
                 flag_input = iteration == 0 ? nothing :
                     Symbol("RK_FOFC_FLAG_HALO_",stage,"_I",iteration-1)
                 iteration_begin = Symbol(prefix,"_begin")
-                begin_reads = Symbol[q_in,u_in,face_in]
+                    begin_reads = Symbol[q_reconstruction,u_in,face_in]
                 flag_input === nothing || push!(begin_reads,flag_input)
                 add_structured_task!(builder,iteration_begin;
                     depends=[final_pre_barrier],reads=begin_reads,
@@ -553,7 +569,8 @@ function build_structured_explicit_rk3_task_graph(
                         push!(edge_dep,previous_edge)
                     add_structured_task!(builder,edge_flux;
                         depends=edge_dep,
-                        reads=[q_in,Symbol("RK_SHOCK_HALO_",stage)],
+                        reads=[q_reconstruction,
+                               Symbol("RK_SHOCK_HALO_",stage)],
                         writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_flux))
                     add_structured_task!(builder,edge_average;
@@ -573,7 +590,8 @@ function build_structured_explicit_rk3_task_graph(
                         final_average_resource = corrected_resource
                     end
                     add_structured_task!(builder,edge_diffusive;
-                        depends=[edge_average],reads=[q_in,average_resource],
+                        depends=[edge_average],
+                        reads=[q_reconstruction,average_resource],
                         writes=[diffusive_resource],
                         exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_diffusive_flux))
@@ -641,7 +659,8 @@ function build_structured_explicit_rk3_task_graph(
                         push!(detect_dep,previous_detect)
                     add_structured_task!(builder,detect_flux;
                         depends=detect_dep,
-                        reads=[q_in,Symbol("RK_SHOCK_HALO_",stage)],
+                        reads=[q_reconstruction,
+                               Symbol("RK_SHOCK_HALO_",stage)],
                         writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_flux))
                     add_structured_task!(builder,detect_average;
@@ -661,7 +680,8 @@ function build_structured_explicit_rk3_task_graph(
                         final_detect_resource = corrected_resource
                     end
                     add_structured_task!(builder,detect_diffusive;
-                        depends=[detect_average],reads=[q_in,average_resource],
+                        depends=[detect_average],
+                        reads=[q_reconstruction,average_resource],
                         writes=[diffusive_resource],
                         exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_diffusive_flux))
@@ -744,7 +764,7 @@ function build_structured_explicit_rk3_task_graph(
             previous_block_div === nothing || push!(flux_dep, previous_block_div)
             add_structured_task!(builder, flux_id;
                 depends=flux_dep,
-                reads=[q_in, Symbol("RK_SHOCK_HALO_", stage)],
+                reads=[q_reconstruction, Symbol("RK_SHOCK_HALO_", stage)],
                 writes=[point_flux_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_flux))
 
@@ -769,7 +789,8 @@ function build_structured_explicit_rk3_task_graph(
                 final_flux_resource = corrected_resource
             end
             add_structured_task!(builder, diffusive_id;
-                depends=[face_average_id], reads=[q_in,face_average_resource],
+                depends=[face_average_id],
+                reads=[q_reconstruction,face_average_resource],
                 writes=[diffusive_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_diffusive_flux))
 

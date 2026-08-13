@@ -47,9 +47,19 @@ _ot_ct_scheme in ("sg07", "weno7") || error(
     "OT2D_CT_SCHEME must be sg07 or weno7, got '$_ot_ct_scheme'",
 )
 const ct_emf_scheme::Int32 = _ot_ct_scheme == "weno7" ? Int32(7) : Int32(2)
+const _ot_weno7_edge_mode = lowercase(strip(get(
+    ENV, "OT2D_WENO7_EDGE_MODE", "hybrid",
+)))
+_ot_weno7_edge_mode in ("hybrid", "all_sg07") || error(
+    "OT2D_WENO7_EDGE_MODE must be hybrid or all_sg07, got " *
+    "'$_ot_weno7_edge_mode'",
+)
+const ct_weno7_sg07_selective_only::Bool =
+    _ot_weno7_edge_mode == "hybrid"
 const initial_state_mode::Symbol = Symbol(lowercase(get(
     ENV, "OT2D_INITIAL_STATE_MODE", "quadrature6",
 )))
+const ct_point6_homogeneous_axes::NTuple{3,Bool} = (false,false,true)
 
 # Project root for includes (two levels up from Benchmark/ORSZAG_TANG_2D/)
 const _project_root = joinpath(@__DIR__, "..", "..")
@@ -199,6 +209,33 @@ const _stats_file = abspath(get(
     ENV, "OT2D_STATS_FILE", joinpath(@__DIR__, "stats.dat"),
 ))
 const _stats_interval = strict_ct_positivity ? 1 : 20
+const _ot_ct_metric_host_cache = Dict{NTuple{4,Int},Any}()
+
+function _ot_host_ct_metrics(b, NGp, nx_end, ny_end, nz_end)
+    key = (Int(b.id),Int(b.Nx),Int(b.Ny),Int(b.Nz))
+    return get!(_ot_ct_metric_host_cache,key) do
+        (
+            (
+                Array(@view b.Areai[NGp:nx_end+1,NGp:ny_end,NGp:nz_end]),
+                Array(@view b.nxi[NGp:nx_end+1,NGp:ny_end,NGp:nz_end]),
+                Array(@view b.nyi[NGp:nx_end+1,NGp:ny_end,NGp:nz_end]),
+                Array(@view b.nzi[NGp:nx_end+1,NGp:ny_end,NGp:nz_end]),
+            ),
+            (
+                Array(@view b.Areaj[NGp:nx_end,NGp:ny_end+1,NGp:nz_end]),
+                Array(@view b.nxj[NGp:nx_end,NGp:ny_end+1,NGp:nz_end]),
+                Array(@view b.nyj[NGp:nx_end,NGp:ny_end+1,NGp:nz_end]),
+                Array(@view b.nzj[NGp:nx_end,NGp:ny_end+1,NGp:nz_end]),
+            ),
+            (
+                Array(@view b.Areak[NGp:nx_end,NGp:ny_end,NGp:nz_end+1]),
+                Array(@view b.nxk[NGp:nx_end,NGp:ny_end,NGp:nz_end+1]),
+                Array(@view b.nyk[NGp:nx_end,NGp:ny_end,NGp:nz_end+1]),
+                Array(@view b.nzk[NGp:nx_end,NGp:ny_end,NGp:nz_end+1]),
+            ),
+        )
+    end
+end
 
 # Target snapshot times for the classic 2D Orszag-Tang validation (density field).
 # A PLT file is emitted once activeTime crosses each target.
@@ -240,6 +277,20 @@ function _emit_snapshot(tt, time, blocks, world_rank, Nblocks, block_comms)
             b = blocks[bid]
             b.id >= Nblocks && continue
             _write_chk_for_block(snap_id, b, block_comms[bid])
+        end
+        MPI.Barrier(MPI.COMM_WORLD)
+        if world_rank == 0
+            checkpoint_dir = structured_checkpoint_dir()
+            for bid in 0:(Nblocks-1)
+                chkname = joinpath(
+                    checkpoint_dir,"chk-$(snap_id)-b$(bid).h5",
+                )
+                h5open(chkname,"r+") do file
+                    file["step"] = Int64(tt)
+                    file["time"] = Float64(time)
+                    _write_ct_checkpoint_metadata!(file)
+                end
+            end
         end
         MPI.Barrier(MPI.COMM_WORLD)
     end
@@ -370,9 +421,16 @@ function _run_ot_diagnostics(
         U5_v = @view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 5]
         Vol_v = @view b.Vol[NGp:nx_end, NGp:ny_end, NGp:nz_end]
         e_cons_local += mapreduce((u, v) -> Float64(u) / Float64(v), +, U5_v, Vol_v)
-        Uh = Array(@view b.U[NGp:nx_end, NGp:ny_end, NGp:nz_end, 1:5])
-        Qh = Array(@view b.Q[NGp:nx_end, NGp:ny_end, NGp:nz_end, 7:9])
-        raw_minima = ot_raw_mhd_minima(Uh, Qh, FT(γ))
+        Uh = Array(@view b.U[NGp:nx_end,NGp:ny_end,NGp:nz_end,1:5])
+        face_fluxes = (
+            Array(@view b.Bx_face[NGp:nx_end+1,NGp:ny_end,NGp:nz_end]),
+            Array(@view b.By_face[NGp:nx_end,NGp:ny_end+1,NGp:nz_end]),
+            Array(@view b.Bz_face[NGp:nx_end,NGp:ny_end,NGp:nz_end+1]),
+        )
+        face_metrics = _ot_host_ct_metrics(b,NGp,nx_end,ny_end,nz_end)
+        raw_minima = ot_raw_ct_mhd_minima(
+            Uh,face_fluxes,face_metrics,FT(γ),
+        )
         min_rho_raw_local = min(min_rho_raw_local, raw_minima.rho)
         min_ei_raw_local = min(min_ei_raw_local, raw_minima.ei)
         min_p_raw_local = min(min_p_raw_local, raw_minima.p)
@@ -449,7 +507,8 @@ if rank == 0
             " (splitMethodID=$splitMethodID)")
     println("  CT scheme:  ", _ot_ct_scheme,
             " (EMF=$ct_emf_scheme, characteristic=$ct_characteristic_reconstruction,",
-            " cell-B=$ct_cell_b_recovery, primitive=$ct_primitive_recovery)")
+            " cell-B=$ct_cell_b_recovery, primitive=$ct_primitive_recovery,",
+            " edge-mode=$_ot_weno7_edge_mode)")
     println("  Eigen recon:", eigen_reconstruction)
     println("  Test case:  ", test_case)
     println("  Blocks:     ", Nblocks, "  grid: ", Nx_b, "×", Ny_b, "×", Nz_b)

@@ -135,12 +135,17 @@ const nthreads2::Tuple{Int32,Int32,Int32} = (Int32(8), Int32(8), Int32(4))
     )
 end
 
-function in_situ_ct_initial_face_flux_process(
-    blocks, world_rank, Block_Nprocs, block_comms,
+function in_situ_ct_initial_edge_integral_process(
+    blocks, world_rank, Block_Nprocs, block_comms, metric_coordinates,
 )
     for block in values(blocks)
-        ct_initial_face_flux_from_vector_potential!(
-            block, decay_vector_potential,
+        ct_initial_edge_line_integrals_from_vector_potential!(
+            block, decay_vector_potential;
+            coordinates=get(metric_coordinates, block.id, nothing),
+            junction_fallback=(
+                structured_metric_mode_setting() !=
+                STRUCTURED_METRIC_LOCAL_CHART
+            ),
         )
     end
     return nothing

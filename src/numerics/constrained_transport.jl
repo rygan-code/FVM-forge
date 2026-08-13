@@ -742,10 +742,9 @@ end
     end
     support_max = zero(eltype(sensor))
     for cell in cells
-        @inbounds support_max = max(
-            support_max,
-            sensor[cell[1]+ng,cell[2]+ng,cell[3]+ng],
-        )
+        @inbounds value=sensor[cell[1]+ng,cell[2]+ng,cell[3]+ng]
+        isfinite(value) || return true
+        support_max = max(support_max,value)
     end
     return support_max >= threshold
 end
@@ -3071,6 +3070,258 @@ function ct_derive_q_point6_topological_active!(
         background_fluxes,halo.background_face_shells,face_metrics,
         halo.face_area_vector_shells,halo.face_layout,positivity_meta,
         Int32(nxp),Int32(nyp),Int32(nzp),FT(γ),FT(Rg),physical_faces)
+    return nothing
+end
+
+@inline function _ct_select_troubled_point_state(
+    level,ao_hydro,low_hydro,low_magnetic,gamma,
+)
+    T=eltype(low_hydro)
+    if level >= T(CT_TROUBLED_STRONG)
+        return low_hydro,low_magnetic,zero(T),Int32(2)
+    end
+    if ct_point6_state_is_admissible(
+        ao_hydro,low_magnetic,gamma,T(density_floor),T(pressure_floor),
+    )
+        return ao_hydro,low_magnetic,one(T),Int32(1)
+    end
+    hydro,magnetic,theta,limited=ct_point6_convex_limit(
+        ao_hydro,low_magnetic,low_hydro,low_magnetic,gamma,
+        T(density_floor),T(pressure_floor),
+    )
+    return hydro,magnetic,theta,limited ? Int32(2) : Int32(3)
+end
+
+@inline function _ct_store_troubled_q_local!(
+    Q,U,mask,inverse_volume,
+    face_fluxes,background_fluxes,face_metrics,background_cell,
+    positivity_meta,i,j,k,
+)
+    @inbounds level=mask[i,j,k]
+    level >= eltype(mask)(CT_TROUBLED_RECOVERABLE) || return
+    low_hydro=_ct_point6_cell_conservative(U,i,j,k)
+    low_magnetic=_ct_recover_cell_b_from_face_fluxes(
+        face_fluxes[1],face_fluxes[2],face_fluxes[3],
+        face_metrics[1]...,face_metrics[2]...,face_metrics[3]...,
+        CT_CELL_B_LSQ2,i,j,k,background_fluxes...,
+    )
+    if level >= eltype(mask)(CT_TROUBLED_STRONG)
+        ao_hydro=low_hydro
+    else
+        x_ao,y_ao,z_ao,_,_,_=ct_point6_active_ao_coefficients(U,i,j,k)
+        ao_hydro=ct_conservative_average_to_point_coefficients(
+            U,inverse_volume,i,j,k,x_ao,y_ao,z_ao,
+        )
+    end
+    hydro,magnetic,_,recovery_mode=_ct_select_troubled_point_state(
+        level,ao_hydro,low_hydro,low_magnetic,FT(γ),
+    )
+    _ct_record_point6_recovery!(positivity_meta,recovery_mode)
+    primitive=ct_mhd_point_conservative_to_primitive(
+        hydro,magnetic,FT(γ),
+    )
+    if background_cell !== nothing
+        background=_ct_recover_cell_b_from_face_fluxes(
+            background_fluxes[1],background_fluxes[2],background_fluxes[3],
+            face_metrics[1]...,face_metrics[2]...,face_metrics[3]...,
+            CT_CELL_B_LSQ2,i,j,k,
+        )
+        @inbounds begin
+            background_cell[i,j,k,1]=background[1]
+            background_cell[i,j,k,2]=background[2]
+            background_cell[i,j,k,3]=background[3]
+        end
+    end
+    temperature=primitive[5]/(primitive[1]*FT(Rg))
+    @inbounds begin
+        Q[i,j,k,1]=primitive[1]; Q[i,j,k,2]=primitive[2]
+        Q[i,j,k,3]=primitive[3]; Q[i,j,k,4]=primitive[4]
+        Q[i,j,k,5]=primitive[5]; Q[i,j,k,6]=temperature
+        Q[i,j,k,QBX]=primitive[6]; Q[i,j,k,QBY]=primitive[7]
+        Q[i,j,k,QBZ]=primitive[8]; Q[i,j,k,QPSI]=primitive[9]
+    end
+    return
+end
+
+function ct_apply_troubled_q_kernel!(
+    Q,U,mask,inverse_volume,
+    face_fluxes,background_fluxes,face_metrics,background_cell,
+    positivity_meta,nxp,nyp,nzp,
+)
+    i=(blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j=(blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k=(blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    (i>nxp || j>nyp || k>nzp) && return
+    _ct_store_troubled_q_local!(
+        Q,U,mask,inverse_volume,face_fluxes,background_fluxes,face_metrics,
+        background_cell,positivity_meta,i+NG,j+NG,k+NG,
+    )
+    return
+end
+
+@inline function _ct_store_troubled_q_shell!(
+    Q,U,mask,background_cell,conservative_shell,
+    inverse_volume,inverse_volume_shell,cell_layout,
+    face_fluxes,face_shells,background_fluxes,background_shells,
+    face_metrics,area_vector_shells,face_layout,positivity_meta,i,j,k,
+)
+    @inbounds level=mask[i,j,k]
+    level >= eltype(mask)(CT_TROUBLED_RECOVERABLE) || return
+    low_hydro=ct_conservative_direct_shell(
+        U,conservative_shell,cell_layout,i,j,k,
+    )
+    low_magnetic=ct_recover_cell_b_lsq2_shell(
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,i,j,k,
+    )
+    if level >= eltype(mask)(CT_TROUBLED_STRONG)
+        ao_hydro=low_hydro
+    else
+        x_ao,y_ao,z_ao,_,_,_=ct_point6_shell_ao_coefficients(
+            U,conservative_shell,cell_layout,i,j,k,
+        )
+        ao_hydro=ct_conservative_average_to_point_coefficients_shell(
+            U,conservative_shell,inverse_volume,inverse_volume_shell,
+            cell_layout,i,j,k,x_ao,y_ao,z_ao,
+        )
+    end
+    hydro,magnetic,_,recovery_mode=_ct_select_troubled_point_state(
+        level,ao_hydro,low_hydro,low_magnetic,FT(γ),
+    )
+    _ct_record_point6_recovery!(positivity_meta,recovery_mode)
+    primitive=ct_mhd_point_conservative_to_primitive(
+        hydro,magnetic,FT(γ),
+    )
+    if background_cell !== nothing
+        no_background=(nothing,nothing,nothing)
+        background=ct_recover_cell_b_lsq2_shell(
+            background_fluxes,background_shells,no_background,no_background,
+            face_metrics,area_vector_shells,face_layout,i,j,k,
+        )
+        @inbounds begin
+            background_cell[i,j,k,1]=background[1]
+            background_cell[i,j,k,2]=background[2]
+            background_cell[i,j,k,3]=background[3]
+        end
+    end
+    temperature=primitive[5]/(primitive[1]*FT(Rg))
+    @inbounds begin
+        Q[i,j,k,1]=primitive[1]; Q[i,j,k,2]=primitive[2]
+        Q[i,j,k,3]=primitive[3]; Q[i,j,k,4]=primitive[4]
+        Q[i,j,k,5]=primitive[5]; Q[i,j,k,6]=temperature
+        Q[i,j,k,QBX]=primitive[6]; Q[i,j,k,QBY]=primitive[7]
+        Q[i,j,k,QBZ]=primitive[8]; Q[i,j,k,QPSI]=primitive[9]
+    end
+    return
+end
+
+function ct_apply_troubled_q_ghost_kernel!(
+    Q,U,mask,background_cell,conservative_shell,
+    inverse_volume,inverse_volume_shell,cell_layout,
+    face_fluxes,face_shells,background_fluxes,background_shells,
+    face_metrics,area_vector_shells,face_layout,positivity_meta,
+    nxp,nyp,nzp,physical_faces,
+)
+    i=(blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j=(blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k=(blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    (i>nxp+2NG || j>nyp+2NG || k>nzp+2NG) && return
+    if NG<i<=nxp+NG && NG<j<=nyp+NG && NG<k<=nzp+NG
+        return
+    end
+    if (physical_faces[1] && i<=NG) ||
+       (physical_faces[2] && i>nxp+NG) ||
+       (physical_faces[3] && j<=NG) ||
+       (physical_faces[4] && j>nyp+NG) ||
+       (physical_faces[5] && k<=NG) ||
+       (physical_faces[6] && k>nzp+NG)
+        return
+    end
+    _ct_store_troubled_q_shell!(
+        Q,U,mask,background_cell,conservative_shell,
+        inverse_volume,inverse_volume_shell,cell_layout,
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,positivity_meta,i,j,k,
+    )
+    return
+end
+
+function ct_apply_troubled_q_topological_active_kernel!(
+    Q,U,mask,background_cell,conservative_shell,
+    inverse_volume,inverse_volume_shell,cell_layout,
+    face_fluxes,face_shells,background_fluxes,background_shells,
+    face_metrics,area_vector_shells,face_layout,positivity_meta,
+    nxp,nyp,nzp,physical_faces,
+)
+    i=(blockIdx().x-Int32(1))*blockDim().x+threadIdx().x
+    j=(blockIdx().y-Int32(1))*blockDim().y+threadIdx().y
+    k=(blockIdx().z-Int32(1))*blockDim().z+threadIdx().z
+    (i>nxp || j>nyp || k>nzp) && return
+    reach=Int32(2)
+    touches_topology=
+        (i<=reach && !physical_faces[1]) ||
+        (i>nxp-reach && !physical_faces[2]) ||
+        (j<=reach && !physical_faces[3]) ||
+        (j>nyp-reach && !physical_faces[4]) ||
+        (k<=reach && !physical_faces[5]) ||
+        (k>nzp-reach && !physical_faces[6])
+    touches_physical=
+        (i<=reach && physical_faces[1]) ||
+        (i>nxp-reach && physical_faces[2]) ||
+        (j<=reach && physical_faces[3]) ||
+        (j>nyp-reach && physical_faces[4]) ||
+        (k<=reach && physical_faces[5]) ||
+        (k>nzp-reach && physical_faces[6])
+    (touches_topology && !touches_physical) || return
+    _ct_store_troubled_q_shell!(
+        Q,U,mask,background_cell,conservative_shell,
+        inverse_volume,inverse_volume_shell,cell_layout,
+        face_fluxes,face_shells,background_fluxes,background_shells,
+        face_metrics,area_vector_shells,face_layout,positivity_meta,
+        i+NG,j+NG,k+NG,
+    )
+    return
+end
+
+function ct_apply_troubled_q!(
+    b,halo,nxp,nyp,nzp;
+    physical_faces::NTuple{6,Bool}=ntuple(_->false,Val(6)),
+    positivity_meta=nothing,
+)
+    face_fluxes=(b.Bx_face,b.By_face,b.Bz_face)
+    background_fluxes=hasproperty(b,:B0x_face) ?
+        (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    background_cell=hasproperty(b,:B0_cell) ? b.B0_cell : nothing
+    face_metrics=(
+        (b.Areai,b.nxi,b.nyi,b.nzi),
+        (b.Areaj,b.nxj,b.nyj,b.nzj),
+        (b.Areak,b.nxk,b.nyk,b.nzk),
+    )
+    active_blocks=(
+        cld(nxp,nthreads[1]),cld(nyp,nthreads[2]),cld(nzp,nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=active_blocks ct_apply_troubled_q_kernel!(
+        b.Q,b.U,b.ϕ,b.Vol,face_fluxes,background_fluxes,face_metrics,
+        background_cell,positivity_meta,Int32(nxp),Int32(nyp),Int32(nzp),
+    )
+    @gpu_launch threads=nthreads blocks=active_blocks ct_apply_troubled_q_topological_active_kernel!(
+        b.Q,b.U,b.ϕ,background_cell,halo.conservative_shell,
+        b.Vol,halo.inverse_volume_shell,halo.cell_layout,
+        face_fluxes,halo.face_b_shells,background_fluxes,
+        halo.background_face_shells,face_metrics,halo.face_area_vector_shells,
+        halo.face_layout,positivity_meta,Int32(nxp),Int32(nyp),Int32(nzp),
+        physical_faces,
+    )
+    total=(nxp+2NG,nyp+2NG,nzp+2NG)
+    ghost_blocks=ntuple(axis->cld(total[axis],nthreads[axis]),Val(3))
+    @gpu_launch threads=nthreads blocks=ghost_blocks ct_apply_troubled_q_ghost_kernel!(
+        b.Q,b.U,b.ϕ,background_cell,halo.conservative_shell,
+        b.Vol,halo.inverse_volume_shell,halo.cell_layout,
+        face_fluxes,halo.face_b_shells,background_fluxes,
+        halo.background_face_shells,face_metrics,halo.face_area_vector_shells,
+        halo.face_layout,positivity_meta,Int32(nxp),Int32(nyp),Int32(nzp),
+        physical_faces,
+    )
     return nothing
 end
 

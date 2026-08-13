@@ -294,10 +294,17 @@ function _metric_ct_raw_minima_local(blocks)
     for (_, b) in blocks
         lo = NG + 1
         u = Array(@view b.U[lo:NG+b.Nx, lo:NG+b.Ny, lo:NG+b.Nz, :])
+        magnetic = Array(@view b.Q[
+            lo:NG+b.Nx, lo:NG+b.Ny, lo:NG+b.Nz, 7:9,
+        ])
+        size(u, 4) >= 5 || error(
+            "metric CT diagnostics require five compact hydro components",
+        )
         for k in 1:b.Nz, j in 1:b.Ny, i in 1:b.Nx
             raw = mhd_raw_thermo_components(
                 u[i,j,k,1], u[i,j,k,2], u[i,j,k,3], u[i,j,k,4],
-                u[i,j,k,5], u[i,j,k,6], u[i,j,k,7], u[i,j,k,8], γ,
+                u[i,j,k,5], magnetic[i,j,k,1], magnetic[i,j,k,2],
+                magnetic[i,j,k,3], γ,
             )
             valid &= isfinite(raw[1]) && isfinite(raw[4]) && isfinite(raw[5]) &&
                      raw[1] > 0 && raw[4] > 0 && raw[5] > 0
