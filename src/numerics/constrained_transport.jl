@@ -2215,6 +2215,7 @@ function ct_recover_cell_b_kernel!(
     Areak, nxk, nyk, nzk,
     recovery_mode, nxp, nyp, nzp, cell_offset,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    B0_cell=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -2224,14 +2225,23 @@ function ct_recover_cell_b_kernel!(
     jj = j + cell_offset
     kk = k + cell_offset
 
+    split_background = B0_cell !== nothing
     magnetic = _ct_recover_cell_b_from_face_fluxes(
         Bx_face, By_face, Bz_face,
         Areai, nxi, nyi, nzi,
         Areaj, nxj, nyj, nzj,
         Areak, nxk, nyk, nzk,
         recovery_mode, ii, jj, kk,
-        B0x_face, B0y_face, B0z_face,
+        split_background ? nothing : B0x_face,
+        split_background ? nothing : B0y_face,
+        split_background ? nothing : B0z_face,
     )
+    if split_background
+        @inbounds magnetic += SVector(
+            B0_cell[ii,jj,kk,1], B0_cell[ii,jj,kk,2],
+            B0_cell[ii,jj,kk,3],
+        )
+    end
 
     @inbounds begin
         if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
@@ -2255,6 +2265,7 @@ function ct_recover_physical_ghost_b_kernel!(
     Areak, nxk, nyk, nzk,
     nxp, nyp, nzp, physical_faces,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    B0_cell=nothing,
 )
     i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1))*blockDim().y + threadIdx().y
@@ -2274,14 +2285,22 @@ function ct_recover_physical_ghost_b_kernel!(
         (physical_faces[6] && k > nzp+NG)
     physical || return
 
+    split_background = B0_cell !== nothing
     magnetic = _ct_recover_cell_b_from_face_fluxes(
         Bx_face, By_face, Bz_face,
         Areai, nxi, nyi, nzi,
         Areaj, nxj, nyj, nzj,
         Areak, nxk, nyk, nzk,
         CT_CELL_B_LSQ2, i, j, k,
-        B0x_face, B0y_face, B0z_face,
+        split_background ? nothing : B0x_face,
+        split_background ? nothing : B0y_face,
+        split_background ? nothing : B0z_face,
     )
+    if split_background
+        @inbounds magnetic += SVector(
+            B0_cell[i,j,k,1], B0_cell[i,j,k,2], B0_cell[i,j,k,3],
+        )
+    end
     @inbounds if isfinite(magnetic[1]) && isfinite(magnetic[2]) &&
                  isfinite(magnetic[3])
         Q[i,j,k,QBX] = magnetic[1]
@@ -2299,6 +2318,7 @@ function ct_recover_physical_ghost_b!(
     any(physical_faces) || return nothing
     background_faces = hasproperty(b,:B0x_face) ?
         (b.B0x_face,b.B0y_face,b.B0z_face) : (nothing,nothing,nothing)
+    background_cell = hasproperty(b,:B0_cell) ? b.B0_cell : nothing
     total = (nxp+2NG,nyp+2NG,nzp+2NG)
     blocks = ntuple(axis -> cld(total[axis],nthreads[axis]),Val(3))
     @gpu_launch threads=nthreads blocks=blocks ct_recover_physical_ghost_b_kernel!(
@@ -2307,7 +2327,7 @@ function ct_recover_physical_ghost_b!(
         b.Areaj,b.nxj,b.nyj,b.nzj,
         b.Areak,b.nxk,b.nyk,b.nzk,
         Int32(nxp),Int32(nyp),Int32(nzp),physical_faces,
-        background_faces...,
+        background_faces...,background_cell,
     )
     return nothing
 end
@@ -3342,6 +3362,7 @@ function _ct_launch_recover_cell_b!(
     range_nxp::Int32, range_nyp::Int32, range_nzp::Int32,
     cell_offset::Int32,
     B0x_face=nothing, B0y_face=nothing, B0z_face=nothing,
+    B0_cell=nothing,
 )
     nb = (
         cld(range_nxp, nthreads[1]),
@@ -3354,7 +3375,7 @@ function _ct_launch_recover_cell_b!(
         b.Areaj, b.nxj, b.nyj, b.nzj,
         b.Areak, b.nxk, b.nyk, b.nzk,
         recovery_mode, range_nxp, range_nyp, range_nzp, cell_offset,
-        B0x_face, B0y_face, B0z_face)
+        B0x_face, B0y_face, B0z_face, B0_cell)
     return nothing
 end
 
@@ -3369,6 +3390,8 @@ function ct_recover_cell_b!(
         (b.B0x_face, b.B0y_face, b.B0z_face) :
         (nothing, nothing, nothing)
     B0x_face, B0y_face, B0z_face = background_faces
+    background_cell = B0x_face !== nothing && hasproperty(b,:B0_cell) ?
+        b.B0_cell : nothing
     if include_ghosts && recovery_mode == CT_CELL_B_POINT6
         # POINT6 needs two face layers on the low side and three on the high
         # side. Those layers do not exist outside the padded allocation, so
@@ -3378,12 +3401,12 @@ function ct_recover_cell_b!(
         _ct_launch_recover_cell_b!(
             b, CT_CELL_B_LSQ2,
             Int32(nxp + 2*NG), Int32(nyp + 2*NG), Int32(nzp + 2*NG),
-            Int32(0), B0x_face, B0y_face, B0z_face,
+            Int32(0), B0x_face, B0y_face, B0z_face, background_cell,
         )
         _ct_launch_recover_cell_b!(
             b, CT_CELL_B_POINT6,
             Int32(nxp), Int32(nyp), Int32(nzp), Int32(NG),
-            B0x_face, B0y_face, B0z_face,
+            B0x_face, B0y_face, B0z_face, background_cell,
         )
     else
         _ct_launch_recover_cell_b!(
@@ -3392,9 +3415,57 @@ function ct_recover_cell_b!(
             Int32(include_ghosts ? nyp + 2*NG : nyp),
             Int32(include_ghosts ? nzp + 2*NG : nzp),
             Int32(include_ghosts ? 0 : NG),
-            B0x_face, B0y_face, B0z_face,
+            B0x_face, B0y_face, B0z_face, background_cell,
         )
     end
+    return nothing
+end
+
+# Prescribed external-field boundaries impose zero perturbation in the
+# background-split system. Deep physical ghosts can have degenerate metrics,
+# so their total primitive magnetic state is restored directly from B0.
+function ct_restore_prescribed_background_ghost_b_kernel!(
+    Q, B0_cell, prescribed_faces, nxp, nyp, nzp,
+)
+    i = (blockIdx().x - Int32(1))*blockDim().x + threadIdx().x
+    j = (blockIdx().y - Int32(1))*blockDim().y + threadIdx().y
+    k = (blockIdx().z - Int32(1))*blockDim().z + threadIdx().z
+    if i > nxp+2NG || j > nyp+2NG || k > nzp+2NG
+        return
+    end
+    prescribed =
+        (prescribed_faces[1] && i <= NG) ||
+        (prescribed_faces[2] && i > nxp+NG) ||
+        (prescribed_faces[3] && j <= NG) ||
+        (prescribed_faces[4] && j > nyp+NG) ||
+        (prescribed_faces[5] && k <= NG) ||
+        (prescribed_faces[6] && k > nzp+NG)
+    prescribed || return
+
+    @inbounds begin
+        Q[i,j,k,QBX] = B0_cell[i,j,k,1]
+        Q[i,j,k,QBY] = B0_cell[i,j,k,2]
+        Q[i,j,k,QBZ] = B0_cell[i,j,k,3]
+        Q[i,j,k,QPSI] = zero(FT)
+    end
+    return
+end
+
+function ct_restore_prescribed_background_ghost_b!(
+    b, nxp, nyp, nzp;
+    prescribed_faces::NTuple{6,Bool},
+)
+    background_cell = hasproperty(b,:B0_cell) ? b.B0_cell : nothing
+    background_cell === nothing && return nothing
+    any(prescribed_faces) || return nothing
+    blocks = (
+        cld(nxp+2NG,nthreads[1]), cld(nyp+2NG,nthreads[2]),
+        cld(nzp+2NG,nthreads[3]),
+    )
+    @gpu_launch threads=nthreads blocks=blocks ct_restore_prescribed_background_ghost_b_kernel!(
+        b.Q,background_cell,prescribed_faces,
+        Int32(nxp),Int32(nyp),Int32(nzp),
+    )
     return nothing
 end
 

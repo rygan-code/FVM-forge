@@ -1525,6 +1525,98 @@ function ct_sync_interface_sheets!(
     return nothing
 end
 
+"""Measure oriented edge-EMF disagreement across same-rank block interfaces."""
+function ct_local_interface_edge_residual(blocks, plan::CTSyncPlan)
+    world_rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    for (index, ex) in enumerate(plan.exchanges)
+        ex.nb_rank == world_rank || continue
+        ct_pack_interface_sheet!(plan.send_buffers[index], blocks[ex.bid], ex)
+    end
+
+    max_residual = zero(FT)
+    max_scale = zero(FT)
+    worst = nothing
+    max_interior_residual = zero(FT)
+    worst_interior = nothing
+    for (index, ex) in enumerate(plan.exchanges)
+        ex.nb_rank == world_rank || continue
+        peer_index = plan.local_peer[index]
+        index < peer_index || continue
+        u_len = ex.u_e - ex.u_s + 1
+        v_len = ex.v_e - ex.v_s + 1
+        _, local_u, local_v = _ct_interface_buffer_views(
+            plan.send_buffers[index], u_len, v_len,
+        )
+        source_u_len, source_v_len = if ex.transform !== nothing &&
+            (structured_face_transform_code(
+                structured_inverse_face_transform(ex.transform),
+            ) & 1) != 0
+            (v_len, u_len)
+        else
+            (u_len, v_len)
+        end
+        face_src, u_src, v_src = _ct_interface_buffer_views(
+            plan.send_buffers[peer_index], source_u_len, source_v_len,
+        )
+        if ex.transform !== nothing
+            _, peer_u, peer_v = _ct_reorient_interface_sheet(
+                face_src, u_src, v_src,
+                structured_inverse_face_transform(ex.transform),
+                u_len, v_len,
+            )
+        elseif ex.reverse_tan
+            peer_u = Array(u_src[:, end:-1:1])
+            peer_v = Array(v_src[:, end:-1:1])
+        else
+            peer_u = Array(u_src)
+            peer_v = Array(v_src)
+        end
+        if ex.transform === nothing
+            peer_v .*= FT(ct_interface_v_edge_sign(ex.reverse_tan))
+        end
+        for (component, local_values, peer_values) in (
+            (:u, local_u, peer_u), (:v, local_v, peer_v),
+        )
+            difference = abs.(local_values .- peer_values)
+            residual, residual_index = findmax(difference)
+            scale = max(maximum(abs, local_values), maximum(abs, peer_values))
+            if residual > max_residual
+                max_residual = residual
+                worst = (
+                    ex.bid, ex.fid, ex.nb_bid, ex.nb_fid, component,
+                    Tuple(residual_index), local_values[residual_index],
+                    peer_values[residual_index],
+                )
+            end
+            interior_difference = component === :u ?
+                @view(difference[:, 2:size(difference,2)-1]) :
+                @view(difference[2:size(difference,1)-1, :])
+            if !isempty(interior_difference)
+                interior_residual, interior_index = findmax(interior_difference)
+                if interior_residual > max_interior_residual
+                    max_interior_residual = interior_residual
+                    mapped_index = component === :u ?
+                        (interior_index[1], interior_index[2] + 1) :
+                        (interior_index[1] + 1, interior_index[2])
+                    worst_interior = (
+                        ex.bid, ex.fid, ex.nb_bid, ex.nb_fid, component,
+                        mapped_index,
+                    )
+                end
+            end
+            max_scale = max(max_scale, scale)
+        end
+    end
+    relative = max_residual / max(max_scale, eps(FT))
+    interior_relative = max_interior_residual / max(max_scale, eps(FT))
+    return (
+        absolute=max_residual, scale=max_scale, relative=relative, worst=worst,
+        interior_absolute=max_interior_residual,
+        interior_relative=interior_relative,
+        worst_interior=worst_interior,
+    )
+end
+
 @inline function _ct_block_edge_view(b, edge::CTBlockEdge, global_i_s, global_i_e)
     axis = _ct_edge_axis(edge)
     offsets = (b.ox, b.oy, b.oz)
@@ -2102,6 +2194,46 @@ function ct_sync_junction_edges!(
     end
     gpu_sync()
     return nothing
+end
+
+"""Measure canonical edge-EMF disagreement at same-rank multi-block junctions."""
+function ct_local_junction_edge_residual(blocks, plan::CTJunctionPlan)
+    world_rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    max_residual = zero(FT)
+    max_scale = zero(FT)
+    worst = nothing
+    for owner_job in plan.send_jobs
+        owner_job.remote_rank == world_rank || continue
+        member_index = findfirst(plan.recv_jobs) do member_job
+            member_job.local_edge == owner_job.remote_edge &&
+            member_job.remote_edge == owner_job.local_edge &&
+            member_job.global_i_s == owner_job.global_i_s &&
+            member_job.global_i_e == owner_job.global_i_e &&
+            member_job.tag == owner_job.tag
+        end
+        member_index === nothing && error(
+            "missing local CT junction diagnostic member for $owner_job",
+        )
+        member_job = plan.recv_jobs[member_index]
+        owner_values = similar(plan.send_buffers[1],
+            owner_job.global_i_e - owner_job.global_i_s + 1)
+        member_values = similar(owner_values)
+        _ct_pack_junction_local_canonical!(
+            owner_values, blocks[owner_job.local_edge.bid], owner_job,
+        )
+        _ct_pack_junction_local_canonical!(
+            member_values, blocks[member_job.local_edge.bid], member_job,
+        )
+        residual = maximum(abs, owner_values .- member_values)
+        scale = max(maximum(abs, owner_values), maximum(abs, member_values))
+        if residual > max_residual
+            max_residual = residual
+            worst = (owner_job.local_edge, owner_job.remote_edge)
+        end
+        max_scale = max(max_scale, scale)
+    end
+    relative = max_residual / max(max_scale, eps(FT))
+    return (absolute=max_residual, scale=max_scale, relative=relative, worst=worst)
 end
 
 @inline function _ct_rank_sheet_views(b, direction, side)

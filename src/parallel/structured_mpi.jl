@@ -1217,6 +1217,53 @@ end
 # =============================================================================
 const _tmp_Block_Nprocs = Ref{Any}(nothing)
 
+const _STRUCTURED_METRIC_MPI_TAG_LIMIT = 32767
+
+function _structured_metric_interface_tags(connectivity, base_tag::Integer)
+    0 <= base_tag <= _STRUCTURED_METRIC_MPI_TAG_LIMIT || throw(ArgumentError(
+        "metric interface MPI tag base must be in " *
+        "0:$(_STRUCTURED_METRIC_MPI_TAG_LIMIT), got $base_tag",
+    ))
+    interface_keys = Set{Tuple{Int,Int}}()
+    for ((bid, fid), connection) in connectivity
+        neighbor_bid = Int(connection.src_b)
+        neighbor_fid = Int(connection.src_f)
+        bid >= 0 && neighbor_bid >= 0 || throw(ArgumentError(
+            "metric connectivity block ids must be nonnegative",
+        ))
+        1 <= fid <= 6 && 1 <= neighbor_fid <= 6 || throw(ArgumentError(
+            "metric connectivity face ids must be in 1:6",
+        ))
+        endpoint = 6Int(bid) + Int(fid) - 1
+        neighbor_endpoint = 6neighbor_bid + neighbor_fid - 1
+        push!(interface_keys, (
+            min(endpoint, neighbor_endpoint),
+            max(endpoint, neighbor_endpoint),
+        ))
+    end
+    ordered_keys = sort!(collect(interface_keys))
+    highest_tag = base_tag + length(ordered_keys) - 1
+    highest_tag <= _STRUCTURED_METRIC_MPI_TAG_LIMIT || throw(ArgumentError(
+        "metric interface count $(length(ordered_keys)) exceeds the guaranteed " *
+        "MPI tag range at base $base_tag",
+    ))
+    return Dict(
+        key => Int(base_tag) + index - 1
+        for (index, key) in enumerate(ordered_keys)
+    )
+end
+
+function _structured_metric_gate_tolerance(raw_value, variable_name)
+    value = tryparse(Float64, strip(string(raw_value)))
+    value === nothing && throw(ArgumentError(
+        "$variable_name must be a finite nonnegative number, got '$raw_value'",
+    ))
+    isfinite(value) && value >= 0 || throw(ArgumentError(
+        "$variable_name must be a finite nonnegative number, got '$raw_value'",
+    ))
+    return value
+end
+
 function sync_all_interface_metrics!(local_blocks, temp_metrics_h,
                                      face_bc, connectivity, rank_offsets,
                                      Block_Nprocs, Nx_b, Ny_b, Nz_b, NG)
@@ -1239,10 +1286,9 @@ function sync_all_interface_metrics!(local_blocks, temp_metrics_h, sync_dict, _a
     #   neighbor only issues one Irecv per tag.  Two of the three sends never
     #   match an Irecv → MPI_Waitall hangs forever.
     #
-    # FIX: tag must encode the sub-rank identity of BOTH ends, not just the
-    # block-face pair.  Use a stable, symmetric tag = hash of the ordered tuple
-    # (sender_world_rank, receiver_world_rank, sender_bid, sender_fid).
-    # Each (rank_A → rank_B) message gets a unique tag in both ends' views.
+    # FIX: each logical block-face pair receives a stable compact tag from the
+    # global connectivity. MPI source matching distinguishes sub-rank peers,
+    # so one tag per interface is sufficient and grows linearly with topology.
     #
     # Plus: replace Isend/Irecv/Waitall with MPI.Sendrecv! when both ends
     # post in the same loop iteration — guaranteed deadlock-free.
@@ -1414,15 +1460,16 @@ function sync_all_interface_metrics!(local_blocks, temp_metrics_h, sync_dict, _a
     # anything, so by the time any Isend reaches the network, the matching
     # Irecv is already waiting. No deadlock possible from ordering.
     #
-    # Tag uniqueness: each (sender_rank, receiver_rank, sender_bid, sender_fid)
-    # is unique. Both ends compute the same tag from the symmetric tuple
-    # (min(A,B), max(A,B), bid_lo, fid_lo, bid_hi, fid_hi).
+    # Tag uniqueness: both ends map the same canonical endpoint pair to the
+    # same compact connectivity index. Distinct logical interfaces have
+    # distinct tags; MPI source matching separates their sub-rank overlaps.
     #
     # Pre-allocate buffers for each exchange.
     send_bufs = Vector{Array{Float64,3}}(undef, length(my_exchanges))
     recv_bufs = Vector{Array{Float64,3}}(undef, length(my_exchanges))
     tags = Vector{Int}(undef, length(my_exchanges))
     local_peer = fill(0, length(my_exchanges))
+    interface_tags = _structured_metric_interface_tags(connectivity, 7000)
     for (i, ex) in enumerate(my_exchanges)
         Areai, nxi, nyi, nzi, Areaj, nxj, nyj, nzj, Areak, nxk, nyk, nzk = temp_metrics_h[ex.bid]
         send_bufs[i] = pack_face_metrics!(ex.fid,
@@ -1432,19 +1479,30 @@ function sync_all_interface_metrics!(local_blocks, temp_metrics_h, sync_dict, _a
         recv_bufs[i] = similar(send_bufs[i])
         endpoint = ex.bid*6 + ex.fid - 1
         nb_endpoint = ex.nb_bid*6 + ex.nb_fid - 1
-        tags[i] = 7000 + min(endpoint, nb_endpoint)*(6*Nblocks_total) +
-            max(endpoint, nb_endpoint)
+        tags[i] = interface_tags[(
+            min(endpoint, nb_endpoint), max(endpoint, nb_endpoint),
+        )]
     end
     for (i, ex) in enumerate(my_exchanges)
         if ex.nb_rank != world_rank
             continue
         end
+        transform_swaps_tangents =
+            hasproperty(ex.conn, :transform) &&
+            ex.conn.transform !== nothing &&
+            (structured_face_transform_code(
+                structured_inverse_face_transform(ex.conn.transform),
+            ) & 1) != 0
+        expected_peer_size = transform_swaps_tangents ?
+            (size(recv_bufs[i], 2), size(recv_bufs[i], 1),
+             size(recv_bufs[i], 3)) :
+            size(recv_bufs[i])
         peer = findfirst(eachindex(my_exchanges)) do candidate
             other = my_exchanges[candidate]
             other.bid == ex.nb_bid && other.fid == ex.nb_fid &&
                 other.nb_bid == ex.bid && other.nb_fid == ex.fid &&
                 other.nb_rank == world_rank &&
-                size(send_bufs[candidate]) == size(recv_bufs[i])
+                size(send_bufs[candidate]) == expected_peer_size
         end
         if peer === nothing
             error("Missing local metric interface peer for block=$(ex.bid) face=$(ex.fid)")
@@ -1539,6 +1597,560 @@ end
           # the butterfly topology, but handle them for completeness.
         return y_lo, y_hi, z_lo, z_hi, Nz_g
     end
+end
+
+function _structured_metric_block_layout(
+    Nblocks_total, Block_Nprocs, rank_offsets,
+)
+    layout = Dict{Int,Tuple{Int,Int,Int}}()
+    for bid in 0:Nblocks_total-1
+        if Block_Nprocs !== nothing && bid + 1 <= length(Block_Nprocs)
+            value = Block_Nprocs[bid + 1]
+            layout[bid] = (Int(value[1]), Int(value[2]), Int(value[3]))
+        elseif _tmp_Block_Nprocs[] !== nothing &&
+               bid + 1 <= length(_tmp_Block_Nprocs[])
+            value = _tmp_Block_Nprocs[][bid + 1]
+            layout[bid] = (Int(value[1]), Int(value[2]), Int(value[3]))
+        elseif bid + 2 <= length(rank_offsets)
+            layout[bid] = (rank_offsets[bid + 2] - rank_offsets[bid + 1], 1, 1)
+        else
+            layout[bid] = (1, 1, 1)
+        end
+    end
+    return layout
+end
+
+function _structured_metric_edge_payload_source_shape(ex)
+    destination = structured_face_frame(ex.fid)
+    source = structured_face_frame(ex.nb_fid)
+    transform = _structured_metric_connection_transform(ex.fid, ex.conn)
+    u_length = ex.u_e - ex.u_s + 1
+    v_length = ex.v_e - ex.v_s + 1
+    mapped_u = abs(transform.source_for_destination[destination.u_axis])
+    return mapped_u == source.u_axis ?
+        (u_length, v_length) : (v_length, u_length)
+end
+
+function sync_all_interface_metric_edges!(
+    local_blocks, metric_auxiliary, face_bc, connectivity,
+    rank_offsets, Block_Nprocs, Nx_b, Ny_b, Nz_b, NG,
+)
+    world_rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    Nblocks_total = length(Nx_b)
+    length(Ny_b) == Nblocks_total && length(Nz_b) == Nblocks_total ||
+        throw(DimensionMismatch("inconsistent block dimensions in SCMM edge sync"))
+    block_layout = _structured_metric_block_layout(
+        Nblocks_total, Block_Nprocs, rank_offsets,
+    )
+    exchanges = NamedTuple[]
+
+    for bid in sort(collect(local_blocks))
+        haskey(metric_auxiliary, bid) || continue
+        px, py, pz = block_layout[bid]
+        local_rank = world_rank - rank_offsets[bid + 1]
+        0 <= local_rank < px * py * pz || continue
+        rx = local_rank ÷ (py * pz)
+        ry = (local_rank ÷ pz) % py
+        rz = local_rank % pz
+        nx_global, ny_global, nz_global =
+            Nx_b[bid + 1], Ny_b[bid + 1], Nz_b[bid + 1]
+        nx_local = nx_global ÷ px + (rx < nx_global % px ? 1 : 0)
+        ny_local = ny_global ÷ py + (ry < ny_global % py ? 1 : 0)
+        nz_local = nz_global ÷ pz + (rz < nz_global % pz ? 1 : 0)
+
+        for fid in 1:6
+            get(face_bc, (bid, fid), 1) == 0 || continue
+            haskey(connectivity, (bid, fid)) || throw(ArgumentError(
+                "missing connectivity for SCMM edge endpoint ($bid,$fid)",
+            ))
+            _ms_subdomain_touches_face(fid, rx, ry, rz, px, py, pz) || continue
+            conn = connectivity[(bid, fid)]
+            nb_bid, nb_fid = conn.src_b, conn.src_f
+            u_d_s, u_d_e, v_d_s, v_d_e, _ = _ms_face_uv_extent(
+                fid, rx, ry, rz, px, py, pz,
+                nx_global, ny_global, nz_global,
+            )
+            npx, npy, npz = block_layout[nb_bid]
+            for neighbor_local_rank in 0:npx*npy*npz-1
+                sx = neighbor_local_rank ÷ (npy * npz)
+                sy = (neighbor_local_rank ÷ npz) % npy
+                sz = neighbor_local_rank % npz
+                _ms_subdomain_touches_face(
+                    nb_fid, sx, sy, sz, npx, npy, npz,
+                ) || continue
+                u_s_s, u_s_e, v_s_s, v_s_e, v_total_source =
+                    _ms_face_uv_extent(
+                        nb_fid, sx, sy, sz, npx, npy, npz,
+                        Nx_b[nb_bid + 1], Ny_b[nb_bid + 1], Nz_b[nb_bid + 1],
+                    )
+                mapped_u_s, mapped_u_e, mapped_v_s, mapped_v_e =
+                    if hasproperty(conn, :transform) && conn.transform !== nothing
+                        source_ranges = (
+                            _ms_nonuniform_extent(sx, npx, Nx_b[nb_bid + 1]),
+                            _ms_nonuniform_extent(sy, npy, Ny_b[nb_bid + 1]),
+                            _ms_nonuniform_extent(sz, npz, Nz_b[nb_bid + 1]),
+                        )
+                        mapped = structured_map_face_extent(
+                            structured_inverse_face_transform(conn.transform),
+                            source_ranges,
+                            (Nx_b[nb_bid + 1], Ny_b[nb_bid + 1], Nz_b[nb_bid + 1]),
+                        )
+                        (mapped[1][1], mapped[1][2], mapped[2][1], mapped[2][2])
+                    elseif conn.reverse_tan
+                        (u_s_s, u_s_e,
+                         v_total_source - v_s_e + 1,
+                         v_total_source - v_s_s + 1)
+                    else
+                        (u_s_s, u_s_e, v_s_s, v_s_e)
+                    end
+                u_start, u_end = max(u_d_s, mapped_u_s), min(u_d_e, mapped_u_e)
+                v_start, v_end = max(v_d_s, mapped_v_s), min(v_d_e, mapped_v_e)
+                u_start <= u_end && v_start <= v_end || continue
+                push!(exchanges, (
+                    bid=bid, fid=fid, conn=conn,
+                    nb_bid=nb_bid, nb_fid=nb_fid,
+                    nb_rank=rank_offsets[nb_bid + 1] + neighbor_local_rank,
+                    u_s=u_start-u_d_s+1, u_e=u_end-u_d_s+1,
+                    v_s=v_start-v_d_s+1, v_e=v_end-v_d_s+1,
+                    nx=nx_local, ny=ny_local, nz=nz_local,
+                ))
+            end
+        end
+    end
+    sort!(exchanges, by=ex ->
+        (ex.nb_rank, ex.bid, ex.fid, ex.nb_bid, ex.nb_fid,
+         ex.u_s, ex.v_s))
+
+    send_buffers = Vector{Any}(undef, length(exchanges))
+    recv_buffers = Vector{Any}(undef, length(exchanges))
+    tags = Vector{Int}(undef, length(exchanges))
+    local_peer = zeros(Int, length(exchanges))
+    interface_tags = _structured_metric_interface_tags(connectivity, 9000)
+    for (index, ex) in enumerate(exchanges)
+        auxiliary = metric_auxiliary[ex.bid]
+        coordinates, workspace = auxiliary[1], auxiliary[2]
+        payload = pack_scmm_face_edge_payload(
+            workspace, coordinates, ex.fid, ex.nx, ex.ny, ex.nz, NG;
+            u_s=ex.u_s, u_e=ex.u_e, v_s=ex.v_s, v_e=ex.v_e,
+        )
+        send_buffers[index] = scmm_face_edge_payload_vector(payload)
+        recv_buffers[index] = similar(send_buffers[index])
+        endpoint = ex.bid * 6 + ex.fid - 1
+        neighbor_endpoint = ex.nb_bid * 6 + ex.nb_fid - 1
+        tags[index] = interface_tags[(
+            min(endpoint, neighbor_endpoint),
+            max(endpoint, neighbor_endpoint),
+        )]
+    end
+    for (index, ex) in enumerate(exchanges)
+        ex.nb_rank == world_rank || continue
+        peer = findfirst(eachindex(exchanges)) do candidate
+            other = exchanges[candidate]
+            other.bid == ex.nb_bid && other.fid == ex.nb_fid &&
+                other.nb_bid == ex.bid && other.nb_fid == ex.fid &&
+                other.nb_rank == world_rank &&
+                length(send_buffers[candidate]) == length(recv_buffers[index])
+        end
+        peer === nothing && error(
+            "missing local SCMM edge peer for block=$(ex.bid) face=$(ex.fid)",
+        )
+        local_peer[index] = peer
+    end
+
+    requests = MPI.Request[]
+    for (index, ex) in enumerate(exchanges)
+        ex.nb_rank == world_rank && continue
+        push!(requests, MPI.Irecv!(
+            recv_buffers[index], MPI.COMM_WORLD;
+            source=ex.nb_rank, tag=tags[index],
+        ))
+    end
+    for (index, ex) in enumerate(exchanges)
+        ex.nb_rank == world_rank && continue
+        push!(requests, MPI.Isend(
+            send_buffers[index], MPI.COMM_WORLD;
+            dest=ex.nb_rank, tag=tags[index],
+        ))
+    end
+    isempty(requests) || MPI.Waitall(requests)
+
+    for (index, ex) in enumerate(exchanges)
+        source_key = (ex.nb_bid, ex.nb_fid)
+        destination_key = (ex.bid, ex.fid)
+        isless(source_key, destination_key) || continue
+        values = ex.nb_rank == world_rank ?
+            send_buffers[local_peer[index]] : recv_buffers[index]
+        source_u, source_v = _structured_metric_edge_payload_source_shape(ex)
+        payload = scmm_face_edge_payload_from_vector(
+            values, source_u, source_v,
+        )
+        coordinates, workspace = metric_auxiliary[ex.bid][1:2]
+        unpack_canonical_scmm_face_edges!(
+            workspace, coordinates, payload, ex.fid, ex.conn,
+            ex.nx, ex.ny, ex.nz, NG;
+            u_s=ex.u_s, u_e=ex.u_e, v_s=ex.v_s, v_e=ex.v_e,
+        )
+    end
+    MPI.Barrier(MPI.COMM_WORLD)
+    world_rank == 0 && println(
+        "Rank 0: Canonical SCMM interface-edge synchronization complete.",
+    )
+    return nothing
+end
+
+@inline function _structured_metric_face_arrays(values)
+    offset = if length(values) == 14
+        1
+    elseif length(values) == 12
+        0
+    else
+        throw(DimensionMismatch(
+            "expected 12 metric arrays, optionally preceded by cache path and " *
+            "followed by volume; got tuple length $(length(values))",
+        ))
+    end
+    return ntuple(index -> values[offset + index], 12)
+end
+
+function _structured_metric_buffer_residual(
+    local_buffer, source_buffer, fid::Int, neighbor_fid::Int;
+    reverse_tan::Bool=false, transform=nothing,
+)
+    local_u, local_v = size(local_buffer, 1), size(local_buffer, 2)
+    destination = structured_face_frame(fid)
+    source = structured_face_frame(neighbor_fid)
+    flip_normal = -structured_face_side_sign(fid) *
+        structured_face_side_sign(neighbor_fid)
+    max_absolute = 0.0
+    max_relative = 0.0
+
+    for local_v_index in 1:local_v, local_u_index in 1:local_u
+        source_u, source_v = if transform === nothing
+            (
+                local_u_index,
+                reverse_tan ? local_v + 1 - local_v_index : local_v_index,
+            )
+        else
+            map_u = transform.source_for_destination[destination.u_axis]
+            map_v = transform.source_for_destination[destination.v_axis]
+            source_coordinates = zeros(Int, 3)
+            source_dimensions = zeros(Int, 3)
+            source_dimensions[source.u_axis] = size(source_buffer, 1)
+            source_dimensions[source.v_axis] = size(source_buffer, 2)
+            source_coordinates[abs(map_u)] = map_u < 0 ?
+                source_dimensions[abs(map_u)] + 1 - local_u_index :
+                local_u_index
+            source_coordinates[abs(map_v)] = map_v < 0 ?
+                source_dimensions[abs(map_v)] + 1 - local_v_index :
+                local_v_index
+            (
+                source_coordinates[source.u_axis],
+                source_coordinates[source.v_axis],
+            )
+        end
+        1 <= source_u <= size(source_buffer, 1) &&
+            1 <= source_v <= size(source_buffer, 2) ||
+            throw(BoundsError(
+                source_buffer,
+                (source_u, source_v, 1),
+            ))
+
+        local_area = local_buffer[local_u_index, local_v_index, 1]
+        source_area = source_buffer[source_u, source_v, 1]
+        local_vector = ntuple(
+            component -> local_area *
+                local_buffer[local_u_index, local_v_index, component + 1],
+            3,
+        )
+        source_vector = ntuple(
+            component -> flip_normal * source_area *
+                source_buffer[source_u, source_v, component + 1],
+            3,
+        )
+        absolute = sqrt(sum(
+            (local_vector[component] - source_vector[component])^2
+            for component in 1:3
+        ))
+        local_norm = sqrt(sum(value^2 for value in local_vector))
+        source_norm = sqrt(sum(value^2 for value in source_vector))
+        scale = max(local_norm, source_norm, eps(Float64))
+        max_absolute = max(max_absolute, absolute)
+        max_relative = max(max_relative, absolute / scale)
+    end
+    return max_absolute, max_relative
+end
+
+function structured_interblock_metric_residuals(
+    temp_metrics_h, blocks, face_bc, connectivity,
+    rank_offsets, Block_Nprocs, Nx_b, Ny_b, Nz_b, NG,
+)
+    world_rank = MPI.Comm_rank(MPI.COMM_WORLD)
+    Nblocks_total = length(Nx_b)
+    length(Ny_b) == Nblocks_total && length(Nz_b) == Nblocks_total ||
+        throw(DimensionMismatch(
+            "inconsistent block dimensions in shared-face metric gate",
+        ))
+    block_layout = _structured_metric_block_layout(
+        Nblocks_total, Block_Nprocs, rank_offsets,
+    )
+    exchanges = NamedTuple[]
+
+    for bid in sort(collect(keys(temp_metrics_h)))
+        haskey(blocks, bid) || continue
+        px, py, pz = block_layout[bid]
+        local_rank = world_rank - rank_offsets[bid + 1]
+        0 <= local_rank < px * py * pz || continue
+        rx = local_rank ÷ (py * pz)
+        ry = (local_rank ÷ pz) % py
+        rz = local_rank % pz
+        nx_global, ny_global, nz_global =
+            Nx_b[bid + 1], Ny_b[bid + 1], Nz_b[bid + 1]
+        nx_local = nx_global ÷ px + (rx < nx_global % px ? 1 : 0)
+        ny_local = ny_global ÷ py + (ry < ny_global % py ? 1 : 0)
+        nz_local = nz_global ÷ pz + (rz < nz_global % pz ? 1 : 0)
+
+        for fid in 1:6
+            get(face_bc, (bid, fid), nothing) == BC_INTERBLOCK ||
+                continue
+            _ms_subdomain_touches_face(fid, rx, ry, rz, px, py, pz) ||
+                continue
+            haskey(connectivity, (bid, fid)) || throw(ArgumentError(
+                "missing connectivity for shared-face metric endpoint ($bid,$fid)",
+            ))
+            conn = connectivity[(bid, fid)]
+            neighbor_bid, neighbor_fid = conn.src_b, conn.src_f
+            u_d_s, u_d_e, v_d_s, v_d_e, _ = _ms_face_uv_extent(
+                fid, rx, ry, rz, px, py, pz,
+                nx_global, ny_global, nz_global,
+            )
+            npx, npy, npz = block_layout[neighbor_bid]
+            for neighbor_local_rank in 0:npx*npy*npz-1
+                sx = neighbor_local_rank ÷ (npy * npz)
+                sy = (neighbor_local_rank ÷ npz) % npy
+                sz = neighbor_local_rank % npz
+                _ms_subdomain_touches_face(
+                    neighbor_fid, sx, sy, sz, npx, npy, npz,
+                ) || continue
+                u_s_s, u_s_e, v_s_s, v_s_e, v_total_source =
+                    _ms_face_uv_extent(
+                        neighbor_fid, sx, sy, sz, npx, npy, npz,
+                        Nx_b[neighbor_bid + 1], Ny_b[neighbor_bid + 1],
+                        Nz_b[neighbor_bid + 1],
+                    )
+                mapped_u_s, mapped_u_e, mapped_v_s, mapped_v_e =
+                    if hasproperty(conn, :transform) &&
+                       conn.transform !== nothing
+                        source_ranges = (
+                            _ms_nonuniform_extent(
+                                sx, npx, Nx_b[neighbor_bid + 1],
+                            ),
+                            _ms_nonuniform_extent(
+                                sy, npy, Ny_b[neighbor_bid + 1],
+                            ),
+                            _ms_nonuniform_extent(
+                                sz, npz, Nz_b[neighbor_bid + 1],
+                            ),
+                        )
+                        mapped = structured_map_face_extent(
+                            structured_inverse_face_transform(conn.transform),
+                            source_ranges,
+                            (
+                                Nx_b[neighbor_bid + 1],
+                                Ny_b[neighbor_bid + 1],
+                                Nz_b[neighbor_bid + 1],
+                            ),
+                        )
+                        (
+                            mapped[1][1], mapped[1][2],
+                            mapped[2][1], mapped[2][2],
+                        )
+                    elseif conn.reverse_tan
+                        (
+                            u_s_s, u_s_e,
+                            v_total_source - v_s_e + 1,
+                            v_total_source - v_s_s + 1,
+                        )
+                    else
+                        (u_s_s, u_s_e, v_s_s, v_s_e)
+                    end
+                u_start, u_end = max(u_d_s, mapped_u_s), min(u_d_e, mapped_u_e)
+                v_start, v_end = max(v_d_s, mapped_v_s), min(v_d_e, mapped_v_e)
+                u_start <= u_end && v_start <= v_end || continue
+                push!(exchanges, (
+                    bid=bid, fid=fid, conn=conn,
+                    neighbor_bid=neighbor_bid, neighbor_fid=neighbor_fid,
+                    neighbor_rank=rank_offsets[neighbor_bid + 1] +
+                        neighbor_local_rank,
+                    u_s=u_start-u_d_s+1, u_e=u_end-u_d_s+1,
+                    v_s=v_start-v_d_s+1, v_e=v_end-v_d_s+1,
+                    nx=nx_local, ny=ny_local, nz=nz_local,
+                ))
+            end
+        end
+    end
+    sort!(exchanges, by=exchange -> (
+        exchange.neighbor_rank, exchange.bid, exchange.fid,
+        exchange.neighbor_bid, exchange.neighbor_fid,
+        exchange.u_s, exchange.v_s,
+    ))
+
+    send_buffers = Vector{Any}(undef, length(exchanges))
+    recv_buffers = Vector{Any}(undef, length(exchanges))
+    tags = Vector{Int}(undef, length(exchanges))
+    local_peer = zeros(Int, length(exchanges))
+    interface_tags = _structured_metric_interface_tags(connectivity, 10000)
+    for (index, exchange) in enumerate(exchanges)
+        arrays = _structured_metric_face_arrays(temp_metrics_h[exchange.bid])
+        send_buffers[index] = pack_face_metrics!(
+            exchange.fid, arrays...,
+            exchange.nx, exchange.ny, exchange.nz, NG;
+            u_s=exchange.u_s, u_e=exchange.u_e,
+            v_s=exchange.v_s, v_e=exchange.v_e,
+        )
+        recv_buffers[index] = similar(send_buffers[index])
+        endpoint = exchange.bid * 6 + exchange.fid - 1
+        neighbor_endpoint =
+            exchange.neighbor_bid * 6 + exchange.neighbor_fid - 1
+        tags[index] = interface_tags[(
+            min(endpoint, neighbor_endpoint),
+            max(endpoint, neighbor_endpoint),
+        )]
+    end
+    for (index, exchange) in enumerate(exchanges)
+        exchange.neighbor_rank == world_rank || continue
+        peer = findfirst(eachindex(exchanges)) do candidate
+            other = exchanges[candidate]
+            other.bid == exchange.neighbor_bid &&
+                other.fid == exchange.neighbor_fid &&
+                other.neighbor_bid == exchange.bid &&
+                other.neighbor_fid == exchange.fid &&
+                other.neighbor_rank == world_rank &&
+                length(send_buffers[candidate]) == length(recv_buffers[index])
+        end
+        peer === nothing && error(
+            "missing local shared-face metric peer for " *
+            "block=$(exchange.bid) face=$(exchange.fid)",
+        )
+        local_peer[index] = peer
+    end
+
+    requests = MPI.Request[]
+    for (index, exchange) in enumerate(exchanges)
+        exchange.neighbor_rank == world_rank && continue
+        push!(requests, MPI.Irecv!(
+            recv_buffers[index], MPI.COMM_WORLD;
+            source=exchange.neighbor_rank, tag=tags[index],
+        ))
+    end
+    for (index, exchange) in enumerate(exchanges)
+        exchange.neighbor_rank == world_rank && continue
+        push!(requests, MPI.Isend(
+            send_buffers[index], MPI.COMM_WORLD;
+            dest=exchange.neighbor_rank, tag=tags[index],
+        ))
+    end
+    isempty(requests) || MPI.Waitall(requests)
+
+    max_absolute = 0.0
+    max_relative = 0.0
+    for (index, exchange) in enumerate(exchanges)
+        source = exchange.neighbor_rank == world_rank ?
+            send_buffers[local_peer[index]] : recv_buffers[index]
+        transform = if hasproperty(exchange.conn, :transform) &&
+                       exchange.conn.transform !== nothing
+            structured_inverse_face_transform(exchange.conn.transform)
+        else
+            nothing
+        end
+        if transform !== nothing &&
+           (structured_face_transform_code(transform) & 1) != 0 &&
+           exchange.neighbor_rank != world_rank
+            source = reshape(
+                vec(source), size(source, 2), size(source, 1), size(source, 3),
+            )
+        end
+        absolute, relative = _structured_metric_buffer_residual(
+            send_buffers[index], source,
+            exchange.fid, exchange.neighbor_fid;
+            reverse_tan=exchange.conn.reverse_tan,
+            transform=transform,
+        )
+        max_absolute = max(max_absolute, absolute)
+        max_relative = max(max_relative, relative)
+    end
+    return max_absolute, max_relative
+end
+
+function structured_rank_metric_residuals(
+    temp_metrics_h, blocks, block_comms, Block_Nprocs, NG,
+)
+    max_absolute = 0.0
+    max_relative = 0.0
+    for bid in sort(collect(keys(temp_metrics_h)))
+        block = blocks[bid]
+        layout = Block_Nprocs[bid + 1]
+        all(layout .== 1) && continue
+        communicator = block_comms[bid]
+        arrays = _structured_metric_face_arrays(temp_metrics_h[bid])
+        for direction in 1:3
+            layout[direction] <= 1 && continue
+            low_face = 2direction - 1
+            high_face = 2direction
+            low_buffer = pack_face_metrics!(
+                low_face, arrays..., block.Nx, block.Ny, block.Nz, NG,
+            )
+            high_buffer = pack_face_metrics!(
+                high_face, arrays..., block.Nx, block.Ny, block.Nz, NG,
+            )
+            source_rank, destination_rank =
+                MPI.Cart_shift(communicator, direction - 1, 1)
+            from_low = similar(high_buffer)
+            from_high = similar(low_buffer)
+            MPI.Sendrecv!(
+                high_buffer, from_low, communicator;
+                dest=destination_rank, source=source_rank,
+            )
+            MPI.Sendrecv!(
+                low_buffer, from_high, communicator;
+                dest=source_rank, source=destination_rank,
+            )
+            if source_rank != MPI.PROC_NULL
+                absolute, relative = _structured_metric_buffer_residual(
+                    low_buffer, from_low, low_face, high_face,
+                )
+                max_absolute = max(max_absolute, absolute)
+                max_relative = max(max_relative, relative)
+            end
+            if destination_rank != MPI.PROC_NULL
+                absolute, relative = _structured_metric_buffer_residual(
+                    high_buffer, from_high, high_face, low_face,
+                )
+                max_absolute = max(max_absolute, absolute)
+                max_relative = max(max_relative, relative)
+            end
+        end
+    end
+    return max_absolute, max_relative
+end
+
+function structured_shared_face_metric_residuals(
+    temp_metrics_h, blocks, block_comms, face_bc, connectivity,
+    rank_offsets, Block_Nprocs, Nx_b, Ny_b, Nz_b, NG,
+)
+    interblock_absolute, interblock_relative =
+        structured_interblock_metric_residuals(
+            temp_metrics_h, blocks, face_bc, connectivity,
+            rank_offsets, Block_Nprocs, Nx_b, Ny_b, Nz_b, NG,
+        )
+    rank_absolute, rank_relative = structured_rank_metric_residuals(
+        temp_metrics_h, blocks, block_comms, Block_Nprocs, NG,
+    )
+    local_absolute = max(interblock_absolute, rank_absolute)
+    local_relative = max(interblock_relative, rank_relative)
+    return (
+        MPI.Allreduce(local_absolute, MPI.MAX, MPI.COMM_WORLD),
+        MPI.Allreduce(local_relative, MPI.MAX, MPI.COMM_WORLD),
+    )
 end
 
 # =============================================================================

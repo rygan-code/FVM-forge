@@ -17,6 +17,7 @@ const STRUCTURED_TASK_Q_POINT = :Q_POINT
 const STRUCTURED_TASK_Q_PHYSICAL = :Q_PHYSICAL
 const STRUCTURED_TASK_Q_HALO = :Q_HALO
 const STRUCTURED_TASK_CT_DERIVATION_HALO = :CT_DERIVATION_HALO
+const STRUCTURED_TASK_CT_BACKGROUND_READY = :CT_BACKGROUND_READY
 const STRUCTURED_TASK_POSITIVITY = :POSITIVITY
 
 # End-of-step resources.  These are intentionally separate from the RK stage
@@ -404,6 +405,7 @@ end
 function build_structured_explicit_rk3_task_graph(
     block_ids;
     ct_mode::Bool=false,
+    background_split::Bool=false,
     troubled_mask::Bool=false,
     fofc::Bool=false,
     fofc_iterations::Integer=1,
@@ -414,6 +416,9 @@ function build_structured_explicit_rk3_task_graph(
     ids = sort!(collect(Int.(block_ids)))
     isempty(ids) && throw(ArgumentError(
         "explicit RK3 task graph requires at least one block",
+    ))
+    background_split && !ct_mode && throw(ArgumentError(
+        "CT background splitting requires ct_mode=true",
     ))
     fofc && !ct_mode && throw(ArgumentError(
         "first-order flux correction requires the CT task graph",
@@ -437,6 +442,9 @@ function build_structured_explicit_rk3_task_graph(
     declare_structured_resource!(builder, initial_q)
     declare_structured_resource!(builder, initial_u)
     ct_mode && declare_structured_resource!(builder, initial_face)
+    background_split && declare_structured_resource!(
+        builder, STRUCTURED_TASK_CT_BACKGROUND_READY; persistent=true,
+    )
 
     previous_barrier = nothing
     for stage in 1:3
@@ -567,10 +575,15 @@ function build_structured_explicit_rk3_task_graph(
                     edge_dep = Symbol[iteration_begin]
                     previous_edge === nothing ||
                         push!(edge_dep,previous_edge)
+                    edge_flux_reads = [
+                        q_reconstruction, Symbol("RK_SHOCK_HALO_",stage),
+                    ]
+                    background_split && push!(
+                        edge_flux_reads, STRUCTURED_TASK_CT_BACKGROUND_READY,
+                    )
                     add_structured_task!(builder,edge_flux;
                         depends=edge_dep,
-                        reads=[q_reconstruction,
-                               Symbol("RK_SHOCK_HALO_",stage)],
+                        reads=edge_flux_reads,
                         writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_flux))
                     add_structured_task!(builder,edge_average;
@@ -657,10 +670,15 @@ function build_structured_explicit_rk3_task_graph(
                     detect_dep = Symbol[junction_solve]
                     previous_detect === nothing ||
                         push!(detect_dep,previous_detect)
+                    detect_flux_reads = [
+                        q_reconstruction, Symbol("RK_SHOCK_HALO_",stage),
+                    ]
+                    background_split && push!(
+                        detect_flux_reads, STRUCTURED_TASK_CT_BACKGROUND_READY,
+                    )
                     add_structured_task!(builder,detect_flux;
                         depends=detect_dep,
-                        reads=[q_reconstruction,
-                               Symbol("RK_SHOCK_HALO_",stage)],
+                        reads=detect_flux_reads,
                         writes=[point_resource],exclusive=[:RK_SHARED_FLUX],
                         start! = callback(:rk_flux))
                     add_structured_task!(builder,detect_average;
@@ -762,9 +780,13 @@ function build_structured_explicit_rk3_task_graph(
             # keep block b's flux alive until its divergence callback consumes
             # it.  Serialize complete per-block pipelines explicitly.
             previous_block_div === nothing || push!(flux_dep, previous_block_div)
+            flux_reads = [q_reconstruction, Symbol("RK_SHOCK_HALO_", stage)]
+            background_split && push!(
+                flux_reads, STRUCTURED_TASK_CT_BACKGROUND_READY,
+            )
             add_structured_task!(builder, flux_id;
                 depends=flux_dep,
-                reads=[q_reconstruction, Symbol("RK_SHOCK_HALO_", stage)],
+                reads=flux_reads,
                 writes=[point_flux_resource], exclusive=[:RK_SHARED_FLUX],
                 start! = callback(:rk_flux))
 

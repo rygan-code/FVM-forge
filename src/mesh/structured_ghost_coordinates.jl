@@ -21,6 +21,175 @@ if !isdefined(@__MODULE__, :StructuredFaceFrame)
     include(joinpath(@__DIR__, "..", "core", "structured_interface_transform.jl"))
 end
 
+const STRUCTURED_METRIC_TOPOLOGY_GHOST = :cmd6_topology_ghost
+const STRUCTURED_METRIC_LOCAL_CHART = :cmd6_local_chart
+const STRUCTURED_METRIC_LOCAL_CHART_POINTS = 6
+
+struct MetricCoordinates{A}
+    x::A
+    y::A
+    z::A
+end
+
+@inline function structured_metric_mode_setting()
+    mode = if isdefined(Main, :structured_metric_mode)
+        Symbol(getfield(Main, :structured_metric_mode))
+    elseif haskey(ENV, "STRUCTURED_METRIC_MODE")
+        Symbol(lowercase(strip(ENV["STRUCTURED_METRIC_MODE"])))
+    else
+        STRUCTURED_METRIC_TOPOLOGY_GHOST
+    end
+    mode in (STRUCTURED_METRIC_TOPOLOGY_GHOST, STRUCTURED_METRIC_LOCAL_CHART) ||
+        throw(ArgumentError(
+            "unsupported structured metric mode $mode; expected " *
+            "$STRUCTURED_METRIC_TOPOLOGY_GHOST or $STRUCTURED_METRIC_LOCAL_CHART",
+        ))
+    return mode
+end
+
+function _structured_metric_extrapolation_weights(
+    ::Type{T}, npoints::Int, ng::Int,
+) where {T<:AbstractFloat}
+    npoints >= 2 || throw(ArgumentError(
+        "metric extrapolation requires at least two source nodes",
+    ))
+    weights = zeros(T, ng, npoints)
+    for ghost_layer in 1:ng
+        target = -T(ghost_layer)
+        for source in 1:npoints
+            source_coordinate = T(source - 1)
+            value = one(T)
+            for other in 1:npoints
+                other == source && continue
+                other_coordinate = T(other - 1)
+                value *= (target - other_coordinate) /
+                         (source_coordinate - other_coordinate)
+            end
+            weights[ghost_layer, source] = value
+        end
+    end
+    all(isfinite, weights) || throw(ArgumentError(
+        "non-finite local-chart metric extrapolation weights",
+    ))
+    maximum(abs, weights) <= T(1.0e6) || throw(ArgumentError(
+        "ill-conditioned local-chart metric extrapolation weights",
+    ))
+    return weights
+end
+
+function _structured_metric_extrapolate_axis!(
+    array, axis::Int, low::Bool, high::Bool,
+    ncell::Int, ng::Int, npoints::Int,
+)
+    low || high || return array
+    lo = ng + 1
+    hi = ng + ncell + 1
+    weights = _structured_metric_extrapolation_weights(
+        eltype(array), npoints, ng,
+    )
+
+    if axis == 1
+        for k in axes(array, 3), j in axes(array, 2), ghost in 1:ng
+            if low
+                array[lo-ghost,j,k] = sum(
+                    weights[ghost,source] * array[lo+source-1,j,k]
+                    for source in 1:npoints
+                )
+            end
+            if high
+                array[hi+ghost,j,k] = sum(
+                    weights[ghost,source] * array[hi-source+1,j,k]
+                    for source in 1:npoints
+                )
+            end
+        end
+    elseif axis == 2
+        for k in axes(array, 3), i in axes(array, 1), ghost in 1:ng
+            if low
+                array[i,lo-ghost,k] = sum(
+                    weights[ghost,source] * array[i,lo+source-1,k]
+                    for source in 1:npoints
+                )
+            end
+            if high
+                array[i,hi+ghost,k] = sum(
+                    weights[ghost,source] * array[i,hi-source+1,k]
+                    for source in 1:npoints
+                )
+            end
+        end
+    elseif axis == 3
+        for j in axes(array, 2), i in axes(array, 1), ghost in 1:ng
+            if low
+                array[i,j,lo-ghost] = sum(
+                    weights[ghost,source] * array[i,j,lo+source-1]
+                    for source in 1:npoints
+                )
+            end
+            if high
+                array[i,j,hi+ghost] = sum(
+                    weights[ghost,source] * array[i,j,hi-source+1]
+                    for source in 1:npoints
+                )
+            end
+        end
+    else
+        throw(ArgumentError("metric coordinate axis must be in 1:3, got $axis"))
+    end
+    return array
+end
+
+function _structured_metric_local_chart_points(
+    block_cells::Int, axis::Int,
+)
+    if block_cells == 1
+        return 2
+    end
+    block_cells + 1 >= STRUCTURED_METRIC_LOCAL_CHART_POINTS ||
+        throw(ArgumentError(
+            "sixth-order metric halo on axis $axis requires at least " *
+            "$(STRUCTURED_METRIC_LOCAL_CHART_POINTS) block nodes; " *
+            "got $(block_cells + 1)",
+        ))
+    return STRUCTURED_METRIC_LOCAL_CHART_POINTS
+end
+
+"""
+    build_metric_coordinates(x, y, z, Nx, Ny, Nz, NG; ...)
+
+Return coordinates used only by the metric operators. In local-chart mode,
+real nodes and same-block MPI-cut halos are retained, while halos outside a
+logical block boundary are replaced by a one-sided sixth-order continuation
+of that block's coordinate map. Physical/topological coordinates are never
+modified.
+"""
+function build_metric_coordinates(
+    x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    mode::Symbol=structured_metric_mode_setting(),
+    cell_offsets::NTuple{3,Int}=(0, 0, 0),
+    block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
+)
+    mode == STRUCTURED_METRIC_TOPOLOGY_GHOST &&
+        return MetricCoordinates(x, y, z)
+    mode == STRUCTURED_METRIC_LOCAL_CHART || throw(ArgumentError(
+        "unsupported structured metric mode $mode",
+    ))
+    local_dims = (Nx, Ny, Nz)
+    coordinates = MetricCoordinates(copy(x), copy(y), copy(z))
+    for axis in 1:3
+        low = cell_offsets[axis] == 0
+        high = cell_offsets[axis] + local_dims[axis] == block_dims[axis]
+        low || high || continue
+        npoints = _structured_metric_local_chart_points(block_dims[axis], axis)
+        for array in (coordinates.x, coordinates.y, coordinates.z)
+            _structured_metric_extrapolate_axis!(
+                array, axis, low, high, local_dims[axis], NG, npoints,
+            )
+        end
+    end
+    return coordinates
+end
+
 # BC type constants loaded from bc_types.jl (included in solver.jl)
 
 """
@@ -38,8 +207,7 @@ function expand_coords_with_ghost(x_real, y_real, z_real,
                                    face_bc, bid, connectivity;
                                    xi_offset::Int=0,
                                    cell_offsets::NTuple{3,Int}=(xi_offset, 0, 0),
-                                   block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
-                                   topology_covariant::Bool=false)
+                                   block_dims::NTuple{3,Int}=(Nx, Ny, Nz))
     Nx_tot = Nx + 2*NG + 1
     Ny_tot = Ny + 2*NG + 1
     Nz_tot = Nz + 2*NG + 1
@@ -84,7 +252,6 @@ function expand_coords_with_ghost(x_real, y_real, z_real,
         cell_offsets=cell_offsets,
         block_dims=block_dims,
         mesh_cache=mesh_cache,
-        topology_covariant=topology_covariant,
     )
     
     return FT.(x), FT.(y), FT.(z)
@@ -659,6 +826,70 @@ end
 # Multi-block edge/corner topology
 # =============================================================================
 
+const STRUCTURED_BLOCK_EDGE_FACE_PAIRS = (
+    (3, 5), (3, 6), (4, 5), (4, 6),
+    (1, 5), (1, 6), (2, 5), (2, 6),
+    (1, 3), (1, 4), (2, 3), (2, 4),
+)
+
+const STRUCTURED_BLOCK_EDGE_AXES = (
+    1, 1, 1, 1,
+    2, 2, 2, 2,
+    3, 3, 3, 3,
+)
+
+const STRUCTURED_BLOCK_EDGE_PINS = (
+    (2, 0, 3, 0), (2, 0, 3, 1),
+    (2, 1, 3, 0), (2, 1, 3, 1),
+    (1, 0, 3, 0), (1, 0, 3, 1),
+    (1, 1, 3, 0), (1, 1, 3, 1),
+    (1, 0, 2, 0), (1, 0, 2, 1),
+    (1, 1, 2, 0), (1, 1, 2, 1),
+)
+
+const STRUCTURED_SCMM_JUNCTION_WIDTH = 2
+
+function structured_metric_singularity_edges(bid, face_bc, connectivity)
+    singular = falses(length(STRUCTURED_BLOCK_EDGE_FACE_PAIRS))
+    for (edge, (face_a, face_b)) in pairs(STRUCTURED_BLOCK_EDGE_FACE_PAIRS)
+        _topology_interblock_bc(get(face_bc, (bid, face_a), Int32(-1))) ||
+            continue
+        _topology_interblock_bc(get(face_bc, (bid, face_b), Int32(-1))) ||
+            continue
+        connection_a = get(connectivity, (bid, face_a), nothing)
+        connection_b = get(connectivity, (bid, face_b), nothing)
+        connection_a === nothing && continue
+        connection_b === nothing && continue
+        singular[edge] = connection_a.src_b != connection_b.src_b
+    end
+    return singular
+end
+
+function structured_metric_singularity_edges_from_mask(mask::Integer)
+    return BitVector(
+        (UInt16(mask) & (UInt16(1) << (edge - 1))) != 0
+        for edge in eachindex(STRUCTURED_BLOCK_EDGE_FACE_PAIRS)
+    )
+end
+
+function structured_local_metric_singularity_edges(
+    bid, face_bc, connectivity, cell_offsets, local_dims, block_dims,
+)
+    singular = structured_metric_singularity_edges(
+        bid, face_bc, connectivity,
+    )
+    for edge in eachindex(singular)
+        singular[edge] || continue
+        axis_a, high_a, axis_b, high_b = STRUCTURED_BLOCK_EDGE_PINS[edge]
+        on_a = high_a == 0 ? cell_offsets[axis_a] == 0 :
+            cell_offsets[axis_a] + local_dims[axis_a] == block_dims[axis_a]
+        on_b = high_b == 0 ? cell_offsets[axis_b] == 0 :
+            cell_offsets[axis_b] + local_dims[axis_b] == block_dims[axis_b]
+        singular[edge] = on_a && on_b
+    end
+    return singular
+end
+
 function _topological_connection_transform(local_fid, conn)
     nb_fid = conn.src_f
     if hasproperty(conn, :transform) && getproperty(conn, :transform) !== nothing
@@ -688,7 +919,6 @@ function _resolve_topological_node(
     bid::Int, index::NTuple{3,Int}, dims::NTuple{3,Int},
     face_bc, connectivity, mesh_cache;
     max_steps::Int=12,
-    reference_coordinate=nothing,
 )
     # A junction node has several equivalent representations.  Following
     # only the first out-of-range coordinate makes the result depend on which
@@ -826,47 +1056,10 @@ function _resolve_topological_node(
     end
 
     isempty(candidates) && return nothing
-
-    if reference_coordinate === nothing
-        sort!(candidates, by = candidate -> (
-            candidate[1], candidate[2][1], candidate[2][2], candidate[2][3],
-            candidate[3][1], candidate[3][2], candidate[3][3],
-        ))
-        owner_bid, source, owner_shift = first(candidates)
-        coords = _ghost_mesh_coords(mesh_cache, owner_bid)
-        coords === nothing && return nothing
-        return (
-            coords[1][source...] + owner_shift[1],
-            coords[2][source...] + owner_shift[2],
-            coords[3][source...] + owner_shift[3],
-        )
-    end
-
-    # At a multi-block junction, more than one real-node continuation may be
-    # reachable.  A block-ID owner is deterministic but not geometric: rotating
-    # or renumbering an otherwise identical mesh then changes the high-order
-    # metric stencil.  The product extrapolation already stored at this ghost
-    # node is a local smooth-continuation estimate, so use it to select the
-    # physically nearest topological image.  The remaining tuple fields only
-    # break ties between coincident images and cannot bias the geometry.
-    function candidate_key(candidate)
-        candidate_bid, candidate_index, candidate_shift = candidate
-        candidate_coords = _ghost_mesh_coords(mesh_cache, candidate_bid)
-        candidate_coords === nothing && return (Inf, Inf, Inf, Inf,
-                                                  candidate_bid,
-                                                  candidate_index...,
-                                                  candidate_shift...)
-        px = candidate_coords[1][candidate_index...] + candidate_shift[1]
-        py = candidate_coords[2][candidate_index...] + candidate_shift[2]
-        pz = candidate_coords[3][candidate_index...] + candidate_shift[3]
-        distance2 = reference_coordinate === nothing ? zero(px) :
-            (px - reference_coordinate[1])^2 +
-            (py - reference_coordinate[2])^2 +
-            (pz - reference_coordinate[3])^2
-        return (distance2, px, py, pz, candidate_bid,
-                candidate_index..., candidate_shift...)
-    end
-    sort!(candidates, by=candidate_key)
+    sort!(candidates, by = candidate -> (
+        candidate[1], candidate[2][1], candidate[2][2], candidate[2][3],
+        candidate[3][1], candidate[3][2], candidate[3][3],
+    ))
     owner_bid, source, owner_shift = first(candidates)
     coords = _ghost_mesh_coords(mesh_cache, owner_bid)
     coords === nothing && return nothing
@@ -882,9 +1075,11 @@ function _fill_topological_edge_corner_ghosts!(
     cell_offsets::NTuple{3,Int}=(0, 0, 0),
     block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
     mesh_cache=nothing,
-    topology_covariant::Bool=false,
 )
     local_dims = (Nx, Ny, Nz)
+    singularity_edges = structured_metric_singularity_edges(
+        bid, face_bc, connectivity,
+    )
     for k in axes(x, 3), j in axes(x, 2), i in axes(x, 1)
         local_index = (i - NG, j - NG, k - NG)
         ghost_count = count(
@@ -955,16 +1150,112 @@ function _fill_topological_edge_corner_ghosts!(
             for bc in bcs) || continue
         any(_topology_interblock_bc(bc) for bc in bcs) || continue
 
+        # A three-block edge has no single smooth tensor-product continuation:
+        # traversing either incident face reaches a different valid interior
+        # point. Keep the rotation-covariant product extension here and repair
+        # the shared SCMM edge geometry from physical endpoints below.
+        any(eachindex(singularity_edges)) do edge
+            singularity_edges[edge] || return false
+            face_a, face_b = STRUCTURED_BLOCK_EDGE_FACE_PAIRS[edge]
+            return face_a in face_ids && face_b in face_ids
+        end && continue
+
         resolved = _resolve_topological_node(
-            bid, global_index, block_dims, face_bc, connectivity, mesh_cache;
-            reference_coordinate=topology_covariant ?
-                (x[i,j,k], y[i,j,k], z[i,j,k]) : nothing,
+            bid, global_index, block_dims, face_bc, connectivity, mesh_cache,
         )
         resolved === nothing && throw(ArgumentError(
             "unable to resolve topological ghost node " *
             "block=$bid local=$(local_index) global=$(global_index)",
         ))
         x[i,j,k], y[i,j,k], z[i,j,k] = resolved
+    end
+    return nothing
+end
+
+@inline function _set_scmm_low_order_edge!(
+    edge_yz, edge_zx, edge_xy, x, y, z, axis, i, j, k,
+)
+    ip = i + (axis == 1)
+    jp = j + (axis == 2)
+    kp = k + (axis == 3)
+    half = eltype(edge_yz)(0.5)
+    edge_yz[i,j,k] = half * (y[i,j,k] * z[ip,jp,kp] - y[ip,jp,kp] * z[i,j,k])
+    edge_zx[i,j,k] = half * (z[i,j,k] * x[ip,jp,kp] - z[ip,jp,kp] * x[i,j,k])
+    edge_xy[i,j,k] = half * (x[i,j,k] * y[ip,jp,kp] - x[ip,jp,kp] * y[i,j,k])
+    return nothing
+end
+
+@inline function _structured_junction_patch_cell_range(
+    ncell::Int, ng::Int, high::Int, width::Int,
+)
+    patch_width = min(width, ncell)
+    return high == 0 ?
+        ((ng + 1):(ng + patch_width)) :
+        ((ng + ncell - patch_width + 1):(ng + ncell))
+end
+
+function _foreach_scmm_junction_patch_edge(
+    callback, Nx, Ny, Nz, NG, singularity_edges;
+    width::Int=STRUCTURED_SCMM_JUNCTION_WIDTH,
+)
+    singularity_edges === nothing && return nothing
+    any(singularity_edges) || return nothing
+    width > 0 || throw(ArgumentError("SCMM junction patch width must be positive"))
+    dims = (Nx, Ny, Nz)
+    all_cells = ntuple(axis -> (NG + 1):(NG + dims[axis]), 3)
+    all_nodes = ntuple(axis -> (NG + 1):(NG + dims[axis] + 1), 3)
+
+    for edge in eachindex(STRUCTURED_BLOCK_EDGE_FACE_PAIRS)
+        edge <= length(singularity_edges) || break
+        singularity_edges[edge] || continue
+        free_axis = STRUCTURED_BLOCK_EDGE_AXES[edge]
+        axis_a, high_a, axis_b, high_b = STRUCTURED_BLOCK_EDGE_PINS[edge]
+        cells_a = _structured_junction_patch_cell_range(
+            dims[axis_a], NG, high_a, width,
+        )
+        cells_b = _structured_junction_patch_cell_range(
+            dims[axis_b], NG, high_b, width,
+        )
+        nodes_a = first(cells_a):(last(cells_a) + 1)
+        nodes_b = first(cells_b):(last(cells_b) + 1)
+
+        for edge_axis in (axis_a, axis_b, free_axis)
+            ranges = ntuple(3) do axis
+                if axis == edge_axis
+                    axis == free_axis ? all_cells[axis] :
+                        (axis == axis_a ? cells_a : cells_b)
+                else
+                    axis == free_axis ? all_nodes[axis] :
+                        (axis == axis_a ? nodes_a : nodes_b)
+                end
+            end
+            for k in ranges[3], j in ranges[2], i in ranges[1]
+                callback(edge_axis, i, j, k)
+            end
+        end
+    end
+    return nothing
+end
+
+function _apply_scmm_junction_edge_fallback!(
+    edge_groups, x, y, z, Nx, Ny, Nz, NG, singularity_edges;
+    width::Int=STRUCTURED_SCMM_JUNCTION_WIDTH,
+)
+    # A physical face must not mix CMD6 edge products with endpoint products.
+    # Replace all twelve oriented edges of every cell whose centered metric
+    # stencil reaches the multi-member junction. The face vectors are still a
+    # discrete curl, so GCL closure is retained while the patch represents the
+    # actual node-defined polyhedra exactly. This is intentionally a localized
+    # piecewise-linear fallback; expanding it would lower geometric order over
+    # a larger part of an otherwise smooth block.
+    _foreach_scmm_junction_patch_edge(
+        Nx, Ny, Nz, NG, singularity_edges; width=width,
+    ) do edge_axis, i, j, k
+        edge_yz, edge_zx, edge_xy = edge_groups[edge_axis]
+        _set_scmm_low_order_edge!(
+            edge_yz, edge_zx, edge_xy, x, y, z,
+            edge_axis, i, j, k,
+        )
     end
     return nothing
 end
@@ -1227,100 +1518,31 @@ end
     end
 end
 
-if !isdefined(@__MODULE__, :STRUCTURED_METRIC_JUNCTION_LAYERS)
-    const STRUCTURED_METRIC_JUNCTION_LAYERS = 4
-end
-
-if !isdefined(@__MODULE__, :_STRUCTURED_METRIC_EDGE_PINS)
-    # (axis_a, high_a, axis_b, high_b), matching the solver's 12-edge
-    # topology convention.  The edge itself runs along the remaining axis.
-    const _STRUCTURED_METRIC_EDGE_PINS = (
-        (2, false, 3, false), (2, false, 3, true),
-        (2, true,  3, false), (2, true,  3, true),
-        (1, false, 3, false), (1, false, 3, true),
-        (1, true,  3, false), (1, true,  3, true),
-        (1, false, 2, false), (1, false, 2, true),
-        (1, true,  2, false), (1, true,  2, true),
+@inline function _set_scmm_low_order_line_integral!(
+    edge, ax, ay, az, x, y, z, axis, i, j, k,
+)
+    ip = i + (axis == 1)
+    jp = j + (axis == 2)
+    kp = k + (axis == 3)
+    half = eltype(edge)(0.5)
+    edge[i,j,k] = half * (
+        (ax[i,j,k] + ax[ip,jp,kp]) * (x[ip,jp,kp] - x[i,j,k]) +
+        (ay[i,j,k] + ay[ip,jp,kp]) * (y[ip,jp,kp] - y[i,j,k]) +
+        (az[i,j,k] + az[ip,jp,kp]) * (z[ip,jp,kp] - z[i,j,k])
     )
-end
-
-@inline function _structured_metric_boundary_distance(
-    index, axis, edge_direction, high, dims, ng,
-)
-    boundary = ng + 1 + (high ? dims[axis] : 0)
-    coordinate = axis == edge_direction ? index + 0.5 : index
-    return abs(coordinate - boundary)
-end
-
-@inline function structured_metric_near_junction_edge(
-    edge_direction, i, j, k, dims, ng, singularity_edges, junction_layers,
-)
-    singularity_edges === nothing && return false
-    junction_layers > 0 || return false
-    length(singularity_edges) == 12 || throw(DimensionMismatch(
-        "structured metric singularity flags must contain 12 block edges",
-    ))
-    indices = (i, j, k)
-    @inbounds for edge_index in 1:12
-        singularity_edges[edge_index] || continue
-        axis_a, high_a, axis_b, high_b =
-            _STRUCTURED_METRIC_EDGE_PINS[edge_index]
-        distance_a = _structured_metric_boundary_distance(
-            indices[axis_a], axis_a, edge_direction, high_a, dims, ng,
-        )
-        distance_b = _structured_metric_boundary_distance(
-            indices[axis_b], axis_b, edge_direction, high_b, dims, ng,
-        )
-        max(distance_a, distance_b) <= junction_layers && return true
-    end
-    return false
-end
-
-@inline function structured_metric_endpoint_products(
-    x, y, z, edge_direction, i, j, k,
-)
-    ip = i + (edge_direction == 1)
-    jp = j + (edge_direction == 2)
-    kp = k + (edge_direction == 3)
-    half = eltype(x)(0.5)
-    return (
-        half * (y[i,j,k] * z[ip,jp,kp] - z[i,j,k] * y[ip,jp,kp]),
-        half * (z[i,j,k] * x[ip,jp,kp] - x[i,j,k] * z[ip,jp,kp]),
-        half * (x[i,j,k] * y[ip,jp,kp] - y[i,j,k] * x[ip,jp,kp]),
-    )
-end
-
-@inline function structured_endpoint_line_integral(
-    ax, ay, az, x, y, z, edge_direction, i, j, k,
-)
-    ip = i + (edge_direction == 1)
-    jp = j + (edge_direction == 2)
-    kp = k + (edge_direction == 3)
-    half = eltype(x)(0.5)
-    return (
-        half * (ax[i,j,k] + ax[ip,jp,kp]) * (x[ip,jp,kp] - x[i,j,k]) +
-        half * (ay[i,j,k] + ay[ip,jp,kp]) * (y[ip,jp,kp] - y[i,j,k]) +
-        half * (az[i,j,k] + az[ip,jp,kp]) * (z[ip,jp,kp] - z[i,j,k])
-    )
+    return nothing
 end
 
 function structured_scmm_edge_line_integrals(
     vector_potential, x, y, z;
-    time=zero(eltype(x)), active_dims=nothing, ng::Int=0,
-    singularity_edges=nothing,
-    junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS,
+    time=zero(eltype(x)), singularity_edges=nothing,
+    physical_dims=nothing, ng::Int=0,
+    junction_width::Int=STRUCTURED_SCMM_JUNCTION_WIDTH,
 )
     size(x) == size(y) == size(z) || throw(DimensionMismatch(
         "SCMM edge geometry arrays must have identical sizes",
     ))
     ni, nj, nk = size(x)
-    if singularity_edges !== nothing && active_dims === nothing
-        throw(ArgumentError(
-            "active_dims is required for junction-regularized SCMM edges",
-        ))
-    end
-    metric_dims = active_dims === nothing ? (ni - 1, nj - 1, nk - 1) :
-        active_dims
     T = promote_type(eltype(x), typeof(time))
     ax = Array{T}(undef, ni, nj, nk)
     ay = similar(ax)
@@ -1336,61 +1558,63 @@ function structured_scmm_edge_line_integrals(
     edge_y = Array{T,3}(undef, ni, nj - 1, nk)
     edge_z = Array{T,3}(undef, ni, nj, nk - 1)
     @inbounds for k in 1:nk, j in 1:nj, i in 1:ni-1
-        edge_x[i,j,k] = if structured_metric_near_junction_edge(
-            1, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
-        )
-            structured_endpoint_line_integral(
-                ax, ay, az, x, y, z, 1, i, j, k,
-            )
-        else
+        edge_x[i,j,k] =
             structured_scmm_interp_i(ax, i, j, k, ni) *
                 structured_scmm_deriv_i(x, i, j, k, ni) +
             structured_scmm_interp_i(ay, i, j, k, ni) *
                 structured_scmm_deriv_i(y, i, j, k, ni) +
             structured_scmm_interp_i(az, i, j, k, ni) *
                 structured_scmm_deriv_i(z, i, j, k, ni)
-        end
     end
     @inbounds for k in 1:nk, j in 1:nj-1, i in 1:ni
-        edge_y[i,j,k] = if structured_metric_near_junction_edge(
-            2, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
-        )
-            structured_endpoint_line_integral(
-                ax, ay, az, x, y, z, 2, i, j, k,
-            )
-        else
+        edge_y[i,j,k] =
             structured_scmm_interp_j(ax, i, j, k, nj) *
                 structured_scmm_deriv_j(x, i, j, k, nj) +
             structured_scmm_interp_j(ay, i, j, k, nj) *
                 structured_scmm_deriv_j(y, i, j, k, nj) +
             structured_scmm_interp_j(az, i, j, k, nj) *
                 structured_scmm_deriv_j(z, i, j, k, nj)
-        end
     end
     @inbounds for k in 1:nk-1, j in 1:nj, i in 1:ni
-        edge_z[i,j,k] = if structured_metric_near_junction_edge(
-            3, i, j, k, metric_dims, ng, singularity_edges, junction_layers,
-        )
-            structured_endpoint_line_integral(
-                ax, ay, az, x, y, z, 3, i, j, k,
-            )
-        else
+        edge_z[i,j,k] =
             structured_scmm_interp_k(ax, i, j, k, nk) *
                 structured_scmm_deriv_k(x, i, j, k, nk) +
             structured_scmm_interp_k(ay, i, j, k, nk) *
                 structured_scmm_deriv_k(y, i, j, k, nk) +
             structured_scmm_interp_k(az, i, j, k, nk) *
                 structured_scmm_deriv_k(z, i, j, k, nk)
+    end
+
+    if singularity_edges !== nothing && any(singularity_edges)
+        physical_dims === nothing && throw(ArgumentError(
+            "junction-aware SCMM edge integrals require physical_dims",
+        ))
+        dims = Tuple(Int.(physical_dims))
+        length(dims) == 3 || throw(DimensionMismatch(
+            "physical_dims must contain three cell counts",
+        ))
+        expected_nodes = ntuple(axis -> dims[axis] + 2ng + 1, 3)
+        size(x) == expected_nodes || throw(DimensionMismatch(
+            "junction-aware SCMM coordinates have size $(size(x)); " *
+            "expected $expected_nodes for physical_dims=$dims and ng=$ng",
+        ))
+        edges = (edge_x, edge_y, edge_z)
+        _foreach_scmm_junction_patch_edge(
+            dims..., ng, singularity_edges; width=junction_width,
+        ) do edge_axis, i, j, k
+            _set_scmm_low_order_line_integral!(
+                edges[edge_axis], ax, ay, az, x, y, z,
+                edge_axis, i, j, k,
+            )
         end
     end
     return edge_x, edge_y, edge_z
 end
 
-function compute_fvm_metrics_runtime(
+function _compute_fvm_metrics_runtime_monolithic(
     x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
     periodic=(false, false, false),
     singularity_edges=nothing,
-    junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS,
 )
     Nx_nodes_tot = Nx + 2NG + 1
     Ny_nodes_tot = Ny + 2NG + 1
@@ -1497,75 +1721,60 @@ function compute_fvm_metrics_runtime(
     # --- Pre-compute SCMM intermediate edge products ---
     # a) k-face/edge intermediates (midpoint in k, nodes in i and j)
     for k in 1:Nz_cells_tot, j in 1:Ny_nodes_tot, i in 1:Nx_nodes_tot
-        if structured_metric_near_junction_edge(
-            3, i, j, k, (Nx, Ny, Nz), NG,
-            singularity_edges, junction_layers,
+        y_dz_k[i, j, k] = FT(0.5) * (
+            interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot) -
+            interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot)
         )
-            y_dz_k[i,j,k], z_dx_k[i,j,k], x_dy_k[i,j,k] =
-                structured_metric_endpoint_products(x, y, z, 3, i, j, k)
-        else
-            y_dz_k[i, j, k] = FT(0.5) * (
-                interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot) -
-                interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot)
-            )
-            z_dx_k[i, j, k] = FT(0.5) * (
-                interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot) -
-                interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot)
-            )
-            x_dy_k[i, j, k] = FT(0.5) * (
-                interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot) -
-                interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot)
-            )
-        end
+        z_dx_k[i, j, k] = FT(0.5) * (
+            interp_k(z, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot) -
+            interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(z, i, j, k, Nz_nodes_tot)
+        )
+        x_dy_k[i, j, k] = FT(0.5) * (
+            interp_k(x, i, j, k, Nz_nodes_tot) * deriv_k(y, i, j, k, Nz_nodes_tot) -
+            interp_k(y, i, j, k, Nz_nodes_tot) * deriv_k(x, i, j, k, Nz_nodes_tot)
+        )
     end
     
     # b) j-face/edge intermediates (midpoint in j, nodes in i and k)
     for k in 1:Nz_nodes_tot, j in 1:Ny_cells_tot, i in 1:Nx_nodes_tot
-        if structured_metric_near_junction_edge(
-            2, i, j, k, (Nx, Ny, Nz), NG,
-            singularity_edges, junction_layers,
+        y_dz_j[i, j, k] = FT(0.5) * (
+            interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot) -
+            interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot)
         )
-            y_dz_j[i,j,k], z_dx_j[i,j,k], x_dy_j[i,j,k] =
-                structured_metric_endpoint_products(x, y, z, 2, i, j, k)
-        else
-            y_dz_j[i, j, k] = FT(0.5) * (
-                interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot) -
-                interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot)
-            )
-            z_dx_j[i, j, k] = FT(0.5) * (
-                interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot) -
-                interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot)
-            )
-            x_dy_j[i, j, k] = FT(0.5) * (
-                interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot) -
-                interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot)
-            )
-        end
+        z_dx_j[i, j, k] = FT(0.5) * (
+            interp_j(z, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot) -
+            interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(z, i, j, k, Ny_nodes_tot)
+        )
+        x_dy_j[i, j, k] = FT(0.5) * (
+            interp_j(x, i, j, k, Ny_nodes_tot) * deriv_j(y, i, j, k, Ny_nodes_tot) -
+            interp_j(y, i, j, k, Ny_nodes_tot) * deriv_j(x, i, j, k, Ny_nodes_tot)
+        )
     end
     
     # c) i-face/edge intermediates (midpoint in i, nodes in j and k)
     for k in 1:Nz_nodes_tot, j in 1:Ny_nodes_tot, i in 1:Nx_cells_tot
-        if structured_metric_near_junction_edge(
-            1, i, j, k, (Nx, Ny, Nz), NG,
-            singularity_edges, junction_layers,
+        y_dz_i[i, j, k] = FT(0.5) * (
+            interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot) -
+            interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot)
         )
-            y_dz_i[i,j,k], z_dx_i[i,j,k], x_dy_i[i,j,k] =
-                structured_metric_endpoint_products(x, y, z, 1, i, j, k)
-        else
-            y_dz_i[i, j, k] = FT(0.5) * (
-                interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot) -
-                interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot)
-            )
-            z_dx_i[i, j, k] = FT(0.5) * (
-                interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot) -
-                interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot)
-            )
-            x_dy_i[i, j, k] = FT(0.5) * (
-                interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot) -
-                interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot)
-            )
-        end
+        z_dx_i[i, j, k] = FT(0.5) * (
+            interp_i(z, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot) -
+            interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(z, i, j, k, Nx_nodes_tot)
+        )
+        x_dy_i[i, j, k] = FT(0.5) * (
+            interp_i(x, i, j, k, Nx_nodes_tot) * deriv_i(y, i, j, k, Nx_nodes_tot) -
+            interp_i(y, i, j, k, Nx_nodes_tot) * deriv_i(x, i, j, k, Nx_nodes_tot)
+        )
     end
+
+    _apply_scmm_junction_edge_fallback!(
+        (
+            (y_dz_i, z_dx_i, x_dy_i),
+            (y_dz_j, z_dx_j, x_dy_j),
+            (y_dz_k, z_dx_k, x_dy_k),
+        ),
+        x, y, z, Nx, Ny, Nz, NG, singularity_edges,
+    )
 
     # 1. Compute i-face metrics (face center: i, j+1/2, k+1/2)
     for k in 1:Nz_cells_tot, j in 1:Ny_cells_tot, i in 1:Nx_nodes_tot
@@ -1660,12 +1869,722 @@ function compute_fvm_metrics_runtime(
     return Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V
 end
 
+struct SCMMEdgeWorkspace{A}
+    edge_i::NTuple{3,A}
+    edge_j::NTuple{3,A}
+    edge_k::NTuple{3,A}
+end
+
+struct SCMMFaceEdgePayload{A}
+    edge_u::A
+    delta_u::A
+    edge_v::A
+    delta_v::A
+    nodes::A
+end
+
+@inline Base.getindex(workspace::SCMMEdgeWorkspace, axis::Integer) =
+    axis == 1 ? workspace.edge_i :
+    axis == 2 ? workspace.edge_j :
+    axis == 3 ? workspace.edge_k :
+    throw(BoundsError(workspace, axis))
+
+@inline function _structured_scmm_axis_derivative(
+    array, axis::Integer, index::NTuple{3,Int}, node_dims::NTuple{3,Int},
+)
+    i, j, k = index
+    return axis == 1 ? structured_scmm_deriv_i(array, i, j, k, node_dims[1]) :
+           axis == 2 ? structured_scmm_deriv_j(array, i, j, k, node_dims[2]) :
+           axis == 3 ? structured_scmm_deriv_k(array, i, j, k, node_dims[3]) :
+           throw(ArgumentError("SCMM edge axis must be in 1:3, got $axis"))
+end
+
+@inline function _structured_scmm_face_edge_index(
+    normal_axis::Integer, normal_node::Int,
+    edge_axis::Integer, edge_cell::Int,
+    other_axis::Integer, other_node::Int,
+)
+    return ntuple(3) do axis
+        axis == normal_axis ? normal_node :
+        axis == edge_axis ? edge_cell :
+        axis == other_axis ? other_node :
+        throw(ArgumentError("invalid SCMM face edge axes"))
+    end
+end
+
+function pack_scmm_face_edge_payload(
+    workspace::SCMMEdgeWorkspace, coordinates::MetricCoordinates,
+    fid::Int, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    u_s::Int=1, u_e::Int=-1, v_s::Int=1, v_e::Int=-1,
+)
+    frame = structured_face_frame(fid)
+    local_dims = (Nx, Ny, Nz)
+    node_dims = size(coordinates.x)
+    u_count = local_dims[frame.u_axis]
+    v_count = local_dims[frame.v_axis]
+    u_e = u_e < 1 ? u_count : u_e
+    v_e = v_e < 1 ? v_count : v_e
+    1 <= u_s <= u_e <= u_count || throw(BoundsError(1:u_count, u_s:u_e))
+    1 <= v_s <= v_e <= v_count || throw(BoundsError(1:v_count, v_s:v_e))
+    u_length = u_e - u_s + 1
+    v_length = v_e - v_s + 1
+    normal_node = isodd(fid) ? NG + 1 :
+        local_dims[frame.normal_axis] + NG + 1
+    T = eltype(coordinates.x)
+    edge_u = zeros(T, u_length, v_length + 1, 3)
+    delta_u = similar(edge_u)
+    edge_v = zeros(T, u_length + 1, v_length, 3)
+    delta_v = similar(edge_v)
+    nodes = zeros(T, u_length + 1, v_length + 1, 3)
+    coordinate_arrays = (coordinates.x, coordinates.y, coordinates.z)
+
+    for v_node in 1:v_length+1, u_node in 1:u_length+1
+        index = ntuple(3) do axis
+            axis == frame.normal_axis ? normal_node :
+            axis == frame.u_axis ? NG + u_s + u_node - 1 :
+            axis == frame.v_axis ? NG + v_s + v_node - 1 :
+            throw(ArgumentError("invalid SCMM face-node axis"))
+        end
+        for component in 1:3
+            nodes[u_node,v_node,component] =
+                coordinate_arrays[component][index...]
+        end
+    end
+
+    for v_node in 1:v_length+1, u_cell in 1:u_length
+        index = _structured_scmm_face_edge_index(
+            frame.normal_axis, normal_node,
+            frame.u_axis, NG + u_s + u_cell - 1,
+            frame.v_axis, NG + v_s + v_node - 1,
+        )
+        for component in 1:3
+            edge_u[u_cell,v_node,component] =
+                workspace[frame.u_axis][component][index...]
+            delta_u[u_cell,v_node,component] =
+                _structured_scmm_axis_derivative(
+                    coordinate_arrays[component], frame.u_axis,
+                    index, node_dims,
+                )
+        end
+    end
+    for v_cell in 1:v_length, u_node in 1:u_length+1
+        index = _structured_scmm_face_edge_index(
+            frame.normal_axis, normal_node,
+            frame.v_axis, NG + v_s + v_cell - 1,
+            frame.u_axis, NG + u_s + u_node - 1,
+        )
+        for component in 1:3
+            edge_v[u_node,v_cell,component] =
+                workspace[frame.v_axis][component][index...]
+            delta_v[u_node,v_cell,component] =
+                _structured_scmm_axis_derivative(
+                    coordinate_arrays[component], frame.v_axis,
+                    index, node_dims,
+                )
+        end
+    end
+    return SCMMFaceEdgePayload(edge_u, delta_u, edge_v, delta_v, nodes)
+end
+
+function scmm_face_edge_payload_vector(payload::SCMMFaceEdgePayload)
+    arrays = (
+        payload.edge_u, payload.delta_u, payload.edge_v, payload.delta_v,
+        payload.nodes,
+    )
+    result = Vector{eltype(payload.edge_u)}(undef, sum(length, arrays))
+    offset = 0
+    for array in arrays
+        copyto!(result, offset + 1, vec(array), 1, length(array))
+        offset += length(array)
+    end
+    return result
+end
+
+function scmm_face_edge_payload_from_vector(
+    values::AbstractVector{T}, u_count::Int, v_count::Int,
+) where {T<:AbstractFloat}
+    shapes = (
+        (u_count, v_count + 1, 3),
+        (u_count, v_count + 1, 3),
+        (u_count + 1, v_count, 3),
+        (u_count + 1, v_count, 3),
+        (u_count + 1, v_count + 1, 3),
+    )
+    expected = sum(prod, shapes)
+    length(values) == expected || throw(DimensionMismatch(
+        "SCMM face-edge payload has $(length(values)) values; expected $expected",
+    ))
+    arrays = Vector{Array{T,3}}(undef, 5)
+    offset = 0
+    for index in eachindex(shapes)
+        count = prod(shapes[index])
+        arrays[index] = reshape(copy(view(values, offset+1:offset+count)), shapes[index])
+        offset += count
+    end
+    return SCMMFaceEdgePayload(arrays...)
+end
+
+@inline function _mapped_scmm_payload_node(
+    payload::SCMMFaceEdgePayload,
+    destination_u_node::Int, destination_v_node::Int,
+    destination_frame::StructuredFaceFrame,
+    source_frame::StructuredFaceFrame,
+    transform::StructuredFaceTransform,
+)
+    source_counts = zeros(Int, 3)
+    source_counts[source_frame.u_axis] = size(payload.nodes, 1) - 1
+    source_counts[source_frame.v_axis] = size(payload.nodes, 2) - 1
+    source_nodes = zeros(Int, 3)
+    for (destination_axis, destination_node) in (
+        (destination_frame.u_axis, destination_u_node),
+        (destination_frame.v_axis, destination_v_node),
+    )
+        mapped_axis = transform.source_for_destination[destination_axis]
+        source_axis = abs(mapped_axis)
+        source_nodes[source_axis] = mapped_axis < 0 ?
+            source_counts[source_axis] + 2 - destination_node :
+            destination_node
+    end
+    return ntuple(
+        component -> payload.nodes[
+            source_nodes[source_frame.u_axis],
+            source_nodes[source_frame.v_axis], component,
+        ],
+        3,
+    )
+end
+
+function validate_canonical_scmm_face_nodes!(
+    coordinates::MetricCoordinates, payload::SCMMFaceEdgePayload,
+    fid::Int, conn, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    u_s::Int=1, u_e::Int=-1, v_s::Int=1, v_e::Int=-1,
+)
+    destination = structured_face_frame(fid)
+    source = structured_face_frame(conn.src_f)
+    transform = _structured_metric_connection_transform(fid, conn)
+    local_dims = (Nx, Ny, Nz)
+    u_count = local_dims[destination.u_axis]
+    v_count = local_dims[destination.v_axis]
+    u_e = u_e < 1 ? u_count : u_e
+    v_e = v_e < 1 ? v_count : v_e
+    u_length = u_e - u_s + 1
+    v_length = v_e - v_s + 1
+    normal_node = isodd(fid) ? NG + 1 :
+        local_dims[destination.normal_axis] + NG + 1
+    candidate_translation = hasproperty(conn, :image_translation) ?
+        getproperty(conn, :image_translation) : nothing
+    translation = candidate_translation === nothing ?
+        (0.0, 0.0, 0.0) : candidate_translation
+    coordinate_arrays = (coordinates.x, coordinates.y, coordinates.z)
+    T = eltype(coordinates.x)
+
+    for v_node in 1:v_length+1, u_node in 1:u_length+1
+        index = ntuple(3) do axis
+            axis == destination.normal_axis ? normal_node :
+            axis == destination.u_axis ? NG + u_s + u_node - 1 :
+            axis == destination.v_axis ? NG + v_s + v_node - 1 :
+            throw(ArgumentError("invalid SCMM interface-node axis"))
+        end
+        local_node = ntuple(
+            component -> coordinate_arrays[component][index...], 3,
+        )
+        source_node = _mapped_scmm_payload_node(
+            payload, u_node, v_node, destination, source, transform,
+        )
+        mapped_node = ntuple(
+            component -> source_node[component] + T(translation[component]), 3,
+        )
+        scale = max(
+            one(T), maximum(abs, local_node), maximum(abs, mapped_node),
+        )
+        tolerance = T(512) * eps(T) * scale
+        mismatch = maximum(abs(local_node[c] - mapped_node[c]) for c in 1:3)
+        mismatch <= tolerance || throw(ArgumentError(
+            "nonconformal structured interface at block face $fid node " *
+            "($u_node,$v_node): mapped coordinate mismatch=$mismatch " *
+            "exceeds tolerance=$tolerance",
+        ))
+    end
+    return nothing
+end
+
+@inline function _structured_metric_connection_transform(fid, conn)
+    if hasproperty(conn, :transform) && getproperty(conn, :transform) !== nothing
+        candidate = getproperty(conn, :transform)
+        return candidate.source_face == conn.src_f &&
+               candidate.destination_face == fid ?
+            candidate : structured_inverse_face_transform(candidate)
+    end
+    return structured_legacy_face_transform(conn.src_f, fid, conn.reverse_tan)
+end
+
+@inline function _mapped_scmm_payload_edge(
+    payload::SCMMFaceEdgePayload,
+    destination_axis::Integer, destination_cell::Int,
+    destination_other_axis::Integer, destination_other_node::Int,
+    destination_frame::StructuredFaceFrame,
+    source_frame::StructuredFaceFrame,
+    transform::StructuredFaceTransform,
+)
+    source_u_count = size(payload.edge_u, 1)
+    source_v_count = size(payload.edge_v, 2)
+    source_cells = zeros(Int, 3)
+    source_cells[source_frame.u_axis] = source_u_count
+    source_cells[source_frame.v_axis] = source_v_count
+    mapped_axis = transform.source_for_destination[destination_axis]
+    mapped_other_axis = transform.source_for_destination[destination_other_axis]
+    source_axis = abs(mapped_axis)
+    source_other_axis = abs(mapped_other_axis)
+    source_cell = mapped_axis < 0 ?
+        source_cells[source_axis] - destination_cell + 1 : destination_cell
+    source_other_node = mapped_other_axis < 0 ?
+        source_cells[source_other_axis] + 2 - destination_other_node :
+        destination_other_node
+    orientation = mapped_axis < 0 ? -1 : 1
+    if source_axis == source_frame.u_axis
+        return (
+            ntuple(component -> orientation *
+                payload.edge_u[source_cell,source_other_node,component], 3),
+            ntuple(component -> orientation *
+                payload.delta_u[source_cell,source_other_node,component], 3),
+        )
+    elseif source_axis == source_frame.v_axis
+        return (
+            ntuple(component -> orientation *
+                payload.edge_v[source_other_node,source_cell,component], 3),
+            ntuple(component -> orientation *
+                payload.delta_v[source_other_node,source_cell,component], 3),
+        )
+    end
+    throw(ArgumentError(
+        "interface transform maps destination edge outside source face",
+    ))
+end
+
+@inline function _translated_scmm_edge(edge, delta, translation, ::Type{T}) where {T}
+    ax, ay, az = T.(translation)
+    dx, dy, dz = delta
+    return (
+        edge[1] + T(0.5) * (ay * dz - az * dy),
+        edge[2] + T(0.5) * (az * dx - ax * dz),
+        edge[3] + T(0.5) * (ax * dy - ay * dx),
+    )
+end
+
+function unpack_canonical_scmm_face_edges!(
+    workspace::SCMMEdgeWorkspace, coordinates::MetricCoordinates,
+    payload::SCMMFaceEdgePayload,
+    fid::Int, conn, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    u_s::Int=1, u_e::Int=-1, v_s::Int=1, v_e::Int=-1,
+)
+    destination = structured_face_frame(fid)
+    source = structured_face_frame(conn.src_f)
+    transform = _structured_metric_connection_transform(fid, conn)
+    local_dims = (Nx, Ny, Nz)
+    u_count = local_dims[destination.u_axis]
+    v_count = local_dims[destination.v_axis]
+    u_e = u_e < 1 ? u_count : u_e
+    v_e = v_e < 1 ? v_count : v_e
+    u_length = u_e - u_s + 1
+    v_length = v_e - v_s + 1
+    normal_node = isodd(fid) ? NG + 1 :
+        local_dims[destination.normal_axis] + NG + 1
+    translation = hasproperty(conn, :image_translation) ?
+        getproperty(conn, :image_translation) : (0.0, 0.0, 0.0)
+    T = eltype(payload.edge_u)
+
+    validate_canonical_scmm_face_nodes!(
+        coordinates, payload, fid, conn, Nx, Ny, Nz, NG;
+        u_s=u_s, u_e=u_e, v_s=v_s, v_e=v_e,
+    )
+
+    for v_node in 1:v_length+1, u_cell in 1:u_length
+        edge, delta = _mapped_scmm_payload_edge(
+            payload, destination.u_axis, u_cell,
+            destination.v_axis, v_node,
+            destination, source, transform,
+        )
+        canonical = _translated_scmm_edge(edge, delta, translation, T)
+        index = _structured_scmm_face_edge_index(
+            destination.normal_axis, normal_node,
+            destination.u_axis, NG + u_s + u_cell - 1,
+            destination.v_axis, NG + v_s + v_node - 1,
+        )
+        for component in 1:3
+            workspace[destination.u_axis][component][index...] = canonical[component]
+        end
+    end
+    for v_cell in 1:v_length, u_node in 1:u_length+1
+        edge, delta = _mapped_scmm_payload_edge(
+            payload, destination.v_axis, v_cell,
+            destination.u_axis, u_node,
+            destination, source, transform,
+        )
+        canonical = _translated_scmm_edge(edge, delta, translation, T)
+        index = _structured_scmm_face_edge_index(
+            destination.normal_axis, normal_node,
+            destination.v_axis, NG + v_s + v_cell - 1,
+            destination.u_axis, NG + u_s + u_node - 1,
+        )
+        for component in 1:3
+            workspace[destination.v_axis][component][index...] = canonical[component]
+        end
+    end
+    return workspace
+end
+
+struct StructuredMetrics{A}
+    Ai::A
+    nxi::A
+    nyi::A
+    nzi::A
+    Aj::A
+    nxj::A
+    nyj::A
+    nzj::A
+    Ak::A
+    nxk::A
+    nyk::A
+    nzk::A
+    V::A
+end
+
+@inline structured_metrics_tuple(metrics::StructuredMetrics) = (
+    metrics.Ai, metrics.nxi, metrics.nyi, metrics.nzi,
+    metrics.Aj, metrics.nxj, metrics.nyj, metrics.nzj,
+    metrics.Ak, metrics.nxk, metrics.nyk, metrics.nzk, metrics.V,
+)
+
+function allocate_scmm_edge_workspace(
+    ::Type{T}, Nx::Int, Ny::Int, Nz::Int, NG::Int,
+) where {T<:AbstractFloat}
+    node_dims = (Nx + 2NG + 1, Ny + 2NG + 1, Nz + 2NG + 1)
+    cell_dims = (Nx + 2NG, Ny + 2NG, Nz + 2NG)
+    edge_i_shape = (cell_dims[1], node_dims[2], node_dims[3])
+    edge_j_shape = (node_dims[1], cell_dims[2], node_dims[3])
+    edge_k_shape = (node_dims[1], node_dims[2], cell_dims[3])
+    return SCMMEdgeWorkspace(
+        ntuple(_ -> zeros(T, edge_i_shape), 3),
+        ntuple(_ -> zeros(T, edge_j_shape), 3),
+        ntuple(_ -> zeros(T, edge_k_shape), 3),
+    )
+end
+
+function allocate_structured_metrics(
+    ::Type{T}, Nx::Int, Ny::Int, Nz::Int, NG::Int,
+) where {T<:AbstractFloat}
+    node_dims = (Nx + 2NG + 1, Ny + 2NG + 1, Nz + 2NG + 1)
+    cell_dims = (Nx + 2NG, Ny + 2NG, Nz + 2NG)
+    i_shape = (node_dims[1], cell_dims[2], cell_dims[3])
+    j_shape = (cell_dims[1], node_dims[2], cell_dims[3])
+    k_shape = (cell_dims[1], cell_dims[2], node_dims[3])
+    return StructuredMetrics(
+        zeros(T, i_shape), zeros(T, i_shape), zeros(T, i_shape), zeros(T, i_shape),
+        zeros(T, j_shape), zeros(T, j_shape), zeros(T, j_shape), zeros(T, j_shape),
+        zeros(T, k_shape), zeros(T, k_shape), zeros(T, k_shape), zeros(T, k_shape),
+        zeros(T, cell_dims),
+    )
+end
+
+function compute_scmm_edge_potentials!(
+    workspace::SCMMEdgeWorkspace, x, y, z,
+    Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    singularity_edges=nothing,
+)
+    node_dims = (Nx + 2NG + 1, Ny + 2NG + 1, Nz + 2NG + 1)
+    cell_dims = (Nx + 2NG, Ny + 2NG, Nz + 2NG)
+    y_dz_i, z_dx_i, x_dy_i = workspace.edge_i
+    y_dz_j, z_dx_j, x_dy_j = workspace.edge_j
+    y_dz_k, z_dx_k, x_dy_k = workspace.edge_k
+    T = eltype(x)
+
+    for k in 1:cell_dims[3], j in 1:node_dims[2], i in 1:node_dims[1]
+        y_dz_k[i,j,k] = T(0.5) * (
+            structured_scmm_interp_k(y, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(z, i, j, k, node_dims[3]) -
+            structured_scmm_interp_k(z, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(y, i, j, k, node_dims[3])
+        )
+        z_dx_k[i,j,k] = T(0.5) * (
+            structured_scmm_interp_k(z, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(x, i, j, k, node_dims[3]) -
+            structured_scmm_interp_k(x, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(z, i, j, k, node_dims[3])
+        )
+        x_dy_k[i,j,k] = T(0.5) * (
+            structured_scmm_interp_k(x, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(y, i, j, k, node_dims[3]) -
+            structured_scmm_interp_k(y, i, j, k, node_dims[3]) *
+                structured_scmm_deriv_k(x, i, j, k, node_dims[3])
+        )
+    end
+
+    for k in 1:node_dims[3], j in 1:cell_dims[2], i in 1:node_dims[1]
+        y_dz_j[i,j,k] = T(0.5) * (
+            structured_scmm_interp_j(y, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(z, i, j, k, node_dims[2]) -
+            structured_scmm_interp_j(z, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(y, i, j, k, node_dims[2])
+        )
+        z_dx_j[i,j,k] = T(0.5) * (
+            structured_scmm_interp_j(z, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(x, i, j, k, node_dims[2]) -
+            structured_scmm_interp_j(x, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(z, i, j, k, node_dims[2])
+        )
+        x_dy_j[i,j,k] = T(0.5) * (
+            structured_scmm_interp_j(x, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(y, i, j, k, node_dims[2]) -
+            structured_scmm_interp_j(y, i, j, k, node_dims[2]) *
+                structured_scmm_deriv_j(x, i, j, k, node_dims[2])
+        )
+    end
+
+    for k in 1:node_dims[3], j in 1:node_dims[2], i in 1:cell_dims[1]
+        y_dz_i[i,j,k] = T(0.5) * (
+            structured_scmm_interp_i(y, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(z, i, j, k, node_dims[1]) -
+            structured_scmm_interp_i(z, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(y, i, j, k, node_dims[1])
+        )
+        z_dx_i[i,j,k] = T(0.5) * (
+            structured_scmm_interp_i(z, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(x, i, j, k, node_dims[1]) -
+            structured_scmm_interp_i(x, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(z, i, j, k, node_dims[1])
+        )
+        x_dy_i[i,j,k] = T(0.5) * (
+            structured_scmm_interp_i(x, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(y, i, j, k, node_dims[1]) -
+            structured_scmm_interp_i(y, i, j, k, node_dims[1]) *
+                structured_scmm_deriv_i(x, i, j, k, node_dims[1])
+        )
+    end
+
+    _apply_scmm_junction_edge_fallback!(
+        (workspace.edge_i, workspace.edge_j, workspace.edge_k),
+        x, y, z, Nx, Ny, Nz, NG, singularity_edges,
+    )
+    return workspace
+end
+
+function compute_scmm_edge_potentials(
+    x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    singularity_edges=nothing,
+)
+    workspace = allocate_scmm_edge_workspace(eltype(x), Nx, Ny, Nz, NG)
+    return compute_scmm_edge_potentials!(
+        workspace, x, y, z, Nx, Ny, Nz, NG;
+        singularity_edges=singularity_edges,
+    )
+end
+
+@inline function _validated_structured_face_metric(
+    area, sx, sy, sz, direction, i, j, k, active,
+)
+    if !isfinite(area) || area <= zero(area)
+        active && throw(DomainError(
+            area,
+            "degenerate $(direction)-face at metric index ($i, $j, $k): " *
+            "face area must be finite and strictly positive",
+        ))
+        return zero(area), zero(area), zero(area), zero(area)
+    end
+    return area, sx / area, sy / area, sz / area
+end
+
+function finalize_scmm_face_metrics!(
+    metrics::StructuredMetrics, workspace::SCMMEdgeWorkspace,
+    Nx::Int, Ny::Int, Nz::Int, NG::Int,
+)
+    node_dims = (Nx + 2NG + 1, Ny + 2NG + 1, Nz + 2NG + 1)
+    cell_dims = (Nx + 2NG, Ny + 2NG, Nz + 2NG)
+    y_dz_i, z_dx_i, x_dy_i = workspace.edge_i
+    y_dz_j, z_dx_j, x_dy_j = workspace.edge_j
+    y_dz_k, z_dx_k, x_dy_k = workspace.edge_k
+
+    for k in 1:cell_dims[3], j in 1:cell_dims[2], i in 1:node_dims[1]
+        sx = (y_dz_k[i,j+1,k] - y_dz_k[i,j,k]) -
+             (y_dz_j[i,j,k+1] - y_dz_j[i,j,k])
+        sy = (z_dx_k[i,j+1,k] - z_dx_k[i,j,k]) -
+             (z_dx_j[i,j,k+1] - z_dx_j[i,j,k])
+        sz = (x_dy_k[i,j+1,k] - x_dy_k[i,j,k]) -
+             (x_dy_j[i,j,k+1] - x_dy_j[i,j,k])
+        metrics.Ai[i,j,k], metrics.nxi[i,j,k], metrics.nyi[i,j,k],
+            metrics.nzi[i,j,k] = _validated_structured_face_metric(
+                sqrt(sx^2 + sy^2 + sz^2), sx, sy, sz, "i", i, j, k,
+                NG+1 <= i <= Nx+NG+1 && NG+1 <= j <= Ny+NG &&
+                    NG+1 <= k <= Nz+NG,
+            )
+    end
+
+    for k in 1:cell_dims[3], j in 1:node_dims[2], i in 1:cell_dims[1]
+        sx = (y_dz_i[i,j,k+1] - y_dz_i[i,j,k]) -
+             (y_dz_k[i+1,j,k] - y_dz_k[i,j,k])
+        sy = (z_dx_i[i,j,k+1] - z_dx_i[i,j,k]) -
+             (z_dx_k[i+1,j,k] - z_dx_k[i,j,k])
+        sz = (x_dy_i[i,j,k+1] - x_dy_i[i,j,k]) -
+             (x_dy_k[i+1,j,k] - x_dy_k[i,j,k])
+        metrics.Aj[i,j,k], metrics.nxj[i,j,k], metrics.nyj[i,j,k],
+            metrics.nzj[i,j,k] = _validated_structured_face_metric(
+                sqrt(sx^2 + sy^2 + sz^2), sx, sy, sz, "j", i, j, k,
+                NG+1 <= i <= Nx+NG && NG+1 <= j <= Ny+NG+1 &&
+                    NG+1 <= k <= Nz+NG,
+            )
+    end
+
+    for k in 1:node_dims[3], j in 1:cell_dims[2], i in 1:cell_dims[1]
+        sx = (y_dz_j[i+1,j,k] - y_dz_j[i,j,k]) -
+             (y_dz_i[i,j+1,k] - y_dz_i[i,j,k])
+        sy = (z_dx_j[i+1,j,k] - z_dx_j[i,j,k]) -
+             (z_dx_i[i,j+1,k] - z_dx_i[i,j,k])
+        sz = (x_dy_j[i+1,j,k] - x_dy_j[i,j,k]) -
+             (x_dy_i[i,j+1,k] - x_dy_i[i,j,k])
+        metrics.Ak[i,j,k], metrics.nxk[i,j,k], metrics.nyk[i,j,k],
+            metrics.nzk[i,j,k] = _validated_structured_face_metric(
+                sqrt(sx^2 + sy^2 + sz^2), sx, sy, sz, "k", i, j, k,
+                NG+1 <= i <= Nx+NG && NG+1 <= j <= Ny+NG &&
+                    NG+1 <= k <= Nz+NG+1,
+            )
+    end
+    return metrics
+end
+
+@inline function _structured_cmd6_midpoint(values::NTuple{6,T}) where {T}
+    return T(75) * (values[4] + values[3]) / T(128) -
+           T(25) * (values[5] + values[2]) / T(256) +
+           T(3) * (values[6] + values[1]) / T(256)
+end
+
+@inline function _structured_scmm_face_point_i(array, i, j, k)
+    nj, nk = size(array, 2), size(array, 3)
+    values = ntuple(6) do sample
+        kk = clamp(k + sample - 3, 1, nk)
+        structured_scmm_interp_j(array, i, j, kk, nj)
+    end
+    return _structured_cmd6_midpoint(values)
+end
+
+@inline function _structured_scmm_face_point_j(array, i, j, k)
+    ni, nk = size(array, 1), size(array, 3)
+    values = ntuple(6) do sample
+        kk = clamp(k + sample - 3, 1, nk)
+        structured_scmm_interp_i(array, i, j, kk, ni)
+    end
+    return _structured_cmd6_midpoint(values)
+end
+
+@inline function _structured_scmm_face_point_k(array, i, j, k)
+    ni, nj = size(array, 1), size(array, 2)
+    values = ntuple(6) do sample
+        jj = clamp(j + sample - 3, 1, nj)
+        structured_scmm_interp_i(array, i, jj, k, ni)
+    end
+    return _structured_cmd6_midpoint(values)
+end
+
+function finalize_scmm_volumes!(
+    metrics::StructuredMetrics, x, y, z,
+    Nx::Int, Ny::Int, Nz::Int, NG::Int,
+)
+    cell_dims = (Nx + 2NG, Ny + 2NG, Nz + 2NG)
+    for k in 1:cell_dims[3], j in 1:cell_dims[2], i in 1:cell_dims[1]
+        area_i_lo = metrics.Ai[i,j,k]
+        dot_i_lo = _structured_scmm_face_point_i(x, i, j, k) *
+                       (area_i_lo * metrics.nxi[i,j,k]) +
+                   _structured_scmm_face_point_i(y, i, j, k) *
+                       (area_i_lo * metrics.nyi[i,j,k]) +
+                   _structured_scmm_face_point_i(z, i, j, k) *
+                       (area_i_lo * metrics.nzi[i,j,k])
+        area_i_hi = metrics.Ai[i+1,j,k]
+        dot_i_hi = _structured_scmm_face_point_i(x, i+1, j, k) *
+                       (area_i_hi * metrics.nxi[i+1,j,k]) +
+                   _structured_scmm_face_point_i(y, i+1, j, k) *
+                       (area_i_hi * metrics.nyi[i+1,j,k]) +
+                   _structured_scmm_face_point_i(z, i+1, j, k) *
+                       (area_i_hi * metrics.nzi[i+1,j,k])
+        area_j_lo = metrics.Aj[i,j,k]
+        dot_j_lo = _structured_scmm_face_point_j(x, i, j, k) *
+                       (area_j_lo * metrics.nxj[i,j,k]) +
+                   _structured_scmm_face_point_j(y, i, j, k) *
+                       (area_j_lo * metrics.nyj[i,j,k]) +
+                   _structured_scmm_face_point_j(z, i, j, k) *
+                       (area_j_lo * metrics.nzj[i,j,k])
+        area_j_hi = metrics.Aj[i,j+1,k]
+        dot_j_hi = _structured_scmm_face_point_j(x, i, j+1, k) *
+                       (area_j_hi * metrics.nxj[i,j+1,k]) +
+                   _structured_scmm_face_point_j(y, i, j+1, k) *
+                       (area_j_hi * metrics.nyj[i,j+1,k]) +
+                   _structured_scmm_face_point_j(z, i, j+1, k) *
+                       (area_j_hi * metrics.nzj[i,j+1,k])
+        area_k_lo = metrics.Ak[i,j,k]
+        dot_k_lo = _structured_scmm_face_point_k(x, i, j, k) *
+                       (area_k_lo * metrics.nxk[i,j,k]) +
+                   _structured_scmm_face_point_k(y, i, j, k) *
+                       (area_k_lo * metrics.nyk[i,j,k]) +
+                   _structured_scmm_face_point_k(z, i, j, k) *
+                       (area_k_lo * metrics.nzk[i,j,k])
+        area_k_hi = metrics.Ak[i,j,k+1]
+        dot_k_hi = _structured_scmm_face_point_k(x, i, j, k+1) *
+                       (area_k_hi * metrics.nxk[i,j,k+1]) +
+                   _structured_scmm_face_point_k(y, i, j, k+1) *
+                       (area_k_hi * metrics.nyk[i,j,k+1]) +
+                   _structured_scmm_face_point_k(z, i, j, k+1) *
+                       (area_k_hi * metrics.nzk[i,j,k+1])
+        volume = (dot_i_hi - dot_i_lo + dot_j_hi - dot_j_lo +
+                  dot_k_hi - dot_k_lo) / eltype(x)(3)
+        active = NG+1 <= i <= Nx+NG && NG+1 <= j <= Ny+NG &&
+                 NG+1 <= k <= Nz+NG
+        active && (!isfinite(volume) || volume <= zero(volume)) &&
+            throw(DomainError(
+                volume,
+                "inverted or degenerate cell at metric index ($i, $j, $k): " *
+                "signed volume must be finite and strictly positive",
+            ))
+        metrics.V[i,j,k] = active ? inv(volume) :
+            (isfinite(volume) && abs(volume) > eps(eltype(x)) ?
+                inv(abs(volume)) : zero(eltype(x)))
+    end
+    return metrics
+end
+
+function compute_structured_metric_pipeline(
+    x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    periodic=(false, false, false),
+    singularity_edges=nothing,
+)
+    workspace = compute_scmm_edge_potentials(
+        x, y, z, Nx, Ny, Nz, NG;
+        singularity_edges=singularity_edges,
+    )
+    metrics = allocate_structured_metrics(eltype(x), Nx, Ny, Nz, NG)
+    finalize_scmm_face_metrics!(metrics, workspace, Nx, Ny, Nz, NG)
+    finalize_scmm_volumes!(metrics, x, y, z, Nx, Ny, Nz, NG)
+    _enforce_periodic_metric_ghosts!(
+        structured_metrics_tuple(metrics)..., Nx, Ny, Nz, NG, periodic,
+    )
+    return workspace, metrics
+end
+
+function compute_fvm_metrics_runtime(
+    x, y, z, Nx::Int, Ny::Int, Nz::Int, NG::Int;
+    periodic=(false, false, false),
+    singularity_edges=nothing,
+)
+    _, metrics = compute_structured_metric_pipeline(
+        x, y, z, Nx, Ny, Nz, NG;
+        periodic=periodic,
+        singularity_edges=singularity_edges,
+    )
+    return structured_metrics_tuple(metrics)
+end
+
 # =============================================================================
 # Metrics caching: save/load from HDF5
 # Cache filename includes block ID AND rank indices to avoid race conditions
 # =============================================================================
 if !isdefined(@__MODULE__, :STRUCTURED_METRIC_ALGORITHM_VERSION)
-    const STRUCTURED_METRIC_ALGORITHM_VERSION = 5
+    const STRUCTURED_METRIC_ALGORITHM_VERSION = 7
 end
 
 function _structured_metric_fingerprint(arrays...)
@@ -1730,10 +2649,16 @@ function _metrics_cache_filename(
     bid, rx, ry, rz, Nx, Ny, Nz, NG, ::Type{T}, periodic,
     ; mesh_fingerprint::AbstractString="none",
       topology_fingerprint::AbstractString="none",
+      metric_mode::Symbol=STRUCTURED_METRIC_TOPOLOGY_GHOST,
+      metric_order::Int=STRUCTURED_METRIC_LOCAL_CHART_POINTS,
+      block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
 ) where {T<:AbstractFloat}
     periodic_key = join(Int(flag) for flag in periodic)
+    mode_key = replace(String(metric_mode), r"[^A-Za-z0-9]" => "")
     return "metrics_cache_b$(bid)_r$(rx)_$(ry)_$(rz)_" *
            "dims$(Nx)x$(Ny)x$(Nz)_ng$(NG)_ft$(nameof(T))_" *
+           "bdims$(block_dims[1])x$(block_dims[2])x$(block_dims[3])_" *
+           "mode$(mode_key)_order$(metric_order)_" *
            "p$(periodic_key)_mesh$(mesh_fingerprint)_topo$(topology_fingerprint)_" *
            "alg$(STRUCTURED_METRIC_ALGORITHM_VERSION).h5"
 end
@@ -1748,19 +2673,20 @@ function load_or_compute_metrics(bid::Int, rx::Int, ry::Int, rz::Int,
                                   periodic=(false, false, false),
                                   topology_fingerprint::AbstractString="none",
                                   singularity_edges=nothing,
-                                  junction_layers::Int=STRUCTURED_METRIC_JUNCTION_LAYERS)
+                                  metric_mode::Symbol=structured_metric_mode_setting(),
+                                  cell_offsets::NTuple{3,Int}=(0, 0, 0),
+                                  block_dims::NTuple{3,Int}=(Nx, Ny, Nz),
+                                  metric_auxiliary=nothing)
     _mesh_base_mc = isdefined(Main, :mesh_dir) ? getfield(Main, :mesh_dir) : "MESH"
-    mesh_fingerprint = singularity_edges === nothing ?
-        _structured_metric_fingerprint(x, y, z) :
-        _structured_metric_fingerprint(
-            x, y, z, Int8.(collect(singularity_edges)), Int32[junction_layers],
-        )
+    mesh_fingerprint = _structured_metric_fingerprint(x, y, z)
     cache_path = joinpath(
         _mesh_base_mc,
         _metrics_cache_filename(
             bid, rx, ry, rz, Nx, Ny, Nz, NG, FT, periodic,
             mesh_fingerprint=mesh_fingerprint,
             topology_fingerprint=topology_fingerprint,
+            metric_mode=metric_mode,
+            block_dims=block_dims,
         ),
     )
     mesh_path  = joinpath(_mesh_base_mc, "mesh_b$bid.h5")
@@ -1775,24 +2701,39 @@ function load_or_compute_metrics(bid::Int, rx::Int, ry::Int, rz::Int,
         mtime(cache_path) > mtime(mesh_path) &&
         all(source -> isfile(source) && mtime(cache_path) > mtime(source),
             metric_sources)
+    metric_coordinates = build_metric_coordinates(
+        x, y, z, Nx, Ny, Nz, NG;
+        mode=metric_mode,
+        cell_offsets=cell_offsets,
+        block_dims=block_dims,
+    )
     if cache_metrics && cache_newer_than_inputs
         println("    Loading cached metrics from $cache_path")
         metrics = load_metrics_from_h5(cache_path, FT)
         _enforce_periodic_metric_ghosts!(
             metrics..., Nx, Ny, Nz, NG, periodic,
         )
+        metric_auxiliary !== nothing &&
+            (metric_auxiliary[bid] = (
+                metric_coordinates, nothing, StructuredMetrics(metrics...),
+            ))
         return cache_path, false, metrics...
     end
     
     # Compute at runtime
-    println("    Computing metrics at runtime for block $bid rank ($rx,$ry,$rz)...")
-    Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V = 
-        compute_fvm_metrics_runtime(
-            x, y, z, Nx, Ny, Nz, NG;
-            periodic=periodic,
-            singularity_edges=singularity_edges,
-            junction_layers=junction_layers,
-        )
+    println(
+        "    Computing metrics at runtime for block $bid rank ($rx,$ry,$rz) " *
+        "with mode=$metric_mode...",
+    )
+    workspace, metrics = compute_structured_metric_pipeline(
+        metric_coordinates.x, metric_coordinates.y, metric_coordinates.z,
+        Nx, Ny, Nz, NG;
+        periodic=periodic,
+        singularity_edges=(metric_mode == STRUCTURED_METRIC_LOCAL_CHART ?
+            nothing : singularity_edges),
+    )
+    metric_auxiliary !== nothing &&
+        (metric_auxiliary[bid] = (metric_coordinates, workspace, metrics))
     
-    return cache_path, true, Ai, nxi, nyi, nzi, Aj, nxj, nyj, nzj, Ak, nxk, nyk, nzk, V
+    return cache_path, true, structured_metrics_tuple(metrics)...
 end

@@ -5758,6 +5758,21 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                 ct_recover_physical_ghost_b!(
                     b,b.Nx,b.Ny,b.Nz; physical_faces=physical_faces,
                 )
+                if ct_background_split_enabled
+                    prescribed_faces = ntuple(Val(6)) do face_id
+                        physical_faces[face_id] &&
+                        is_prescribed_external_magnetic_field_bc(Int32(get(
+                            face_bc,(bid,face_id),BC_INTERBLOCK,
+                        ))) &&
+                        !external_magnetic_split_preserves_perturbation(
+                            Int32(get(face_bc,(bid,face_id),BC_INTERBLOCK)),
+                        )
+                    end
+                    ct_restore_prescribed_background_ghost_b!(
+                        b,b.Nx,b.Ny,b.Nz;
+                        prescribed_faces=prescribed_faces,
+                    )
+                end
                 finalize_structured_ct_physical_ghost_energy!(
                     b.U, b.Q, rx_b, ry_b, rz_b, b.id,
                     b.Nx, b.Ny, b.Nz, Nprocs_b, face_bc, bc_params,
@@ -6300,6 +6315,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         task_graph = build_structured_explicit_rk3_task_graph(
             0:(Int(Nblocks) - 1);
             ct_mode=structured_task_ct_active,
+            background_split=ct_background_split_enabled,
             troubled_mask=structured_task_ct_active &&
                            ct_troubled_mask_enabled,
             fofc=structured_task_ct_active &&
@@ -6322,6 +6338,7 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
                             shared_dU_forced),
             runtime_options=(equation_type=equation_type,
                              ct_mode=structured_task_ct_active,
+                             background_split=ct_background_split_enabled,
                              block_count=length(blocks)),
         )
         graph_min = MPI.Allreduce(task_graph.signature, MPI.MIN, MPI.COMM_WORLD)
@@ -6368,6 +6385,12 @@ function time_step(world_rank, comm_cart, Block_Nprocs)
         structured_rk_task_state[] = state
         seed_resources = Symbol[:RK_Q_HALO_0, :RK_U_ACTIVE_0]
         structured_task_ct_active && push!(seed_resources, :RK_FACE_B_0)
+        if ct_background_split_enabled
+            ct_background_ready[] || error(
+                "CT background cache is not ready before RK flux evaluation",
+            )
+            push!(seed_resources, STRUCTURED_TASK_CT_BACKGROUND_READY)
+        end
         begin_structured_task_stage!(
             structured_rk_task_context,
             StructuredTaskEpoch(Int(tt_val), 0, 0);

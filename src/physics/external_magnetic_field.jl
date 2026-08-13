@@ -230,6 +230,15 @@ end
            bc_type == Int32(BC_MHD_OUTFLOW_EXTERNAL_FIELD)
 end
 
+@inline function external_magnetic_split_preserves_perturbation(bc_type)
+    # These boundaries prescribe the fluid state and fixed B0 while leaving
+    # the CT-owned perturbation free. Their preceding zero-gradient fill owns
+    # tangential ghost fluxes and preserves the evolved normal face.
+    return bc_type == Int32(BC_MHD_PROFILED_INFLOW) ||
+           bc_type == Int32(BC_MHD_FIXED_EXTERNAL_FIELD) ||
+           bc_type == Int32(BC_MHD_OUTFLOW_EXTERNAL_FIELD)
+end
+
 @inline function external_magnetic_field_components_from_bc(bcp, x, y, z)
     model = bcp[BCP_MN_MODEL]
     if model >= typeof(model)(0.5)
@@ -500,6 +509,7 @@ function ct_fill_external_field_face_b_kernel!(
     Bface, Area, normal_x, normal_y, normal_z, x, y, z,
     boundary_axis, side, face_kind,
     nxp, nyp, nzp, bcp, include_normal_face, background_splitting,
+    preserve_perturbation, background_face=nothing,
 )
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     j = (blockIdx().y - Int32(1)) * blockDim().y + threadIdx().y
@@ -523,11 +533,7 @@ function ct_fill_external_field_face_b_kernel!(
     ) || return
 
     if background_splitting
-        # The evolved face state is b = B - B0.  These boundary kinds prescribe
-        # the total external field to be the cached B0, so their Dirichlet
-        # value is exactly b_n = 0.  Copying an interior perturbation here would
-        # turn the fixed-field boundary into a zero-gradient boundary and break
-        # the discrete Bessel equilibrium after the first CT stage.
+        preserve_perturbation && return
         @inbounds Bface[i,j,k] = zero(eltype(Bface))
         return
     end
@@ -725,7 +731,8 @@ end
 function ct_initialize_background_cell_b_from_model!(
     block, model; time=zero(FT),
 )
-    block.B0x_cell === nothing && return false
+    background_cell = hasproperty(block,:B0_cell) ? block.B0_cell : nothing
+    background_cell === nothing && return false
     applicable(
         magnetic_nozzle_field, model, zero(FT), zero(FT), zero(FT), FT(time),
     ) || return false
@@ -733,10 +740,10 @@ function ct_initialize_background_cell_b_from_model!(
     x = Array(block.x)
     y = Array(block.y)
     z = Array(block.z)
-    cell_dims = size(block.B0x_cell)
-    size(block.B0y_cell) == cell_dims == size(block.B0z_cell) ||
+    cell_dims = size(background_cell)[1:3]
+    size(background_cell,4) == 3 ||
         throw(DimensionMismatch(
-            "CT background cell arrays must have identical sizes",
+            "CT background cell cache must have three components",
         ))
     size(x) == size(y) == size(z) == cell_dims .+ 1 ||
         throw(DimensionMismatch(
@@ -744,23 +751,18 @@ function ct_initialize_background_cell_b_from_model!(
             "in each coordinate direction",
         ))
 
-    background_x = Array{FT}(undef, cell_dims)
-    background_y = similar(background_x)
-    background_z = similar(background_x)
-    @inbounds for k in axes(background_x, 3),
-                  j in axes(background_x, 2),
-                  i in axes(background_x, 1)
+    background = Array{FT}(undef,cell_dims...,3)
+    @inbounds for k in axes(background,3), j in axes(background,2),
+                  i in axes(background,1)
         center = structured_cell_center_coordinates(x, y, z, i, j, k)
         magnetic = magnetic_nozzle_field(
             model, center[1], center[2], center[3], FT(time),
         )
-        background_x[i,j,k] = FT(magnetic[1])
-        background_y[i,j,k] = FT(magnetic[2])
-        background_z[i,j,k] = FT(magnetic[3])
+        background[i,j,k,1] = FT(magnetic[1])
+        background[i,j,k,2] = FT(magnetic[2])
+        background[i,j,k,3] = FT(magnetic[3])
     end
-    copyto!(block.B0x_cell, background_x)
-    copyto!(block.B0y_cell, background_y)
-    copyto!(block.B0z_cell, background_z)
+    copyto!(background_cell,background)
     return true
 end
 
