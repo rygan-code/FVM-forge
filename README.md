@@ -1,155 +1,88 @@
-# FVM-Forge
+# Simflow
 
-<p align="center"><b>OpenCFD 框架下的 GPU 异构并行可压缩流体求解器</b></p>
+Simflow 是基于 Julia 的三维可压缩有限体积求解器，面向 CPU、CUDA/ROCm GPU
+和 MPI 异构计算。当前仓库采用模块化 `src/` 架构，提供结构化多块求解路径，
+并保留正在完善的非结构网格后端。
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Language-Julia-9558B2?style=flat-square&logo=julia" />
-  <img src="https://img.shields.io/badge/GPU-CUDA%20%7C%20ROCm-76B900?style=flat-square" />
-  <img src="https://img.shields.io/badge/Parallel-MPI%20%2B%20GPU-blue?style=flat-square" />
-  <img src="https://img.shields.io/badge/Precision-FP32%20%7C%20FP64-orange?style=flat-square" />
-</p>
+完整的理论、算法和使用说明见 [docs/manual.md](docs/manual.md)。
 
-**FVM-Forge** 是 OpenCFD 框架下基于 MPI+GPU 异构并行的三维可压缩流有限体积求解器。程序提供结构化多块和非结构网格两个空间后端，支持 NVIDIA CUDA、AMD ROCm 和纯 CPU 回退模式。结构后端承担完整 Navier-Stokes/MHD 生产计算；非结构后端当前完成了可压缩 Euler 基线。
+## 主要能力
 
-> 📖 完整手册请参阅 [docs/manual.md](docs/manual.md)
+- 结构化多块有限体积求解，支持可压缩 Euler、Navier–Stokes 和 MHD；
+- GLM 与 Constrained Transport（CT）磁场推进路径；
+- WENO/特征重构、Riemann 通量、粘性通量、正性保护和多种时间推进方法；
+- MPI 多块通信、GPU 后端以及 CPU 回退；
+- HDF5/XDMF/VTU 等网格、结果和重启动 I/O；
+- `Benchmark/` 中的管道流、MHD、CT、激波管和网格验证算例。
 
----
+非结构后端的实现位于 `src/*/unstructured_*.jl`，其能力和限制以手册及
+`config/cases/unstructured_*.toml` 为准。
 
-## ✨ 特色
+## 目录结构
 
-- 🔥 **GPU 异构并行** — 同一套 Julia kernel 代码，通过统一抽象层自动适配 CUDA / ROCm / CPU
-- 🧱 **多块结构化网格** — 支持 O-H butterfly 管道拓扑、任意块间连接、运行时 ghost 坐标生成
-- 🔷 **非结构网格后端** — cell/face CSR、OpenFOAM polyMesh、MUSCL、MPI 和 VTU 输出
-- 🔬 **高阶精度** — WENO7/5-Z 特征分解重构 + 6 阶中心差分粘性通量
-- ⚡ **自适应混合策略** — 激波传感器驱动的 7 阶光滑/WENO/Minmod 自动切换
-- 🚀 **性能优化** — Kernel 自动调优、非阻塞 MPI 管线、批量 pack/unpack、融合 kernel
-- 🌀 **丰富物理模型** — Coriolis/离心力、管道流 bulk forcing、HIT 线性强迫
-- 🧲 **MHD 求解器** — GLM 散度清洗、Rusanov/HLLD/KEP 通量
-- 🔄 **差分旋转模块** — 空间发展管道 + Fringe 回复区、两阶段启动流程
-
----
-
-## 📁 项目结构
-
-```
-FVM-Forge/
-├── run_pipe.jl              # 入口：标准旋转管道 (周期性)
-├── run_pipe_diffrot.jl      # 入口：差分旋转管道 (Fringe 区)
-├── run_pipe_ac.jl           # 入口：不可压 AC 管道
-├── run_pipe_piso.jl         # 入口：不可压 PISO 管道
-├── run_brio_wu.jl           # 入口：MHD Brio-Wu 激波管
-├── solver.jl                # 核心求解器：时间推进、块管理、同步
-├── backend_interface.jl     # 结构/非结构空间后端分派
-├── euler_flux.jl            # 两种后端共享的一阶 Euler 面通量
-├── unstruct/                # 非结构 Euler 后端
-├── gpu_backend.jl           # GPU 后端抽象层 (CUDA / ROCm / CPU)
-├── auto_tune.jl             # GPU kernel 自动调优 (block size + VGPR)
-├── auto_partition.jl        # 多块自动 GPU 分区
-├── Reconstruct.jl           # WENO7/5 + 线性混合重构 (i/j/k 方向)
-├── Riemann_Solver.jl        # HLLC / Van Leer / SW / Roe / KEP 通量 + MHD
-├── viscous.jl               # 6 阶中心差分粘性通量
-├── boundary.jl              # 边界条件 (壁面/周期/NSCBC/超音速)
-├── mpi.jl                   # MPI ghost exchange + 多块间 ghost 同步
-├── ghost_coords.jl          # 运行时 ghost cell 坐标扩展
-├── volume_force.jl          # 体积力 (旋转/Bulk/HIT/Deschamps forcing)
-├── fringe.jl                # Fringe 回复区 (差分旋转用)
-├── implicit.jl              # 隐式 LU-SGS 时间推进 (可选)
-├── gmres.jl                 # GMRES 线性求解器
-├── div.jl                   # 通量散度 + RK 组合
-├── filter_interface.jl      # 块间界面滤波 (自适应 σ)
-├── spectral_warmup.jl       # 频谱预热 (DRP/CD6 自适应)
-├── init_flow.jl             # 初始场 (PipeFlow/TGV/HIT/Sod/MHD)
-├── IO.jl                    # HDF5/XDMF 并行 I/O (mesh_dir 自适应)
-├── utils.jl                 # c2Prim, compute_dt, 空间滤波器
-├── schemes.jl               # 数值格式系数 (DRP/标准)
-├── docs/
-│   └── manual.md            # 用户手册
-├── Benchmark/
-│   └── PIPEFLOW/            # 圆管湍流基准测试
-└── Utils/
-    ├── gen_butterfly_fvm.jl          # O-H 管道网格生成器
-    ├── gen_butterfly_fvm_diffrot.jl  # 差分旋转扩展网格生成器
-    ├── prepare_precursor_mean.jl     # Phase 1 时均截面提取
-    └── analyze_*.jl                  # 后处理诊断脚本集
+```text
+src/
+├── core/       配置、方程和边界类型
+├── mesh/       结构化与 OpenFOAM 网格
+├── numerics/   重构、通量、散度和 CT
+├── parallel/   MPI、GPU、分区和通信
+├── physics/    Euler/MHD、边界和粘性物理
+├── time/       RK、源项和后端生命周期
+└── io/         结构化/非结构化 I/O
+bin/
+├── run_case.jl              TOML 算例入口
+└── generate_openfoam_mesh.jl OpenFOAM 网格工具
+config/cases/                 算例配置
+Benchmark/                    基准、收敛和验证算例
+Utils/                        网格与结果处理工具
+post/                         后处理模块
+docs/manual.md                用户手册
 ```
 
----
+## 环境与安装
 
-## 🚀 快速开始
-
-### 环境要求
-
-| 依赖 | 版本 |
-|------|------|
-| Julia | ≥ 1.9 |
-| MPI.jl | ≥ 0.20 |
-| HDF5.jl | ≥ 0.16 |
-| CUDA.jl (NVIDIA) | ≥ 5.0 |
-| AMDGPU.jl (AMD) | ≥ 0.8 |
-
-### 1. 生成网格
+建议使用 Julia 1.10。首次运行前安装项目依赖：
 
 ```bash
-cd Utils/
-julia gen_butterfly_fvm.jl    # 生成 5-block O-H butterfly 管道网格
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-### 2. 运行仿真
+根据硬件选择 MPI、CUDA 或 ROCm 环境；CPU 回退路径不需要 GPU。
+
+## 运行算例
+
+统一入口为 `bin/run_case.jl`，第一个参数是 TOML 配置文件：
 
 ```bash
-# 24 GPU: 5 blocks, 自动分区
-mpirun -np 24 julia run_pipe.jl 10000
+# 仅检查配置，不启动长时间计算
+julia --project=. bin/run_case.jl config/cases/unstructured_smoke.toml --validate-only
+
+# 运行一个配置算例
+julia --project=. bin/run_case.jl config/cases/unstructured_smoke.toml
 ```
 
-### 3. 可视化
+结构化生产入口和具体网格要求见 `docs/manual.md` 及 `Benchmark/` 中对应算例的
+说明。MPI 运行时使用与 Julia/MPI.jl 匹配的 `mpiexec`/`mpirun`。
 
-使用 ParaView 打开 `PLT/` 目录下的 `.xdmf` 文件。
+结果通常写入算例配置指定的目录，可能包含 HDF5、XDMF 或 VTU 文件，可使用
+ParaView 等工具进行可视化。
 
----
+## 配置文件
 
-## ⚙️ 关键参数
+配置文件采用 TOML 格式，主要分为：
 
-在 `run_pipe.jl` / `run_pipe_diffrot.jl` 中配置：
+- `[backend]`：网格后端、设备和运行模式；
+- `[mesh]`：网格类型、尺寸、边界和输入路径；
+- `[physics]`：方程、粘性、MHD/CT 和物性参数；
+- `[numerics]`：阶数、Riemann 通量、CFL 和正性策略；
+- `[time]`、`[output]`：终止时间、步数、输出间隔和结果目录。
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `Re_target` | FT | 目标 Reynolds 数 |
-| `Ma_target` | FT | 目标 Mach 数 |
-| `Ro_target` / `Ro_min`~`Ro_max` | FT | 旋转数 (均匀/差分) |
-| `CFL` | FT | CFL 数 |
-| `viscous` | Bool | 启用粘性项 |
-| `eigen_reconstruction` | Bool | 特征分解重构 |
-| `splitMethod` | String | `"HLLC"` / `"VL"` / `"SW"` / `"Roe"` / `"KEP"` |
-| `mesh_dir` | String | 网格目录 (`"MESH_COARSE"` 等) |
-| `diffrot_phase` | Int | 差分旋转阶段 (1=湍流发展, 2=激活旋转) |
-| `profiling` | Bool | 逐模块性能计时 |
+## 文档与基准
 
----
+- 用户手册：[docs/manual.md](docs/manual.md)
+- 基准和验证算例：[Benchmark/](Benchmark/)
+- 结果处理工具：[Utils/](Utils/)
 
-## 📊 性能基准
+## 许可证
 
-**硬件**: 24× AMD MI50 (gfx906), Hygon DCU 集群  
-**网格**: 5-block butterfly 管道, 29.86M cells  
-**分区**: (5,1,1)×4 + (4,1,1)×1 = 24 GPUs
-
-| 指标 | 数值 |
-|------|------|
-| 每步耗时 | 0.087 s |
-| GPU 带宽利用率 | 40% (memory-bound) |
-| 总 FLOPs/step | 2.36 × 10¹¹ |
-| 实际算力 | 0.84 TFLOPS (FP32) |
-
----
-
-## 📝 引用
-
-如果 FVM-Forge 对您的研究有帮助，请引用：
-
-```
-FVM-Forge: A GPU-accelerated heterogeneous parallel compressible FVM solver
-under the OpenCFD framework.
-```
-
-## 📄 许可
-
-Private research code — OpenCFD Lab.
+本项目采用 [MIT License](LICENSE)。
