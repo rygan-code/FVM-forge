@@ -3,8 +3,8 @@
 length(ARGS)>=1 || error("usage: julia --project=. bin/run_case.jl config/cases/case.toml")
 const PROJECT_ROOT=abspath(joinpath(@__DIR__,".."))
 const VALIDATE_ONLY="--validate-only" in ARGS[2:end]
-using OpenCFDFVM
-OpenCFDFVM.load_backend_api!(Main)
+using Simflow
+Simflow.load_backend_api!(Main)
 const CASE_CONFIG=validate_case_config(load_case_config(abspath(ARGS[1])))
 apply_case_environment!(CASE_CONFIG)
 
@@ -39,7 +39,7 @@ const density_floor=FT(CASE_CONFIG.numerics.density_floor)
 const pressure_floor=FT(CASE_CONFIG.numerics.pressure_floor)
 const cr_glm=FT(0.18)
 
-OpenCFDFVM.load_unstructured_solver_stack!(Main)
+Simflow.load_unstructured_solver_stack!(Main)
 
 result=run_backend_case!(
     select_spatial_backend(:unstructured),CASE_CONFIG;

@@ -1,4 +1,4 @@
-module OpenCFDFVM
+module Simflow
 
 include(joinpath(@__DIR__,"core","case_config.jl"))
 include(joinpath(@__DIR__,"parallel","device_selection.jl"))
