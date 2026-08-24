@@ -42,7 +42,6 @@ FVM-Forge/
 ├── backend_interface.jl     # 结构/非结构空间后端分派
 ├── euler_flux.jl            # 两种后端共享的一阶 Euler 面通量
 ├── unstruct/                # 非结构 Euler 后端
-├── run/unstructured/        # 非结构网格运行入口
 ├── gpu_backend.jl           # GPU 后端抽象层 (CUDA / ROCm / CPU)
 ├── auto_tune.jl             # GPU kernel 自动调优 (block size + VGPR)
 ├── auto_partition.jl        # 多块自动 GPU 分区
@@ -100,12 +99,6 @@ julia gen_butterfly_fvm.jl    # 生成 5-block O-H butterfly 管道网格
 ```bash
 # 24 GPU: 5 blocks, 自动分区
 mpirun -np 24 julia run_pipe.jl 10000
-```
-
-非结构 Euler 基线：
-
-```bash
-julia --project=. run/unstructured/euler_sod.jl
 ```
 
 ### 3. 可视化

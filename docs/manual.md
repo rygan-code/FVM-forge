@@ -975,29 +975,10 @@ I/O 修改同样不是孤立工作：数组在内存中的 Julia 顺序、HDF5 d
 顺序、block offset 和 verifier 文件名必须一起更新。只修改 writer 而不修改 reader 和
 测试，会制造看似数值失败的格式不兼容。
 
-### 12.3 推荐测试顺序
+### 12.3 修改后的基本检查
 
-一次局部修改应从最窄的测试开始：
-
-```text
-公式/系数单元测试
--> 单 kernel 或合成场测试
--> 单 block CPU 小算例
--> GPU 同结果检查
--> 多 rank halo/接口测试
--> 对应 benchmark
--> 网格收敛与长时间稳定性
-```
-
-重构和高阶 CT 可从 `tests/test_weno7.jl`、`tests/test_ct_weno7.jl`、
-`tests/test_ct_characteristic_weno7.jl` 开始；同步和 metric 可看
-`tests/test_ct_sync.jl`、`tests/test_metric_ct.jl`、
-`tests/test_metrics_sync_multirank.jl`。positivity 测试应验证 tripwire 找到非法状态，
-不能只验证 floor 后程序没有崩溃。
-
-需要精确数组尺寸、配置联动、文件格式、验证范围或已知 guard 时，查阅
-[开发者参考](reference/implementation_contracts.md)。正文解释为什么这样设计，参考附件
-负责回答“当前代码到底接受什么”。
+修改数值内核后，建议至少运行一个小规模算例，检查守恒量、残差、输出文件和重启动
+数据是否正常；生产规模验证请使用 `Benchmark/` 中保留的基准算例。
 
 ## 附录 A：常用配置速查
 
